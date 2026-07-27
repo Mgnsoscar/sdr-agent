@@ -1,0 +1,63 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# SDR Agent — Task Registry
+#
+# Add one entry per script you want to manage.
+# The agent hot-reloads this file on startup only (restart agent to pick up
+# new tasks).
+#
+# Fields
+# ──────
+# name            (required) Unique string identifier, used in API URLs.
+# description     Human-readable label shown in status output.
+# command         List: executable + arguments.  Use absolute paths.
+# working_dir     CWD for the process. Default: /opt/sdr-agent
+# env             Extra environment variables (merged with system env).
+# autostart       true → start automatically when the agent boots.
+# restart_on_crash true → restart once if the process exits non-zero.
+# restart_delay_s Seconds to wait before the automatic restart. Default: 3.
+# ──────────────────────────────────────────────────────────────────────────────
+
+tasks:
+
+  # ── GNU Radio flowgraph ────────────────────────────────────────────────────
+  - name: rx_flowgraph
+    description: "Main RX flowgraph (Ettus B206-mini)"
+    command:
+      - python3
+      - /opt/sdr-agent/scripts/rx_flowgraph.py
+    working_dir: /opt/sdr-agent/scripts
+    env:
+      GR_DONT_LOAD_PREFS: "1"          # skip slow pref scan in headless mode
+    autostart: false
+    restart_on_crash: false
+
+  # ── Chirp sequence ────────────────────────────────────────────────────
+  - name: Chirp
+    description: "Chirp sequence at a specified center frequency and bandwidth."
+    command:
+      - python3
+      - /opt/sdr-agent/scripts/sqwtooth_fm_sweep.py
+    working_dir: /opt/sdr-agent/scripts
+    env:
+      GR_DONT_LOAD_PREFS: "1"          # skip slow pref scan in headless mode
+    autostart: false
+    restart_on_crash: false
+
+  # ── Programmable attenuator controller ────────────────────────────────────
+  - name: attenuator
+    description: "Attenuator control loop"
+    command:
+      - python3
+      - /opt/sdr-agent/scripts/attenuator_ctrl.py
+    working_dir: /opt/sdr-agent/scripts
+    autostart: false
+    restart_on_crash: false
+
+  # ── Example: any shell script or binary ───────────────────────────────────
+  - name: spectrum_logger
+    description: "Periodic spectrum snapshot logger"
+    command:
+      - python3
+      - /opt/sdr-agent/scripts/spectrum_logger.py
+    autostart: false
+    restart_on_crash: false
