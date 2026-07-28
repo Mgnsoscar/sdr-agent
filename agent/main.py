@@ -19,6 +19,8 @@ GET  /events/stream                   → SSE stream of crash + lifecycle events
 
 POST /scripts/upload                  → {"saved": filename}   multipart file upload
 GET  /scripts                         → list[str]  (filenames in scripts dir)
+GET  /scripts/{name}                  → {"name","content","size"}  (read a script)
+DELETE /scripts/{name}                → {"deleted": name}          (delete a script)
 
 GET  /config/tasks-yaml               → raw YAML text
 PUT  /config/tasks-yaml               → write new YAML + auto-reload
@@ -400,6 +402,42 @@ async def upload_script(file: UploadFile = File(...)):
 async def list_scripts():
     """List all .py files currently in the scripts directory."""
     return sorted(p.name for p in SCRIPTS_DIR.glob("*.py"))
+
+
+def _safe_script_path(name: str):
+    """Resolve a script name to a path inside SCRIPTS_DIR, rejecting traversal."""
+    if "/" in name or "\\" in name or name in (".", ".."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not name.endswith(".py"):
+        raise HTTPException(status_code=400, detail="Only .py files are accepted")
+    return SCRIPTS_DIR / name
+
+
+@app.get("/scripts/{name}", tags=["scripts"], dependencies=[Depends(verify_key)])
+async def get_script(name: str):
+    """Return the contents of a script in the scripts directory."""
+    path = _safe_script_path(name)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"No such script: {name}")
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read file: {exc}")
+    return {"name": name, "content": content, "size": path.stat().st_size}
+
+
+@app.delete("/scripts/{name}", tags=["scripts"], dependencies=[Depends(verify_key)])
+async def delete_script(name: str):
+    """Delete a script from the scripts directory."""
+    path = _safe_script_path(name)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"No such script: {name}")
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to delete file: {exc}")
+    logger.info("Script deleted: %s", name)
+    return {"deleted": name}
 
 
 # ── System health ─────────────────────────────────────────────────────────────
