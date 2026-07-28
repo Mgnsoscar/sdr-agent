@@ -92,26 +92,87 @@ class LogManager:
     async def stream(self, websocket, lines: int = 50):
         """
         Stream live log output to a WebSocket connection.
-        Sends historical lines first, then follows the file in real time.
+
+        Sends the recent backlog first, then follows current.log in real time.
+
+        Two robustness fixes vs. a naive follow loop:
+          1. Survives log rotation. When a task restarts, rotate() renames
+             current.log to an archive and creates a fresh current.log. A handle
+             opened once would keep following the *renamed* (now archived) inode
+             and silently go quiet. We detect the inode change and reopen so the
+             tail keeps following the new run's output.
+          2. Detects a client that goes away even while the log is idle. The
+             client only ever reads, so we run a concurrent receive that resolves
+             when it disconnects — otherwise a gone client is noticed only on the
+             next write, which never happens for an idle task, leaking the
+             coroutine and socket.
         """
-        # Send backlog
+        # Backlog first
         history = await self.tail(lines)
         for line in history:
             await websocket.send_text(line + "\n")
 
-        # Follow from current position
-        try:
-            with self.current.open("rb") as fh:
-                fh.seek(0, os.SEEK_END)
+        # The client never sends data frames; this future resolves when it closes,
+        # giving prompt disconnect detection even with no new log output.
+        async def _await_close() -> None:
+            try:
                 while True:
+                    await websocket.receive_text()
+            except Exception:
+                return
+
+        closed = asyncio.ensure_future(_await_close())
+
+        def _open_current():
+            fh = self.current.open("rb")
+            return fh, os.fstat(fh.fileno()).st_ino
+
+        try:
+            fh, cur_inode = _open_current()
+            fh.seek(0, os.SEEK_END)   # only *new* output for the first file
+            try:
+                while not closed.done():
                     chunk = fh.read(4096)
                     if chunk:
                         await websocket.send_text(
                             chunk.decode("utf-8", errors="replace")
                         )
-                    else:
-                        await asyncio.sleep(0.1)
+                        continue
+
+                    # No new data — has current.log been rotated out from under us?
+                    try:
+                        rotated = (
+                            not self.current.exists()
+                            or self.current.stat().st_ino != cur_inode
+                        )
+                    except OSError:
+                        rotated = False
+
+                    if rotated:
+                        # Open the fresh file BEFORE closing the old one, so a
+                        # failed reopen (mid-rotate) leaves us on a valid handle.
+                        try:
+                            new_fh, new_inode = _open_current()
+                        except OSError:
+                            await asyncio.sleep(0.1)
+                            continue
+                        try:
+                            fh.close()
+                        except OSError:
+                            pass
+                        # Follow the new run from its start (do NOT seek to end).
+                        fh, cur_inode = new_fh, new_inode
+                        continue
+
+                    await asyncio.sleep(0.1)
+            finally:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
         except asyncio.CancelledError:
-            pass   # Client disconnected — normal exit
+            pass   # Client disconnected / server shutting down — normal exit
         except Exception:
             pass
+        finally:
+            closed.cancel()

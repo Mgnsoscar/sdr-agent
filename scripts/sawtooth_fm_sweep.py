@@ -63,8 +63,7 @@ def build_buffer(samp_rate: float, cf: float,  bw: float, chirp_freq: float,
     period = make_chirp_period(samp_rate, bw, chirp_freq, amplitude)
     n = len(period)
     reps = max(1, math.ceil(MIN_BUFFER_SAMPS / n))
-    tiled, n, reps =  np.tile(period, reps), n, reps
-    tiled, n, reps = np.tile(period, reps), n, reps
+    tiled = np.tile(period, reps)
 
     # Random-walk phase drift across the entire buffer
     phase_noise = np.cumsum(
@@ -131,13 +130,17 @@ def main():
     p.add_argument("--oversample", type=float, default=DEFAULT_OVERSAMPLE,
                    help=f"fs = oversample * bandwidth (default {DEFAULT_OVERSAMPLE}). "
                         "Lower toward 1.0 if a very wide chirp still underflows.")
+
     p.add_argument("--args", type=str, default="",
                    help='UHD device args, e.g. "serial=1234" or '
                         '"num_send_frames=256" to enlarge the USB send buffer')
+    p.add_argument("-r", "--randomization", type=float, default=0.0,
+                   help="Phase random-walk stddev per sample (0 = clean chirp)")
     opts = p.parse_args()
 
     tb = ChirpTx(opts.center_freq, opts.bandwidth, opts.chirp_freq,
-                 opts.gain, opts.amplitude, opts.oversample, opts.args)
+                 opts.gain, opts.amplitude, opts.oversample, opts.args,
+                 opts.randomization)
 
     def stop(sig, frame):
         print("\nStopping...")
@@ -153,19 +156,4 @@ def main():
     tb.wait()
 
 if __name__ == "__main__":
-    tb = ChirpTx(1575.42e6,30e6,10e3,90, randomization=0.1)
-
-
-    def stop(sig, frame):
-        print("\nStopping...")
-        tb.stop()
-        tb.wait()
-        sys.exit(0)
-
-
-    signal.signal(signal.SIGINT, stop)
-    signal.signal(signal.SIGTERM, stop)
-
-    tb.start()
-    print("Transmitting. Ctrl-C to stop.")
-    tb.wait()
+    main()

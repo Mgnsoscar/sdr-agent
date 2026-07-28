@@ -380,6 +380,9 @@ async def upload_script(file: UploadFile = File(...)):
     if not file.filename or not file.filename.endswith(".py"):
         raise HTTPException(status_code=400, detail="Only .py files are accepted")
 
+    if "/" in file.filename or "\\" in file.filename or file.filename in (".", ".."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
     dest = SCRIPTS_DIR / file.filename
     content = await file.read()
 
