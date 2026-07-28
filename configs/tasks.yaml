@@ -31,12 +31,25 @@ tasks:
     autostart: false
     restart_on_crash: false
 
-  # ── Chirp sequence ────────────────────────────────────────────────────
+  # ── Chirp transmitter ──────────────────────────────────────────────────────
+  # NOTE: the script now takes its transmit parameters from the command line
+  # (see `sawtooth_fm_sweep.py --help`). The values below match the example in
+  # the script's docstring (2.4 GHz ISM band).
+  # ⚠  Set -f (center frequency) and -g (gain) to values you are LICENSED /
+  #    AUTHORISED to transmit on for your hardware and location.
   - name: Chirp
-    description: "Chirp sequence at a specified center frequency and bandwidth."
+    description: "Linear chirp TX at a specified center frequency and bandwidth."
     command:
       - python3
-      - /opt/sdr-agent/scripts/sqwtooth_fm_sweep.py
+      - /opt/sdr-agent/scripts/sawtooth_fm_sweep.py
+      - -f
+      - "2.4e9"        # center frequency [Hz] — CHANGE to your authorised band
+      - -b
+      - "30e6"         # sweep bandwidth [Hz]
+      - -c
+      - "200e3"        # chirp repetition rate [Hz] (lower = more spectral lines)
+      - -g
+      - "40"           # TX gain [dB]
     working_dir: /opt/sdr-agent/scripts
     env:
       GR_DONT_LOAD_PREFS: "1"          # skip slow pref scan in headless mode

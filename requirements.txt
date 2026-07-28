@@ -3,9 +3,13 @@ uvicorn[standard]==0.30.6
 pydantic==2.8.2
 PyYAML==6.0.2
 websockets==13.1
-aiohttp==3.10.5
 python-multipart==0.0.9
 zeroconf==0.131.0
 # psutil is installed via apt (python3-psutil) — see install.sh.
 # Keeping it out of pip avoids conflicts with the apt-managed version,
 # which has no RECORD file and can't be pip-uninstalled.
+#
+# Note: aiohttp was removed — it was only used by the old outbound-webhook POST
+# path, which has been replaced by the SSE event stream. Confirm with
+#   grep -rn aiohttp agent/
+# returns nothing before deploying, then this is safe to drop.

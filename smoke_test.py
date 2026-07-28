@@ -21,7 +21,7 @@ import json
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BASE = sys.argv[1].rstrip("/") if len(sys.argv) > 1 else "http://jhostname.local:8765"
+BASE = sys.argv[1].rstrip("/") if len(sys.argv) > 1 else "http://hostname.local:8765"
 API_KEY = sys.argv[2] if len(sys.argv) > 2 else ""   # optional
 
 # A task that already exists on the unit and is safe to start/stop repeatedly.
