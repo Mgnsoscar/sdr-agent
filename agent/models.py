@@ -72,15 +72,9 @@ class AgentInfo(BaseModel):
     tasks: list[str]
 
 
-class WebhookRegistration(BaseModel):
-    """A URL the agent should POST crash/exit events to."""
-    url: str                           # e.g. "http://192.168.1.50:8766/events"
-    secret: str = ""                   # Optional shared secret sent in X-Webhook-Secret header
-
-
 class CrashEvent(BaseModel):
-    """Payload POSTed to registered webhooks when a task crashes or exits unexpectedly."""
-    type: str = "crash"                # Webhook event type discriminator
+    """Event emitted on the SSE stream when a task crashes or exits unexpectedly."""
+    type: str = "crash"                # Event type discriminator
     unit_id: str
     task_name: str
     task_description: str
@@ -180,7 +174,7 @@ class PatchEventRequest(BaseModel):
 
 
 class EventWebhook(BaseModel):
-    """Payload POSTed to webhooks on event lifecycle transitions."""
+    """Event emitted on the SSE stream on scheduled-event lifecycle transitions."""
     type: str                          # "event_started" | "event_stopped" | "event_aborted" | "event_modified"
     unit_id: str
     event_id: str
@@ -322,7 +316,7 @@ class PatchSequenceRunRequest(BaseModel):
 
 
 class SequenceWebhook(BaseModel):
-    """Payload POSTed to webhooks on sequence-run lifecycle transitions."""
+    """Event emitted on the SSE stream on sequence-run lifecycle transitions."""
     type: str                          # sequence_started | sequence_step | sequence_stopped | sequence_aborted | sequence_modified
     unit_id: str
     run_id: str
