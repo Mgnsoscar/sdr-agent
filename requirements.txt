@@ -13,3 +13,6 @@ zeroconf==0.131.0
 # path, which has been replaced by the SSE event stream. Confirm with
 #   grep -rn aiohttp agent/
 # returns nothing before deploying, then this is safe to drop.
+
+ruamel.yaml==0.19.1
+
