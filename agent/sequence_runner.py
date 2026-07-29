@@ -86,6 +86,11 @@ class SequenceRunner:
         self._runs: Dict[str, SequenceRun] = {}
         self._loop_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
+        # Run ids for which the on-air (T0) marker event has already been emitted,
+        # so we fire "sequence_on_air" exactly once per run when on_air_at is
+        # reached. In-memory only: a run mid-flight across a restart is aborted by
+        # reconcile, so this never needs to survive one.
+        self._on_air_marked: set[str] = set()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -401,6 +406,34 @@ class SequenceRunner:
         due.sort(key=lambda rs: _parse(rs[1].fire_at))
         for run, step in due:
             await self._fire_step(run, step)
+
+        # Emit the on-air (T0) marker for any run that has reached on_air_at.
+        await self._emit_on_air(now)
+
+    # ── On-air marker ─────────────────────────────────────────────────────────────
+
+    async def _emit_on_air(self, now: datetime) -> None:
+        """
+        Fire a one-shot "sequence_on_air" event when a run crosses its on_air_at
+        (T0). This is distinct from "sequence_started", which fires when the run's
+        FIRST step fires — that's the warm-up moment, not on-air. Without this, an
+        activity feed can only show T0 via a generic step event; this gives the
+        actual RF-live moment its own marker.
+        """
+        due: List[SequenceRun] = []
+        async with self._lock:
+            for run in self._runs.values():
+                if run.state not in (SequenceState.ARMED, SequenceState.RUNNING):
+                    continue
+                if run.id in self._on_air_marked:
+                    continue
+                if _parse(run.on_air_at) <= now:
+                    self._on_air_marked.add(run.id)
+                    due.append(run)
+
+        for run in due:
+            await self._fire(run, "sequence_on_air", detail="on air")
+            logger.info("Run %s on air (T0 reached)", run.id)
 
     # ── Step firing ──────────────────────────────────────────────────────────────
 

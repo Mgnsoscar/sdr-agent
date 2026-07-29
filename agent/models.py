@@ -317,7 +317,7 @@ class PatchSequenceRunRequest(BaseModel):
 
 class SequenceWebhook(BaseModel):
     """Event emitted on the SSE stream on sequence-run lifecycle transitions."""
-    type: str                          # sequence_started | sequence_step | sequence_stopped | sequence_aborted | sequence_modified
+    type: str                          # sequence_started | sequence_on_air | sequence_step | sequence_stopped | sequence_aborted | sequence_modified
     unit_id: str
     run_id: str
     sequence_name: str
