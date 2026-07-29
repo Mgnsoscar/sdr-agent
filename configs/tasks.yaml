@@ -19,17 +19,6 @@
 
 tasks:
 
-  # ── GNU Radio flowgraph ────────────────────────────────────────────────────
-  - name: rx_flowgraph
-    description: "Main RX flowgraph (Ettus B206-mini)"
-    command:
-      - python3
-      - /opt/sdr-agent/scripts/rx_flowgraph.py
-    working_dir: /opt/sdr-agent/scripts
-    env:
-      GR_DONT_LOAD_PREFS: "1"          # skip slow pref scan in headless mode
-    autostart: false
-    restart_on_crash: false
 
   # ── Chirp transmitter ──────────────────────────────────────────────────────
   # NOTE: the script now takes its transmit parameters from the command line
@@ -53,24 +42,5 @@ tasks:
     working_dir: /opt/sdr-agent/scripts
     env:
       GR_DONT_LOAD_PREFS: "1"          # skip slow pref scan in headless mode
-    autostart: false
-    restart_on_crash: false
-
-  # ── Programmable attenuator controller ────────────────────────────────────
-  - name: attenuator
-    description: "Attenuator control loop"
-    command:
-      - python3
-      - /opt/sdr-agent/scripts/attenuator_ctrl.py
-    working_dir: /opt/sdr-agent/scripts
-    autostart: false
-    restart_on_crash: false
-
-  # ── Example: any shell script or binary ───────────────────────────────────
-  - name: spectrum_logger
-    description: "Periodic spectrum snapshot logger"
-    command:
-      - python3
-      - /opt/sdr-agent/scripts/spectrum_logger.py
     autostart: false
     restart_on_crash: false
