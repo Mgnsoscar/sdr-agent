@@ -31,6 +31,8 @@ import sys
 import numpy as np
 from gnuradio import gr, blocks, uhd
 
+import threading
+
 
 DEFAULT_OVERSAMPLE = 1.25      # fs = oversample * bandwidth
 MIN_SAMP_RATE = 200e3          # floor so narrow chirps still get a sane rate
@@ -115,31 +117,33 @@ class ChirpTx(gr.top_block):
 
 
 def main():
+
     p = argparse.ArgumentParser(description="Linear chirp transmitter")
-    p.add_argument("-f", "--center-freq", type=float, required=True,
+    p.add_argument("-Center-Freq", "--center-freq", type=float, required=True,
                    help="RF center frequency [Hz]")
-    p.add_argument("-b", "--bandwidth", type=float, required=True,
+    p.add_argument("-Sweep-BW", "--bandwidth", type=float, required=True,
                    help="Chirp sweep bandwidth [Hz]")
-    p.add_argument("-c", "--chirp-freq", type=float, required=True,
+    p.add_argument("-Sweep-Freq", "--chirp-freq", type=float, required=True,
                    help="Chirp repetition frequency [Hz] "
                         "(lower = more, closer spectral lines)")
-    p.add_argument("-g", "--gain", type=float, default=30.0,
+    p.add_argument("-Gain", "--gain", type=float, default=30.0,
                    help="USRP TX gain [dB] (default 30)")
-    p.add_argument("-a", "--amplitude", type=float, default=0.7,
+    p.add_argument("-Vector-Amplitude", "--amplitude", type=float, default=0.7,
                    help="Baseband amplitude 0-1 (default 0.7)")
-    p.add_argument("--oversample", type=float, default=DEFAULT_OVERSAMPLE,
+    p.add_argument("--Oversample", type=float, default=DEFAULT_OVERSAMPLE,
                    help=f"fs = oversample * bandwidth (default {DEFAULT_OVERSAMPLE}). "
                         "Lower toward 1.0 if a very wide chirp still underflows.")
 
     p.add_argument("--args", type=str, default="",
                    help='UHD device args, e.g. "serial=1234" or '
                         '"num_send_frames=256" to enlarge the USB send buffer')
-    p.add_argument("-r", "--randomization", type=float, default=0.0,
-                   help="Phase random-walk stddev per sample (0 = clean chirp)")
+    p.add_argument("-Phase-Randomization", "--randomization", type=float, default=0.0,
+                   help="Phase random-walk stddev per sample (0 = clean chirp). Setting this to 0.05 will produce a "
+                        "a reasonably uniform noise that's not combed.")
     opts = p.parse_args()
 
     tb = ChirpTx(opts.center_freq, opts.bandwidth, opts.chirp_freq,
-                 opts.gain, opts.amplitude, opts.oversample, opts.args,
+                 opts.gain, opts.amplitude, opts.Oversample, opts.args,
                  opts.randomization)
 
     def stop(sig, frame):

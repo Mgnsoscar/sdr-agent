@@ -64,14 +64,18 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
+import yaml
+from ruamel.yaml import YAML
+
 from . import config as cfg
 from . import system as sysmon
 from .models import (
     AgentInfo, ArmSequenceRequest, CreateEventRequest, CreateSequenceRequest,
     ExitRecord, PanicResult, PatchEventRequest, PatchSequenceRunRequest,
     ProcessStatus, ScheduledEvent, SdrStatus, Sequence, SequenceRun,
-    StartRequest, SystemHealth,
+    StartRequest, SystemHealth, TaskConfig,
 )
+from .argspec import extract_argparse_spec
 from .process_manager import ProcessManager
 from .scheduler import Scheduler
 from .sequence_runner import SequenceRunner
@@ -438,6 +442,156 @@ async def delete_script(name: str):
         raise HTTPException(status_code=500, detail=f"Failed to delete file: {exc}")
     logger.info("Script deleted: %s", name)
     return {"deleted": name}
+
+
+@app.get("/scripts/{name}/params", tags=["scripts"], dependencies=[Depends(verify_key)])
+async def script_params(name: str):
+    """Statically extract a script's argparse parameters (no code execution)."""
+    path = _safe_script_path(name)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"No such script: {name}")
+    try:
+        source = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read file: {exc}")
+    return extract_argparse_spec(source)
+
+
+# ── Task registry editing (create / update / delete, with live reload) ────────
+# Tasks live in tasks.yaml. We edit it with ruamel.yaml (round-trip) so its
+# comments and formatting survive, then call manager.reload() so the change
+# takes effect immediately — no agent restart or Pi reboot.
+
+_yaml_rt = YAML()
+_yaml_rt.preserve_quotes = True
+_yaml_rt.indent(mapping=2, sequence=4, offset=2)
+
+
+def _plain(obj):
+    """Recursively convert ruamel types to plain python (for a safe fallback dump)."""
+    if isinstance(obj, dict):
+        return {str(k): _plain(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_plain(v) for v in obj]
+    if isinstance(obj, bool):
+        return bool(obj)
+    if isinstance(obj, int):
+        return int(obj)
+    if isinstance(obj, float):
+        return float(obj)
+    if isinstance(obj, str):
+        return str(obj)
+    return obj
+
+
+def _load_tasks_doc():
+    doc = None
+    if cfg.TASKS_YAML.exists():
+        try:
+            with cfg.TASKS_YAML.open() as fh:
+                doc = _yaml_rt.load(fh)
+        except Exception as exc:
+            # A previously-corrupted file shouldn't wedge every edit — start from a
+            # clean doc so the next save rewrites a valid file.
+            logger.error("tasks.yaml could not be parsed (%s); starting fresh", exc)
+            doc = None
+    if not isinstance(doc, dict):
+        doc = {}
+    if doc.get("tasks") is None:
+        doc["tasks"] = []
+    return doc
+
+
+def _save_tasks_doc(doc) -> None:
+    import io
+    buf = io.StringIO()
+    _yaml_rt.dump(doc, buf)
+    text = buf.getvalue()
+    # ruamel's comment handling can emit YAML that PyYAML (used by load_tasks)
+    # can't parse — when a commented entry is removed or the list empties, orphaned
+    # comments end up before a `[]`. Verify the result loads; if not, fall back to a
+    # plain, comment-free dump so the file on disk is always valid.
+    try:
+        yaml.safe_load(text)
+    except yaml.YAMLError:
+        text = yaml.safe_dump(
+            {"tasks": _plain(doc.get("tasks") or [])},
+            sort_keys=False, default_flow_style=False, allow_unicode=True,
+        )
+    tmp = cfg.TASKS_YAML.with_name(cfg.TASKS_YAML.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(cfg.TASKS_YAML)   # atomic swap
+
+
+def _task_index(doc, name: str) -> int:
+    for i, entry in enumerate(doc["tasks"]):
+        if entry.get("name") == name:
+            return i
+    return -1
+
+
+def _spec_to_entry(spec: TaskConfig) -> dict:
+    """A clean tasks.yaml entry — the commonly-edited fields only."""
+    return {
+        "name": spec.name,
+        "description": spec.description,
+        "command": list(spec.command),
+        "working_dir": spec.working_dir or str(SCRIPTS_DIR),
+        "env": dict(spec.env),
+        "autostart": spec.autostart,
+        "restart_on_crash": spec.restart_on_crash,
+    }
+
+
+@app.post("/tasks", tags=["tasks"], dependencies=[Depends(verify_key)])
+async def create_task(spec: TaskConfig, manager: ProcessManager = Depends(get_manager)):
+    """Add a task to tasks.yaml and reload live (no restart needed)."""
+    doc = _load_tasks_doc()
+    if _task_index(doc, spec.name) >= 0:
+        raise HTTPException(status_code=409, detail=f"A task named '{spec.name}' already exists")
+    doc["tasks"].append(_spec_to_entry(spec))
+    _save_tasks_doc(doc)
+    result = await manager.reload(cfg.load_tasks())
+    logger.info("Task created: %s (%s)", spec.name, result)
+    return {"created": spec.name, "reload": result}
+
+
+@app.put("/tasks/{name}", tags=["tasks"], dependencies=[Depends(verify_key)])
+async def update_task(name: str, spec: TaskConfig,
+                      manager: ProcessManager = Depends(get_manager)):
+    """
+    Replace a task's definition in tasks.yaml and reload live.
+
+    If the task is currently running it keeps running with its old command; the
+    new definition takes effect on the next start/restart.
+    """
+    doc = _load_tasks_doc()
+    idx = _task_index(doc, name)
+    if idx < 0:
+        raise HTTPException(status_code=404, detail=f"No such task: {name}")
+    if spec.name != name and _task_index(doc, spec.name) >= 0:
+        raise HTTPException(status_code=409, detail=f"A task named '{spec.name}' already exists")
+    doc["tasks"][idx] = _spec_to_entry(spec)
+    _save_tasks_doc(doc)
+    result = await manager.reload(cfg.load_tasks())
+    logger.info("Task updated: %s -> %s (%s)", name, spec.name, result)
+    return {"updated": name, "reload": result}
+
+
+@app.delete("/tasks/{name}", tags=["tasks"], dependencies=[Depends(verify_key)])
+async def delete_task(name: str, manager: ProcessManager = Depends(get_manager)):
+    """Remove a task from tasks.yaml and reload live. Refuses if it's running."""
+    if manager.is_running(name):
+        raise HTTPException(status_code=409, detail=f"Task '{name}' is running — stop it first")
+    doc = _load_tasks_doc()
+    idx = _task_index(doc, name)
+    if idx < 0:
+        raise HTTPException(status_code=404, detail=f"No such task: {name}")
+    del doc["tasks"][idx]
+    _save_tasks_doc(doc)
+    result = await manager.reload(cfg.load_tasks())
+    logger.info("Task deleted: %s (%s)", name, result)
+    return {"deleted": name, "reload": result}
 
 
 # ── System health ─────────────────────────────────────────────────────────────

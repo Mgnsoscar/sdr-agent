@@ -50,8 +50,12 @@ def load_tasks() -> Dict[str, TaskConfig]:
         logger.warning("tasks.yaml not found at %s — no tasks registered", TASKS_YAML)
         return {}
 
-    with TASKS_YAML.open() as fh:
-        raw = yaml.safe_load(fh) or {}
+    try:
+        with TASKS_YAML.open() as fh:
+            raw = yaml.safe_load(fh) or {}
+    except yaml.YAMLError as exc:
+        logger.error("tasks.yaml is not valid YAML (%s) — registering no tasks", exc)
+        return {}
 
     tasks: Dict[str, TaskConfig] = {}
     for entry in raw.get("tasks", []):

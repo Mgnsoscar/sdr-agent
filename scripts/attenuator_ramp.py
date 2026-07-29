@@ -1,3 +1,6 @@
+import argparse
+
+
 NAME = "/dev/ttyACM0"
 
 
@@ -15,6 +18,7 @@ class Port(object):
         with open(self._name, "r") as port:
             return port.readline()
 
+
 class Attenuator(Port):
     _channel: int
 
@@ -26,11 +30,24 @@ class Attenuator(Port):
         self._write(f"SET {self._channel} = {attenuation}")
         print(self._read())
 
-if __name__ == "__main__":
 
-    import time
+
+def main():
+
     attenuator = Attenuator(NAME, 1)
 
-    for i in range(90, 0, 10):
-        attenuator.set_attenuation(i)
-        time.sleep(1)
+    p = argparse.ArgumentParser(description="Attenuator")
+
+    p.add_argument("-Attenuation", "--start", type=float, required=True, help="New attenuation value [dB].")
+
+    opt = p.parse_args()
+
+    try:
+        attenuator.set_attenuation(opt.Attenuation)
+    except Exception as e:
+        print("Failed to set attenuation to " + str(opt.Attenuation))
+
+
+if __name__ == "__main__":
+
+    main()
