@@ -31,6 +31,8 @@ import sys
 import numpy as np
 from gnuradio import gr, blocks, uhd
 
+import threading
+
 
 DEFAULT_OVERSAMPLE = 1.25      # fs = oversample * bandwidth
 MIN_SAMP_RATE = 200e3          # floor so narrow chirps still get a sane rate

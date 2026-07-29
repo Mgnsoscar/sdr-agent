@@ -5,6 +5,7 @@ PyYAML==6.0.2
 websockets==13.1
 python-multipart==0.0.9
 zeroconf==0.131.0
+inotify-simple
 # psutil is installed via apt (python3-psutil) — see install.sh.
 # Keeping it out of pip avoids conflicts with the apt-managed version,
 # which has no RECORD file and can't be pip-uninstalled.
@@ -13,6 +14,5 @@ zeroconf==0.131.0
 # path, which has been replaced by the SSE event stream. Confirm with
 #   grep -rn aiohttp agent/
 # returns nothing before deploying, then this is safe to drop.
-
 ruamel.yaml==0.19.1
 
