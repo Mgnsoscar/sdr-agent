@@ -91,6 +91,9 @@ class SequenceRunner:
         # reached. In-memory only: a run mid-flight across a restart is aborted by
         # reconcile, so this never needs to survive one.
         self._on_air_marked: set[str] = set()
+        # Same, for the off-air (on_air_end / T_end) marker. Reset when a run's
+        # on_air_end is moved (patch), so it re-fires at the new end.
+        self._off_air_marked: set[str] = set()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -332,6 +335,9 @@ class SequenceRunner:
 
             old_end = run.on_air_end
             run.on_air_end = new_end.isoformat()
+            # The end moved — allow the off-air marker to fire again at the new end
+            # (e.g. a run extended after it had already gone off air).
+            self._off_air_marked.discard(run.id)
 
             # Recompute only stop-anchored steps that haven't fired yet; keep
             # the fired_actual on already-fired steps. Simplest correct approach:
@@ -407,10 +413,12 @@ class SequenceRunner:
         for run, step in due:
             await self._fire_step(run, step)
 
-        # Emit the on-air (T0) marker for any run that has reached on_air_at.
+        # Emit the on-air (T0) and off-air (T_end) markers for any run that has
+        # reached those moments.
         await self._emit_on_air(now)
+        await self._emit_off_air(now)
 
-    # ── On-air marker ─────────────────────────────────────────────────────────────
+    # ── On-air / off-air markers ──────────────────────────────────────────────────
 
     async def _emit_on_air(self, now: datetime) -> None:
         """
@@ -434,6 +442,31 @@ class SequenceRunner:
         for run in due:
             await self._fire(run, "sequence_on_air", detail="on air")
             logger.info("Run %s on air (T0 reached)", run.id)
+
+    async def _emit_off_air(self, now: datetime) -> None:
+        """
+        Fire a one-shot "sequence_off_air" event when a run crosses its on_air_end
+        (T_end). This is distinct from "sequence_stopped", which fires once EVERY
+        step (including cool-down, which is stop-anchored at positive offsets) has
+        fired — that's the run finishing, not the RF-off instant. Open-ended runs
+        have no on_air_end and never emit this; they end via abort.
+        """
+        due: List[SequenceRun] = []
+        async with self._lock:
+            for run in self._runs.values():
+                if run.state not in (SequenceState.ARMED, SequenceState.RUNNING):
+                    continue
+                if run.open_ended or not run.on_air_end:
+                    continue
+                if run.id in self._off_air_marked:
+                    continue
+                if _parse(run.on_air_end) <= now:
+                    self._off_air_marked.add(run.id)
+                    due.append(run)
+
+        for run in due:
+            await self._fire(run, "sequence_off_air", detail="off air")
+            logger.info("Run %s off air (on_air_end reached)", run.id)
 
     # ── Step firing ──────────────────────────────────────────────────────────────
 
