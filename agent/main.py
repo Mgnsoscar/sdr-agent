@@ -64,6 +64,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
+import yaml
 from ruamel.yaml import YAML
 
 from . import config as cfg
@@ -466,11 +467,34 @@ _yaml_rt.preserve_quotes = True
 _yaml_rt.indent(mapping=2, sequence=4, offset=2)
 
 
+def _plain(obj):
+    """Recursively convert ruamel types to plain python (for a safe fallback dump)."""
+    if isinstance(obj, dict):
+        return {str(k): _plain(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_plain(v) for v in obj]
+    if isinstance(obj, bool):
+        return bool(obj)
+    if isinstance(obj, int):
+        return int(obj)
+    if isinstance(obj, float):
+        return float(obj)
+    if isinstance(obj, str):
+        return str(obj)
+    return obj
+
+
 def _load_tasks_doc():
     doc = None
     if cfg.TASKS_YAML.exists():
-        with cfg.TASKS_YAML.open() as fh:
-            doc = _yaml_rt.load(fh)
+        try:
+            with cfg.TASKS_YAML.open() as fh:
+                doc = _yaml_rt.load(fh)
+        except Exception as exc:
+            # A previously-corrupted file shouldn't wedge every edit — start from a
+            # clean doc so the next save rewrites a valid file.
+            logger.error("tasks.yaml could not be parsed (%s); starting fresh", exc)
+            doc = None
     if not isinstance(doc, dict):
         doc = {}
     if doc.get("tasks") is None:
@@ -479,9 +503,23 @@ def _load_tasks_doc():
 
 
 def _save_tasks_doc(doc) -> None:
+    import io
+    buf = io.StringIO()
+    _yaml_rt.dump(doc, buf)
+    text = buf.getvalue()
+    # ruamel's comment handling can emit YAML that PyYAML (used by load_tasks)
+    # can't parse — when a commented entry is removed or the list empties, orphaned
+    # comments end up before a `[]`. Verify the result loads; if not, fall back to a
+    # plain, comment-free dump so the file on disk is always valid.
+    try:
+        yaml.safe_load(text)
+    except yaml.YAMLError:
+        text = yaml.safe_dump(
+            {"tasks": _plain(doc.get("tasks") or [])},
+            sort_keys=False, default_flow_style=False, allow_unicode=True,
+        )
     tmp = cfg.TASKS_YAML.with_name(cfg.TASKS_YAML.name + ".tmp")
-    with tmp.open("w") as fh:
-        _yaml_rt.dump(doc, fh)
+    tmp.write_text(text, encoding="utf-8")
     tmp.replace(cfg.TASKS_YAML)   # atomic swap
 
 
