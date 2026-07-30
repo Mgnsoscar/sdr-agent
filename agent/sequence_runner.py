@@ -230,6 +230,7 @@ class SequenceRunner:
                 task_name=s.task_name,
                 fire_at=fire_at.isoformat(),
                 resume_offset_s=inject,
+                args=list(s.args),
             ))
         # Sort by fire time so the runner fires them in order
         fires.sort(key=lambda f: _parse(f.fire_at))
@@ -343,14 +344,14 @@ class SequenceRunner:
             # the fired_actual on already-fired steps. Simplest correct approach:
             # rebuild all steps, then re-apply fired_actual for matching steps.
             fired_map = {
-                (f.anchor, f.offset_s, f.action, f.task_name): f.fired_actual
+                (f.anchor, f.offset_s, f.action, f.task_name, tuple(f.args)): f.fired_actual
                 for f in run.steps
             }
             rebuilt = self._resolve_steps(
                 seq, _parse(run.on_air_at), new_end, run.resume_offset_s
             )
             for f in rebuilt:
-                key = (f.anchor, f.offset_s, f.action, f.task_name)
+                key = (f.anchor, f.offset_s, f.action, f.task_name, tuple(f.args))
                 f.fired_actual = fired_map.get(key)
             run.steps = rebuilt
             self._persist_runs()
@@ -480,11 +481,16 @@ class SequenceRunner:
 
         try:
             if step.action == "start":
-                if step.resume_offset_s and step.resume_offset_s > 0:
-                    sreq = self._manager.build_resume_request(step.task_name, step.resume_offset_s)
-                    await self._manager.start(step.task_name, sreq, source="sequence")
-                else:
-                    await self._manager.start(step.task_name, source="sequence")
+                # Start with any resume-offset injection PLUS this step's own extra
+                # args, so a single registered task can be reused with different
+                # arguments per step (e.g. a set-gain script at various gains).
+                # build_resume_request returns an empty StartRequest for offset 0 /
+                # non-resumable tasks, so this covers the no-resume case too.
+                sreq = self._manager.build_resume_request(
+                    step.task_name, step.resume_offset_s or 0.0)
+                if step.args:
+                    sreq.args = list(sreq.args) + list(step.args)
+                await self._manager.start(step.task_name, sreq, source="sequence")
             else:  # stop
                 await self._manager.stop(step.task_name, source="sequence")
         except Exception as exc:

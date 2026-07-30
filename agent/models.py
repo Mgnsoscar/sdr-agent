@@ -225,6 +225,11 @@ class SequenceStep(BaseModel):
     offset_s: float                    # relative to the chosen anchor
     action: StepAction
     task_name: str
+    # Extra CLI args appended to the base task's command when this step STARTs it,
+    # so one registered task (e.g. a set-gain script) can be reused across steps
+    # with different values instead of registering one task per value. Ignored for
+    # stop actions. Merged after any resume-offset args.
+    args: list[str] = []
     inject_resume_offset: bool = False # If true and resuming, pass the offset to this task's start
 
 
@@ -264,6 +269,7 @@ class StepFire(BaseModel):
     fire_at: str                       # absolute UTC the step is scheduled to fire
     fired_actual: Optional[str] = None # when it actually fired (None if not yet / aborted before)
     resume_offset_s: Optional[float] = None  # offset injected, if any
+    args: list[str] = []               # extra CLI args for this step's start (see SequenceStep.args)
 
 
 class SequenceRun(BaseModel):
