@@ -95,18 +95,26 @@ class LogManager:
 
         Sends the recent backlog first, then follows current.log in real time.
 
-        Two robustness fixes vs. a naive follow loop:
-          1. Survives log rotation. When a task restarts, rotate() renames
+        Three robustness fixes vs. a naive follow loop:
+          1. Waits for the log to appear. A task tailed before its first run (or a
+             sequence step that fires later) hasn't created current.log yet. A
+             naive open() would raise and end the stream, so nothing would ever
+             show even once the task fires. We poll until the file exists and then
+             follow it, so output appears the moment the task starts.
+          2. Survives log rotation. When a task restarts, rotate() renames
              current.log to an archive and creates a fresh current.log. A handle
              opened once would keep following the *renamed* (now archived) inode
              and silently go quiet. We detect the inode change and reopen so the
              tail keeps following the new run's output.
-          2. Detects a client that goes away even while the log is idle. The
+          3. Detects a client that goes away even while the log is idle. The
              client only ever reads, so we run a concurrent receive that resolves
              when it disconnects — otherwise a gone client is noticed only on the
              next write, which never happens for an idle task, leaking the
              coroutine and socket.
         """
+        # Whether the file exists now decides where we start following (see below).
+        existed_at_start = self.current.exists()
+
         # Backlog first
         history = await self.tail(lines)
         for line in history:
@@ -128,8 +136,21 @@ class LogManager:
             return fh, os.fstat(fh.fileno()).st_ino
 
         try:
-            fh, cur_inode = _open_current()
-            fh.seek(0, os.SEEK_END)   # only *new* output for the first file
+            # The log may not exist yet — wait for it instead of ending the stream.
+            fh = None
+            while not closed.done():
+                try:
+                    fh, cur_inode = _open_current()
+                    break
+                except OSError:
+                    await asyncio.sleep(0.2)
+            if fh is None:
+                return   # client disconnected before the log appeared
+
+            if existed_at_start:
+                fh.seek(0, os.SEEK_END)   # existing file: only new output (backlog already sent)
+            # else: the file was created after we started tailing (the run we were
+            # waiting for) — follow from the start so its first output isn't missed.
             try:
                 while not closed.done():
                     chunk = fh.read(4096)

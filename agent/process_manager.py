@@ -437,17 +437,19 @@ class ProcessManager:
         Launch a task's command as a transient, self-terminating process — NOT the
         task's single managed slot — so a sequence can fire many (e.g. attenuator
         sets at different values) without an "already running" collision, and
-        without needing a stop. Output is appended to <log>/<task>/oneshot.log.
-        Tracked so abort/panic can sweep any still-running one-shot.
+        without needing a stop. Output is appended to the task's current.log — the
+        same log the Logs tab tails — so a one-shot's output is visible there
+        instead of a separate file the UI never reads. Tracked so abort/panic can
+        sweep any still-running one-shot.
         """
-        cfg = self._get(name).config
+        mp = self._get(name)
+        cfg = mp.config
         cmd = _build_command(cfg.command, list(args), replace=True)
         env = {**os.environ, **cfg.env}
-        log_dir = self._log_root / name
+        env.setdefault("PYTHONUNBUFFERED", "1")   # flush print()/stdout live, like logging
         try:
-            log_dir.mkdir(parents=True, exist_ok=True)
-            fh = (log_dir / "oneshot.log").open("ab")
-            fh.write(f"\n--- {_utcnow()}  {' '.join(cmd)} ---\n".encode())
+            fh = mp.log.current.open("ab")   # append into the task's single log
+            fh.write(f"\n--- {_utcnow()}  one-shot: {' '.join(cmd)} ---\n".encode())
         except OSError as exc:
             logger.error("One-shot '%s': could not open log: %s", name, exc)
             fh = None
