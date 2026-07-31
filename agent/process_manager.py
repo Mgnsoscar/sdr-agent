@@ -2,8 +2,9 @@
 ProcessManager — owns the lifecycle of every registered task.
 
 Each task runs as a real OS subprocess.  stdout and stderr are merged
-and written to the task's log file.  Crash-restart logic runs inside
-an asyncio task so it never blocks the HTTP server.
+and written to the task's log file, with PYTHONUNBUFFERED set so print()
+output flushes live instead of block-buffering.  Crash-restart logic runs
+inside an asyncio task so it never blocks the HTTP server.
 
 Event support: when a task crashes the manager fires a CrashEvent to all
 connected SSE subscribers (best-effort, non-blocking, stdlib-only).
@@ -158,6 +159,12 @@ class ManagedProcess:
 
         cmd = _build_command(self.config.command, req.args, req.replace_args)
         env = {**os.environ, **self.config.env, **req.env_overrides}
+        # stdout is redirected to a file, so Python would block-buffer print()
+        # output (appearing only in ~8 KB bursts or at exit) while stderr/logging
+        # stays prompt — the "prints sometimes show up, sometimes not" symptom.
+        # Force unbuffered output so both streams flush live. A task that really
+        # wants buffering can still override this in its env.
+        env.setdefault("PYTHONUNBUFFERED", "1")
 
         self.log.rotate()
         self.log.cleanup()   # prune old archives so the SD card never fills
@@ -437,17 +444,19 @@ class ProcessManager:
         Launch a task's command as a transient, self-terminating process — NOT the
         task's single managed slot — so a sequence can fire many (e.g. attenuator
         sets at different values) without an "already running" collision, and
-        without needing a stop. Output is appended to <log>/<task>/oneshot.log.
-        Tracked so abort/panic can sweep any still-running one-shot.
+        without needing a stop. Output is appended to the task's current.log — the
+        same log the Logs tab tails — so a one-shot's output is visible there
+        instead of a separate file the UI never reads. Tracked so abort/panic can
+        sweep any still-running one-shot.
         """
-        cfg = self._get(name).config
+        mp = self._get(name)
+        cfg = mp.config
         cmd = _build_command(cfg.command, list(args), replace=True)
         env = {**os.environ, **cfg.env}
-        log_dir = self._log_root / name
+        env.setdefault("PYTHONUNBUFFERED", "1")   # flush print()/stdout live, like logging
         try:
-            log_dir.mkdir(parents=True, exist_ok=True)
-            fh = (log_dir / "oneshot.log").open("ab")
-            fh.write(f"\n--- {_utcnow()}  {' '.join(cmd)} ---\n".encode())
+            fh = mp.log.current.open("ab")   # append into the task's single log
+            fh.write(f"\n--- {_utcnow()}  one-shot: {' '.join(cmd)} ---\n".encode())
         except OSError as exc:
             logger.error("One-shot '%s': could not open log: %s", name, exc)
             fh = None
