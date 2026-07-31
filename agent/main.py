@@ -75,7 +75,7 @@ from .models import (
     ProcessStatus, ScheduledEvent, SdrStatus, Sequence, SequenceRun,
     StartRequest, SystemHealth, TaskConfig,
 )
-from .argspec import extract_argparse_spec
+from .argspec import extract_params
 from .process_manager import ProcessManager
 from .scheduler import Scheduler
 from .sequence_runner import SequenceRunner
@@ -446,7 +446,10 @@ async def delete_script(name: str):
 
 @app.get("/scripts/{name}/params", tags=["scripts"], dependencies=[Depends(verify_key)])
 async def script_params(name: str):
-    """Statically extract a script's argparse parameters (no code execution)."""
+    """Statically extract a script's parameters (no code execution).
+
+    Returns the rich paramkit schema (kind/unit/min/max/presets) when the script
+    uses paramkit, otherwise the classic argparse schema."""
     path = _safe_script_path(name)
     if not path.is_file():
         raise HTTPException(status_code=404, detail=f"No such script: {name}")
@@ -454,7 +457,7 @@ async def script_params(name: str):
         source = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Failed to read file: {exc}")
-    return extract_argparse_spec(source)
+    return extract_params(source)
 
 
 # ── Task registry editing (create / update / delete, with live reload) ────────
