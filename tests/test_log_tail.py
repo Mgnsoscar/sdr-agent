@@ -96,5 +96,5 @@ def test_oneshot_output_goes_to_the_tasks_current_log(tmp_path):
     text = current.read_text()
     assert "ONESHOT STDOUT" in text        # print() visible in the Logs tab
     assert "ONESHOT STDERR" in text        # stderr/logging too
-    assert "one-shot:" in text             # the run marker header
+    assert "one-shot:" not in text         # no run-marker header noise in the log
     assert not (tmp_path / "t" / "oneshot.log").exists()   # no separate hidden file
