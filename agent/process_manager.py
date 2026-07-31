@@ -33,6 +33,24 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _script_prefix(command: list) -> list:
+    """The [interpreter, …, script] prefix of a command — up to and including the
+    first argument ending in .py. Falls back to the first element (the interpreter)
+    if there's no .py. Used to replace a task's trailing args with a step's."""
+    for i, a in enumerate(command):
+        if isinstance(a, str) and a.endswith(".py"):
+            return list(command[: i + 1])
+    return list(command[:1])
+
+
+def _build_command(command: list, args: list, replace: bool) -> list:
+    """Build the launch command. replace=True → [interpreter, script, *args]
+    (args are the complete set); replace=False → command + args (append)."""
+    if replace and args:
+        return _script_prefix(command) + list(args)
+    return list(command) + list(args)
+
+
 # ── Event dispatcher (SSE fan-out) ────────────────────────────────────────────
 
 class EventDispatcher:
@@ -138,7 +156,7 @@ class ManagedProcess:
         self.state = ProcessState.STARTING
         req = request or StartRequest()
 
-        cmd = list(self.config.command) + list(req.args)
+        cmd = _build_command(self.config.command, req.args, req.replace_args)
         env = {**os.environ, **self.config.env, **req.env_overrides}
 
         self.log.rotate()
@@ -346,6 +364,11 @@ class ProcessManager:
             name: ManagedProcess(cfg, LogManager(log_root, name), self._dispatcher, unit_id)
             for name, cfg in tasks.items()
         }
+        # Transient fire-and-exit ("run") processes — not tied to a task's single
+        # slot, so a sequence can fire many (e.g. attenuator sets) without the
+        # "already running" collision. Keyed by a monotonic id → (proc, fh, run_id).
+        self._oneshots: Dict[int, tuple] = {}
+        self._oneshot_seq = 0
 
     def _make_proc(self, cfg: TaskConfig) -> ManagedProcess:
         return ManagedProcess(
@@ -406,6 +429,70 @@ class ProcessManager:
         else:  # "arg"
             req.args = [cfg.resume_offset_flag, str(offset_s)]
         return req
+
+    # ── One-shot (fire-and-exit) runs ─────────────────────────────────────────
+
+    async def run_oneshot(self, name: str, args: List[str], run_id: str = "") -> None:
+        """
+        Launch a task's command as a transient, self-terminating process — NOT the
+        task's single managed slot — so a sequence can fire many (e.g. attenuator
+        sets at different values) without an "already running" collision, and
+        without needing a stop. Output is appended to <log>/<task>/oneshot.log.
+        Tracked so abort/panic can sweep any still-running one-shot.
+        """
+        cfg = self._get(name).config
+        cmd = _build_command(cfg.command, list(args), replace=True)
+        env = {**os.environ, **cfg.env}
+        log_dir = self._log_root / name
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            fh = (log_dir / "oneshot.log").open("ab")
+            fh.write(f"\n--- {_utcnow()}  {' '.join(cmd)} ---\n".encode())
+        except OSError as exc:
+            logger.error("One-shot '%s': could not open log: %s", name, exc)
+            fh = None
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=fh, stderr=fh, cwd=cfg.working_dir, env=env,
+            start_new_session=True,
+        )
+        self._oneshot_seq += 1
+        oid = self._oneshot_seq
+        self._oneshots[oid] = (proc, fh, run_id)
+        logger.info("One-shot '%s' (pid=%s): %s", name, proc.pid, cmd)
+        asyncio.create_task(self._watch_oneshot(oid, name))
+
+    async def _watch_oneshot(self, oid: int, name: str) -> None:
+        entry = self._oneshots.get(oid)
+        if entry is None:
+            return
+        proc, fh, _run_id = entry
+        code = await proc.wait()
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        self._oneshots.pop(oid, None)
+        if code not in (0, None):
+            logger.warning("One-shot '%s' exited with code %s", name, code)
+        else:
+            logger.info("One-shot '%s' completed", name)
+
+    async def stop_oneshots(self, run_id: Optional[str] = None) -> int:
+        """SIGTERM still-running one-shots (all, or just one run's). Returns the
+        number signalled. Their watchers clean up as they exit."""
+        signalled = 0
+        for _oid, (proc, _fh, rid) in list(self._oneshots.items()):
+            if run_id is not None and rid != run_id:
+                continue
+            if proc.returncode is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    signalled += 1
+                except (ProcessLookupError, OSError):
+                    pass
+        return signalled
 
     # ── Per-task operations ───────────────────────────────────────────────────
 

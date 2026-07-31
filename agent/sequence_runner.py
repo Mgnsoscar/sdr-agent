@@ -86,6 +86,14 @@ class SequenceRunner:
         self._runs: Dict[str, SequenceRun] = {}
         self._loop_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
+        # Run ids for which the on-air (T0) marker event has already been emitted,
+        # so we fire "sequence_on_air" exactly once per run when on_air_at is
+        # reached. In-memory only: a run mid-flight across a restart is aborted by
+        # reconcile, so this never needs to survive one.
+        self._on_air_marked: set[str] = set()
+        # Same, for the off-air (on_air_end / T_end) marker. Reset when a run's
+        # on_air_end is moved (patch), so it re-fires at the new end.
+        self._off_air_marked: set[str] = set()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -222,6 +230,8 @@ class SequenceRunner:
                 task_name=s.task_name,
                 fire_at=fire_at.isoformat(),
                 resume_offset_s=inject,
+                args=list(s.args),
+                replace_args=s.replace_args,
             ))
         # Sort by fire time so the runner fires them in order
         fires.sort(key=lambda f: _parse(f.fire_at))
@@ -327,19 +337,22 @@ class SequenceRunner:
 
             old_end = run.on_air_end
             run.on_air_end = new_end.isoformat()
+            # The end moved — allow the off-air marker to fire again at the new end
+            # (e.g. a run extended after it had already gone off air).
+            self._off_air_marked.discard(run.id)
 
             # Recompute only stop-anchored steps that haven't fired yet; keep
             # the fired_actual on already-fired steps. Simplest correct approach:
             # rebuild all steps, then re-apply fired_actual for matching steps.
             fired_map = {
-                (f.anchor, f.offset_s, f.action, f.task_name): f.fired_actual
+                (f.anchor, f.offset_s, f.action, f.task_name, tuple(f.args)): f.fired_actual
                 for f in run.steps
             }
             rebuilt = self._resolve_steps(
                 seq, _parse(run.on_air_at), new_end, run.resume_offset_s
             )
             for f in rebuilt:
-                key = (f.anchor, f.offset_s, f.action, f.task_name)
+                key = (f.anchor, f.offset_s, f.action, f.task_name, tuple(f.args))
                 f.fired_actual = fired_map.get(key)
             run.steps = rebuilt
             self._persist_runs()
@@ -402,6 +415,61 @@ class SequenceRunner:
         for run, step in due:
             await self._fire_step(run, step)
 
+        # Emit the on-air (T0) and off-air (T_end) markers for any run that has
+        # reached those moments.
+        await self._emit_on_air(now)
+        await self._emit_off_air(now)
+
+    # ── On-air / off-air markers ──────────────────────────────────────────────────
+
+    async def _emit_on_air(self, now: datetime) -> None:
+        """
+        Fire a one-shot "sequence_on_air" event when a run crosses its on_air_at
+        (T0). This is distinct from "sequence_started", which fires when the run's
+        FIRST step fires — that's the warm-up moment, not on-air. Without this, an
+        activity feed can only show T0 via a generic step event; this gives the
+        actual RF-live moment its own marker.
+        """
+        due: List[SequenceRun] = []
+        async with self._lock:
+            for run in self._runs.values():
+                if run.state not in (SequenceState.ARMED, SequenceState.RUNNING):
+                    continue
+                if run.id in self._on_air_marked:
+                    continue
+                if _parse(run.on_air_at) <= now:
+                    self._on_air_marked.add(run.id)
+                    due.append(run)
+
+        for run in due:
+            await self._fire(run, "sequence_on_air", detail="on air")
+            logger.info("Run %s on air (T0 reached)", run.id)
+
+    async def _emit_off_air(self, now: datetime) -> None:
+        """
+        Fire a one-shot "sequence_off_air" event when a run crosses its on_air_end
+        (T_end). This is distinct from "sequence_stopped", which fires once EVERY
+        step (including cool-down, which is stop-anchored at positive offsets) has
+        fired — that's the run finishing, not the RF-off instant. Open-ended runs
+        have no on_air_end and never emit this; they end via abort.
+        """
+        due: List[SequenceRun] = []
+        async with self._lock:
+            for run in self._runs.values():
+                if run.state not in (SequenceState.ARMED, SequenceState.RUNNING):
+                    continue
+                if run.open_ended or not run.on_air_end:
+                    continue
+                if run.id in self._off_air_marked:
+                    continue
+                if _parse(run.on_air_end) <= now:
+                    self._off_air_marked.add(run.id)
+                    due.append(run)
+
+        for run in due:
+            await self._fire(run, "sequence_off_air", detail="off air")
+            logger.info("Run %s off air (on_air_end reached)", run.id)
+
     # ── Step firing ──────────────────────────────────────────────────────────────
 
     async def _fire_step(self, run: SequenceRun, step: StepFire) -> None:
@@ -414,11 +482,22 @@ class SequenceRunner:
 
         try:
             if step.action == "start":
-                if step.resume_offset_s and step.resume_offset_s > 0:
-                    sreq = self._manager.build_resume_request(step.task_name, step.resume_offset_s)
-                    await self._manager.start(step.task_name, sreq, source="sequence")
-                else:
-                    await self._manager.start(step.task_name, source="sequence")
+                # Start with any resume-offset injection PLUS this step's own extra
+                # args, so a single registered task can be reused with different
+                # arguments per step (e.g. a set-gain script at various gains).
+                # build_resume_request returns an empty StartRequest for offset 0 /
+                # non-resumable tasks, so this covers the no-resume case too.
+                sreq = self._manager.build_resume_request(
+                    step.task_name, step.resume_offset_s or 0.0)
+                if step.args:
+                    sreq.args = list(sreq.args) + list(step.args)
+                sreq.replace_args = step.replace_args
+                await self._manager.start(step.task_name, sreq, source="sequence")
+            elif step.action == "run":
+                # Fire-and-exit: a transient process, no slot, no stop. Many of the
+                # same script (e.g. attenuator sets) can run without colliding.
+                await self._manager.run_oneshot(
+                    step.task_name, list(step.args), run_id=run.id)
             else:  # stop
                 await self._manager.stop(step.task_name, source="sequence")
         except Exception as exc:
@@ -467,6 +546,12 @@ class SequenceRunner:
                     await self._manager.stop(name)
             except Exception as exc:
                 logger.error("Abort run %s: failed to stop '%s': %s", run.id, name, exc)
+
+        # Also sweep any still-running one-shot (run-action) processes for this run.
+        try:
+            await self._manager.stop_oneshots(run.id)
+        except Exception as exc:
+            logger.error("Abort run %s: failed to sweep one-shots: %s", run.id, exc)
 
         async with self._lock:
             run.state = SequenceState.ABORTED
