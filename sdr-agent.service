@@ -5,6 +5,10 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/sdr-agent
+# Put the install dir on PYTHONPATH so managed scripts (run as subprocesses from
+# /opt/sdr-agent/scripts) can `import paramkit`. Subprocesses inherit the agent's
+# environment, so this covers them too.
+Environment=PYTHONPATH=/opt/sdr-agent
 ExecStart=/usr/bin/python3 -m uvicorn agent.main:app --host 0.0.0.0 --port 8765
 Restart=on-failure
 RestartSec=5
