@@ -231,6 +231,7 @@ class SequenceRunner:
                 fire_at=fire_at.isoformat(),
                 resume_offset_s=inject,
                 args=list(s.args),
+                replace_args=s.replace_args,
             ))
         # Sort by fire time so the runner fires them in order
         fires.sort(key=lambda f: _parse(f.fire_at))
@@ -490,7 +491,13 @@ class SequenceRunner:
                     step.task_name, step.resume_offset_s or 0.0)
                 if step.args:
                     sreq.args = list(sreq.args) + list(step.args)
+                sreq.replace_args = step.replace_args
                 await self._manager.start(step.task_name, sreq, source="sequence")
+            elif step.action == "run":
+                # Fire-and-exit: a transient process, no slot, no stop. Many of the
+                # same script (e.g. attenuator sets) can run without colliding.
+                await self._manager.run_oneshot(
+                    step.task_name, list(step.args), run_id=run.id)
             else:  # stop
                 await self._manager.stop(step.task_name, source="sequence")
         except Exception as exc:
@@ -539,6 +546,12 @@ class SequenceRunner:
                     await self._manager.stop(name)
             except Exception as exc:
                 logger.error("Abort run %s: failed to stop '%s': %s", run.id, name, exc)
+
+        # Also sweep any still-running one-shot (run-action) processes for this run.
+        try:
+            await self._manager.stop_oneshots(run.id)
+        except Exception as exc:
+            logger.error("Abort run %s: failed to sweep one-shots: %s", run.id, exc)
 
         async with self._lock:
             run.state = SequenceState.ABORTED

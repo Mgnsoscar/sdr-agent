@@ -60,7 +60,12 @@ class ProcessStatus(BaseModel):
 class StartRequest(BaseModel):
     """Optional per-call overrides when starting a task."""
     env_overrides: Dict[str, str] = {}
-    args: list[str] = []               # Extra CLI args appended to the command
+    args: list[str] = []               # Extra CLI args for the command
+    # When False, args are APPENDED to the task's configured command (legacy).
+    # When True, args REPLACE the task's configured trailing args — the command
+    # becomes [interpreter, script, *args] — so a sequence step can fully specify
+    # a launch (from a parameter form) without duplicating the task's defaults.
+    replace_args: bool = False
 
 
 class AgentInfo(BaseModel):
@@ -206,8 +211,9 @@ class TaskEvent(BaseModel):
 # ── Sequences ──────────────────────────────────────────────────────────────────
 
 class StepAction(str, Enum):
-    START = "start"
-    STOP  = "stop"
+    START = "start"   # launch a long-running task (stopped later by a STOP step)
+    STOP  = "stop"    # stop a long-running task
+    RUN   = "run"     # fire-and-exit one-shot: launch, let it self-terminate, no stop
 
 
 class SequenceStep(BaseModel):
@@ -225,11 +231,14 @@ class SequenceStep(BaseModel):
     offset_s: float                    # relative to the chosen anchor
     action: StepAction
     task_name: str
-    # Extra CLI args appended to the base task's command when this step STARTs it,
-    # so one registered task (e.g. a set-gain script) can be reused across steps
-    # with different values instead of registering one task per value. Ignored for
-    # stop actions. Merged after any resume-offset args.
+    # CLI args for this step's start/run. So one registered task (e.g. a set-gain
+    # script) can be reused across steps with different values instead of one task
+    # per value. Ignored for stop actions.
     args: list[str] = []
+    # When True, args are the COMPLETE argument set (from a parameter form): the
+    # command becomes [interpreter, script, *args], replacing the task's configured
+    # defaults. When False (legacy), args are appended to the task's command.
+    replace_args: bool = False
     inject_resume_offset: bool = False # If true and resuming, pass the offset to this task's start
 
 
@@ -269,7 +278,8 @@ class StepFire(BaseModel):
     fire_at: str                       # absolute UTC the step is scheduled to fire
     fired_actual: Optional[str] = None # when it actually fired (None if not yet / aborted before)
     resume_offset_s: Optional[float] = None  # offset injected, if any
-    args: list[str] = []               # extra CLI args for this step's start (see SequenceStep.args)
+    args: list[str] = []               # CLI args for this step's start/run (see SequenceStep.args)
+    replace_args: bool = False         # args are the complete set (replace defaults), see SequenceStep
 
 
 class SequenceRun(BaseModel):

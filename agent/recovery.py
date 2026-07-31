@@ -79,6 +79,12 @@ async def panic_stop(
             except Exception as exc:
                 logger.error("Panic: failed to stop task '%s': %s", status.name, exc)
 
+    # 4. Sweep any still-running one-shot (run-action) processes across all runs.
+    try:
+        await manager.stop_oneshots(None)
+    except Exception as exc:
+        logger.error("Panic: failed to sweep one-shots: %s", exc)
+
     result = PanicResult(
         unit_id=unit_id,
         tasks_stopped=tasks_stopped,
