@@ -457,6 +457,7 @@ class ProcessManager:
         try:
             fh = mp.log.current.open("ab")   # append into the task's single log
             fh.write(f"\n--- {_utcnow()}  one-shot: {' '.join(cmd)} ---\n".encode())
+            fh.flush()   # land the header before the subprocess writes to the fd
         except OSError as exc:
             logger.error("One-shot '%s': could not open log: %s", name, exc)
             fh = None

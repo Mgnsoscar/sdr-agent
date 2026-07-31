@@ -35,12 +35,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from .log_manager import LogManager
 from .models import (
     ArmSequenceRequest, CreateSequenceRequest, Sequence, SequenceRun,
     SequenceState, SequenceStep, StepFire,
     SequenceWebhook,
 )
 from .process_manager import ProcessManager
+from .sequence_log import RunLog
 
 logger = logging.getLogger(__name__)
 
@@ -77,11 +79,18 @@ class SequenceRunner:
         unit_id: str,
         sequences_path: Path,
         runs_path: Path,
+        log_root: Path,
     ):
         self._manager  = manager
         self._unit_id  = unit_id
         self._seq_store = sequences_path
         self._run_store = runs_path
+        self._log_root = log_root
+        # One LogManager per sequence (logs/_sequences/<seq_id>/); the run log is
+        # rotated into it per run, so the Logs view tails the latest run.
+        self._seq_logs: Dict[str, LogManager] = {}
+        # Active per-run log writers (annotations + collected task output).
+        self._run_logs: Dict[str, RunLog] = {}
         self._sequences: Dict[str, Sequence] = {}
         self._runs: Dict[str, SequenceRun] = {}
         self._loop_task: Optional[asyncio.Task] = None
@@ -94,6 +103,42 @@ class SequenceRunner:
         # Same, for the off-air (on_air_end / T_end) marker. Reset when a run's
         # on_air_end is moved (patch), so it re-fires at the new end.
         self._off_air_marked: set[str] = set()
+
+    # ── Run logging ────────────────────────────────────────────────────────────
+
+    def get_sequence_log_manager(self, seq_id: str) -> LogManager:
+        """The LogManager for a sequence's run log (created lazily), so the Logs
+        view can tail it even between runs."""
+        lm = self._seq_logs.get(seq_id)
+        if lm is None:
+            lm = LogManager(self._log_root / "_sequences", seq_id)
+            self._seq_logs[seq_id] = lm
+        return lm
+
+    def _task_log_manager(self, name: str) -> Optional[LogManager]:
+        try:
+            return self._manager.get_log_manager(name)
+        except KeyError:
+            return None
+
+    def _open_run_log(self, seq: Sequence, run: SequenceRun) -> None:
+        try:
+            rl = RunLog(self.get_sequence_log_manager(seq.id), self._task_log_manager)
+            window = (f"on-air {run.on_air_at} → {run.on_air_end}"
+                      if run.on_air_end else f"on-air {run.on_air_at} (open-ended)")
+            rl.open(f"sequence '{seq.name}'  run {run.id}  {window}")
+            rl.annotate("armed")
+            self._run_logs[run.id] = rl
+        except Exception:
+            logger.exception("Run %s: could not open run log", run.id)
+
+    def _close_run_log(self, run_id: str, footer: str) -> None:
+        rl = self._run_logs.pop(run_id, None)
+        if rl is not None:
+            try:
+                rl.close(footer)
+            except Exception:
+                logger.exception("Run %s: error closing run log", run_id)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -291,6 +336,8 @@ class SequenceRunner:
             self._runs[run.id] = run
             self._persist_runs()
 
+        self._open_run_log(seq, run)
+
         logger.info(
             "Run %s armed from sequence '%s': on-air %s → %s%s (resume_offset=%.0fs)",
             run.id, seq.name, run.on_air_at,
@@ -377,6 +424,7 @@ class SequenceRunner:
             async with self._lock:
                 run.state = SequenceState.CANCELLED
                 self._persist_runs()
+            self._close_run_log(run_id, "cancelled before start")
             logger.info("Run %s cancelled before start", run_id)
             return run
 
@@ -400,6 +448,11 @@ class SequenceRunner:
 
     async def _tick(self) -> None:
         now = _utcnow_dt()
+
+        # Interleave any new task output into each active run's log.
+        for rl in list(self._run_logs.values()):
+            rl.collect()
+
         due: List[tuple[SequenceRun, StepFire]] = []
 
         async with self._lock:
@@ -442,6 +495,9 @@ class SequenceRunner:
                     due.append(run)
 
         for run in due:
+            rl = self._run_logs.get(run.id)
+            if rl is not None:
+                rl.annotate("ON AIR (T0)")
             await self._fire(run, "sequence_on_air", detail="on air")
             logger.info("Run %s on air (T0 reached)", run.id)
 
@@ -467,6 +523,9 @@ class SequenceRunner:
                     due.append(run)
 
         for run in due:
+            rl = self._run_logs.get(run.id)
+            if rl is not None:
+                rl.annotate("OFF AIR (T_end)")
             await self._fire(run, "sequence_off_air", detail="off air")
             logger.info("Run %s off air (on_air_end reached)", run.id)
 
@@ -479,6 +538,19 @@ class SequenceRunner:
         if first_step:
             run.state = SequenceState.RUNNING
             run.started_actual = run.started_actual or _utcnow_iso()
+
+        rl = self._run_logs.get(run.id)
+        if rl is not None:
+            glyph = {"start": "▶ start", "run": "⚡ run", "stop": "⏹ stop"}.get(
+                step.action, step.action)
+            line = f"{glyph} {step.task_name}"
+            if step.args:
+                line += " " + " ".join(step.args)
+            if step.resume_offset_s:
+                line += f"  (resume +{step.resume_offset_s:.0f}s)"
+            rl.annotate(line)
+            if step.action in ("start", "run"):
+                rl.watch_task(step.task_name)   # collect this task's output from here
 
         try:
             if step.action == "start":
@@ -525,6 +597,7 @@ class SequenceRunner:
                 run.state = SequenceState.COMPLETED
                 run.stopped_actual = _utcnow_iso()
                 self._persist_runs()
+            self._close_run_log(run.id, "completed")
             await self._fire(run, "sequence_stopped", detail="all steps complete")
             logger.info("Run %s completed", run.id)
         elif run.open_ended and all(s.fired_actual is not None for s in run.steps):
@@ -558,6 +631,7 @@ class SequenceRunner:
             run.stopped_actual = _utcnow_iso()
             self._persist_runs()
 
+        self._close_run_log(run.id, f"aborted: {reason}")
         await self._fire(run, "sequence_aborted", detail=reason)
         logger.warning("Run %s ABORTED (%s) — stopped tasks: %s", run.id, reason, task_names)
 
@@ -581,6 +655,7 @@ class SequenceRunner:
                 async with self._lock:
                     run.state = SequenceState.CANCELLED
                     self._persist_runs()
+                self._close_run_log(run.id, f"cancelled: {reason}")
             else:
                 await self._abort_run(run, reason=reason)
             aborted.append(run.id)

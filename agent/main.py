@@ -110,7 +110,7 @@ async def lifespan(app: FastAPI):
     await _scheduler.startup()
 
     _runner = SequenceRunner(
-        _manager, cfg.UNIT_ID, cfg.SEQUENCES_FILE, cfg.SEQUENCE_RUNS_FILE
+        _manager, cfg.UNIT_ID, cfg.SEQUENCES_FILE, cfg.SEQUENCE_RUNS_FILE, cfg.LOG_DIR
     )
     await _runner.startup()
 
@@ -781,6 +781,47 @@ async def update_sequence(
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ── Sequence run log (the whole run's timeline + interleaved task output) ──────
+
+@app.get("/sequences/{seq_id}/logs", response_model=list[str], tags=["sequences"],
+         dependencies=[Depends(verify_key)])
+async def get_sequence_logs(
+    seq_id: str,
+    lines: int = Query(default=200, ge=1, le=10_000),
+    runner: SequenceRunner = Depends(get_runner),
+):
+    try:
+        runner.get_sequence(seq_id)                       # 404 if unknown
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return await runner.get_sequence_log_manager(seq_id).tail(lines)
+
+
+@app.websocket("/sequences/{seq_id}/logs/stream")
+async def stream_sequence_logs(
+    seq_id: str,
+    websocket: WebSocket,
+    api_key: str | None = Query(default=None, alias="api_key"),
+    lines: int = Query(default=200, ge=1, le=2_000),
+):
+    if cfg.API_KEY and api_key != cfg.API_KEY:
+        await websocket.close(code=1008, reason="Unauthorized")
+        return
+    try:
+        runner = get_runner()
+        runner.get_sequence(seq_id)
+        lm = runner.get_sequence_log_manager(seq_id)
+    except (AssertionError, KeyError) as exc:
+        await websocket.close(code=1008, reason=str(exc))
+        return
+
+    await websocket.accept()
+    try:
+        await lm.stream(websocket, lines=lines)
+    except WebSocketDisconnect:
+        pass
 
 
 @app.delete("/sequences/{seq_id}", tags=["sequences"],
