@@ -2,8 +2,9 @@
 ProcessManager — owns the lifecycle of every registered task.
 
 Each task runs as a real OS subprocess.  stdout and stderr are merged
-and written to the task's log file.  Crash-restart logic runs inside
-an asyncio task so it never blocks the HTTP server.
+and written to the task's log file, with PYTHONUNBUFFERED set so print()
+output flushes live instead of block-buffering.  Crash-restart logic runs
+inside an asyncio task so it never blocks the HTTP server.
 
 Event support: when a task crashes the manager fires a CrashEvent to all
 connected SSE subscribers (best-effort, non-blocking, stdlib-only).
@@ -158,6 +159,12 @@ class ManagedProcess:
 
         cmd = _build_command(self.config.command, req.args, req.replace_args)
         env = {**os.environ, **self.config.env, **req.env_overrides}
+        # stdout is redirected to a file, so Python would block-buffer print()
+        # output (appearing only in ~8 KB bursts or at exit) while stderr/logging
+        # stays prompt — the "prints sometimes show up, sometimes not" symptom.
+        # Force unbuffered output so both streams flush live. A task that really
+        # wants buffering can still override this in its env.
+        env.setdefault("PYTHONUNBUFFERED", "1")
 
         self.log.rotate()
         self.log.cleanup()   # prune old archives so the SD card never fills
@@ -443,6 +450,7 @@ class ProcessManager:
         cfg = self._get(name).config
         cmd = _build_command(cfg.command, list(args), replace=True)
         env = {**os.environ, **cfg.env}
+        env.setdefault("PYTHONUNBUFFERED", "1")   # flush print()/stdout live, like logging
         log_dir = self._log_root / name
         try:
             log_dir.mkdir(parents=True, exist_ok=True)
