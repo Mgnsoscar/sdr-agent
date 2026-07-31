@@ -43,9 +43,9 @@ def build_script() -> Script:
         .number("-f", "--freq", unit="Hz", min=70e6, max=6e9,
                 presets=FREQUENCIES, required=True,
                 help="Center frequency.")
-        .number("-g", "--gain", unit="dB", min=0, max=89, default=40,
+        .number("-g", "--gain", unit="dB", min=0, max=89, step=1, default=40,
                 help="TX gain.")
-        .number("-d", "--duration", unit="s", min=0.0, max=3600.0, default=10.0,
+        .number("-d", "--duration", unit="s", min=0.0, max=3600.0, step=0.5, default=10.0,
                 help="How long to transmit.")
         .choice("--antenna", options=["TX/RX", "RX2"], default="TX/RX",
                 help="Which antenna port to use.")

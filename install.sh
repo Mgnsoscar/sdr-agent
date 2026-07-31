@@ -17,6 +17,7 @@ echo "==> Copying files"
 cp -r agent       "$INSTALL_DIR/"
 cp -r scripts     "$INSTALL_DIR/"
 cp -r configs     "$INSTALL_DIR/"
+cp -r paramkit    "$INSTALL_DIR/"   # importable by scripts via PYTHONPATH (see service)
 cp requirements.txt "$INSTALL_DIR/"
 
 echo "==> Installing system packages (apt)"
