@@ -72,5 +72,8 @@ def test_sequence_run_log_has_timeline_and_output(tmp_path):
     # ── interleaved program output, prefixed by task name ──
     assert "broadcast: BROADCAST tuned 100.0MHz" in log
     assert "atten: ATTEN set to 20 dB" in log
+    # ── the one-shot marker header (and its blank line) are NOT in the run log ──
+    assert "one-shot:" not in log
+    assert "atten: \n" not in log and not log.endswith("atten: ")
     # ordering: the start annotation comes before its output
     assert log.index("▶ start broadcast") < log.index("broadcast: BROADCAST tuned 100.0MHz")

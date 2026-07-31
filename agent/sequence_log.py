@@ -120,7 +120,13 @@ class RunLog:
     # ── Internals ─────────────────────────────────────────────────────────────
 
     def _emit_line(self, name: str, raw: bytes) -> None:
-        self._write(f"  {name}: " + raw.decode("utf-8", errors="replace") + "\n")
+        text = raw.decode("utf-8", errors="replace")
+        # The task log carries a one-shot marker header ("--- <ts> one-shot: … ---");
+        # the run log already annotates the run (⚡ run …), so drop it as noise here.
+        s = text.strip()
+        if s.startswith("--- ") and "one-shot:" in s and s.endswith("---"):
+            return
+        self._write(f"  {name}: " + text + "\n")
 
     def _write(self, s: str) -> None:
         if self._fh is None:
