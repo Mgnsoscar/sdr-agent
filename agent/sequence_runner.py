@@ -527,7 +527,12 @@ class SequenceRunner:
                     continue
                 if _parse(run.on_air_at) <= now:
                     self._on_air_marked.add(run.id)
+                    # Record the actual RF-live moment so any GUI can show on-air
+                    # state without comparing its own (possibly skewed) clock to T0.
+                    run.on_air_actual = now.isoformat()
                     due.append(run)
+            if due:
+                self._persist_runs()
 
         for run in due:
             rl = self._run_logs.get(run.id)

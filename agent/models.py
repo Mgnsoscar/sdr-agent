@@ -295,7 +295,8 @@ class SequenceRun(BaseModel):
     on_air_end: Optional[str] = None   # absolute UTC of on-air STOP; None if open-ended
     open_ended: bool = False           # True = no stop; runs on-air until aborted
     created_at: str = ""
-    started_actual: Optional[str] = None
+    started_actual: Optional[str] = None   # when the FIRST step fired (warm-up moment)
+    on_air_actual: Optional[str] = None    # when on_air_at (T0) was actually crossed — RF live
     stopped_actual: Optional[str] = None
     resume_offset_s: float = 0.0       # 0 for a fresh run; >0 if resumed
     note: str = ""
