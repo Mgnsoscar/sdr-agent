@@ -305,6 +305,22 @@ class SequenceRun(BaseModel):
     plan_name: str = ""
 
 
+class StepOverride(BaseModel):
+    """
+    A per-step parameter override applied when arming a sequence, addressed by the
+    step's position in the sequence's steps list.
+
+    This is the plan-level analog of a sequence step overriding a task's args: the
+    stored Sequence is the template, and the arm supplies different parameters for
+    one of its start/run steps without editing the sequence. Overriding a stop step
+    is rejected (stops take no args). args + replace_args have the same meaning as
+    on SequenceStep.
+    """
+    index: int                         # position in the target sequence's steps list
+    args: list[str] = []
+    replace_args: bool = True          # args are the complete set (form-produced)
+
+
 class ArmSequenceRequest(BaseModel):
     """
     Body for POST /sequences/{id}/arm.
@@ -315,6 +331,9 @@ class ArmSequenceRequest(BaseModel):
     resume_offset_s, if > 0, is injected into resumable steps so they begin
     partway through (e.g. resuming a ramp 40 minutes in).
     plan_id / plan_name stamp the resulting run so a GUI can group it into a plan.
+    step_overrides swap in different args for individual steps at arm time (used by
+    plans to run one sequence with per-task parameters that differ from the stored
+    definition); the sequence itself is left unchanged.
     """
     on_air_at: str                     # UTC ISO-8601 — when RF should go live
     on_air_end: Optional[str] = None   # UTC ISO-8601 — when RF should go off
@@ -324,6 +343,7 @@ class ArmSequenceRequest(BaseModel):
     note: str = ""
     plan_id: str = ""
     plan_name: str = ""
+    step_overrides: list[StepOverride] = []
 
 
 class PatchSequenceRunRequest(BaseModel):

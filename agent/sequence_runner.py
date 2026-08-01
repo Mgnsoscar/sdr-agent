@@ -38,7 +38,7 @@ from typing import Dict, List, Optional
 from .log_manager import LogManager
 from .models import (
     ArmSequenceRequest, CreateSequenceRequest, Sequence, SequenceRun,
-    SequenceState, SequenceStep, StepFire,
+    SequenceState, SequenceStep, StepFire, StepOverride,
     SequenceWebhook,
 )
 from .process_manager import ProcessManager
@@ -243,18 +243,48 @@ class SequenceRunner:
         """
         return min((s.offset_s for s in seq.steps if s.anchor == "start"), default=0.0)
 
+    @staticmethod
+    def _validate_overrides(
+        seq: Sequence, overrides: List[StepOverride],
+    ) -> Dict[int, StepOverride]:
+        """
+        Key step overrides by index and reject any that don't address a real,
+        overridable step. A stop step takes no args, so overriding one is an error
+        rather than a silent no-op. Raises ValueError on a bad override.
+        """
+        out: Dict[int, StepOverride] = {}
+        n = len(seq.steps)
+        for ov in overrides or []:
+            if ov.index < 0 or ov.index >= n:
+                raise ValueError(
+                    f"step override index {ov.index} out of range (sequence has {n} step(s))")
+            if seq.steps[ov.index].anchor == "stop" or \
+                    str(getattr(seq.steps[ov.index].action, "value",
+                                seq.steps[ov.index].action)) == "stop":
+                raise ValueError(
+                    f"step override index {ov.index} targets a stop step, which takes no args")
+            out[ov.index] = ov
+        return out
+
     def _resolve_steps(
         self, seq: Sequence, on_air_at: datetime, on_air_end: Optional[datetime],
         resume_offset_s: float, open_ended: bool = False,
+        overrides: Optional[Dict[int, StepOverride]] = None,
     ) -> List[StepFire]:
         """
         Compute absolute fire times for every step around the two anchors.
         If open_ended is True, stop-anchored steps are skipped entirely — the run
         fires only the start-anchored (warm-up + on-air-start) steps and stays
         on-air until aborted. on_air_end may be None in that case.
+
+        overrides maps a step's index (its position in seq.steps) to a StepOverride
+        whose args/replace_args replace the stored step's — so a plan can run this
+        sequence with per-task parameters that differ from its saved definition. The
+        sequence is not mutated; only this run's StepFires carry the new args.
         """
+        overrides = overrides or {}
         fires: List[StepFire] = []
-        for s in seq.steps:
+        for i, s in enumerate(seq.steps):
             if s.anchor == "stop":
                 if open_ended:
                     continue   # no stop in an open-ended run; abort handles shutdown
@@ -268,6 +298,9 @@ class SequenceRunner:
                                     and resume_offset_s > 0)
                 else None
             )
+            ov = overrides.get(i)
+            args = list(ov.args) if ov is not None else list(s.args)
+            replace_args = ov.replace_args if ov is not None else s.replace_args
             fires.append(StepFire(
                 anchor=s.anchor,
                 offset_s=s.offset_s,
@@ -275,8 +308,8 @@ class SequenceRunner:
                 task_name=s.task_name,
                 fire_at=fire_at.isoformat(),
                 resume_offset_s=inject,
-                args=list(s.args),
-                replace_args=s.replace_args,
+                args=args,
+                replace_args=replace_args,
             ))
         # Sort by fire time so the runner fires them in order
         fires.sort(key=lambda f: _parse(f.fire_at))
@@ -314,7 +347,9 @@ class SequenceRunner:
                 f"(on-air start needs {abs(lead_in):.0f}s lead-in; choose a later on_air_at)"
             )
 
-        steps = self._resolve_steps(seq, on_air_at, on_air_end, req.resume_offset_s, open_ended)
+        overrides = self._validate_overrides(seq, req.step_overrides)
+        steps = self._resolve_steps(seq, on_air_at, on_air_end, req.resume_offset_s,
+                                    open_ended, overrides)
 
         run = SequenceRun(
             id=_run_id(),
