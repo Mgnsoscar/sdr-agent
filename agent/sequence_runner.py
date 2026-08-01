@@ -231,21 +231,17 @@ class SequenceRunner:
     # ── On-air window helpers ─────────────────────────────────────────────────
 
     @staticmethod
-    def _stop_offset(seq: Sequence) -> float:
+    def _lead_offset(steps: List[SequenceStep]) -> float:
         """
-        The on-air STOP offset, measured from on-air start. The on-air window
-        length = the largest start-anchored offset that represents on-air end?
-        No — by our model the on-air window is [on_air_at, on_air_end], and
-        on_air_end is supplied at arm time (or via duration). The stop-anchored
-        steps hang off on_air_end. So we don't derive on_air_end from the
-        sequence; the operator sets it when arming. This helper instead returns
-        the minimum start-anchored offset (most negative) for lead-in info.
+        The most-negative start-anchored offset — the warm-up lead-in. By our model
+        the on-air window is [on_air_at, on_air_end] and on_air_end is supplied at
+        arm time; this only reports how far before on-air the first step fires.
         """
-        return min((s.offset_s for s in seq.steps if s.anchor == "start"), default=0.0)
+        return min((s.offset_s for s in steps if s.anchor == "start"), default=0.0)
 
     @staticmethod
     def _validate_overrides(
-        seq: Sequence, overrides: List[StepOverride],
+        steps: List[SequenceStep], overrides: List[StepOverride],
     ) -> Dict[int, StepOverride]:
         """
         Key step overrides by index and reject any that don't address a real,
@@ -253,23 +249,23 @@ class SequenceRunner:
         rather than a silent no-op. Raises ValueError on a bad override.
         """
         out: Dict[int, StepOverride] = {}
-        n = len(seq.steps)
+        n = len(steps)
         for ov in overrides or []:
             if ov.index < 0 or ov.index >= n:
                 raise ValueError(
                     f"step override index {ov.index} out of range (sequence has {n} step(s))")
-            if seq.steps[ov.index].anchor == "stop" or \
-                    str(getattr(seq.steps[ov.index].action, "value",
-                                seq.steps[ov.index].action)) == "stop":
+            if steps[ov.index].anchor == "stop" or \
+                    str(getattr(steps[ov.index].action, "value",
+                                steps[ov.index].action)) == "stop":
                 raise ValueError(
                     f"step override index {ov.index} targets a stop step, which takes no args")
             out[ov.index] = ov
         return out
 
     def _resolve_steps(
-        self, seq: Sequence, on_air_at: datetime, on_air_end: Optional[datetime],
-        resume_offset_s: float, open_ended: bool = False,
-        overrides: Optional[Dict[int, StepOverride]] = None,
+        self, steps: List[SequenceStep], on_air_at: datetime,
+        on_air_end: Optional[datetime], resume_offset_s: float,
+        open_ended: bool = False, overrides: Optional[Dict[int, StepOverride]] = None,
     ) -> List[StepFire]:
         """
         Compute absolute fire times for every step around the two anchors.
@@ -277,14 +273,14 @@ class SequenceRunner:
         fires only the start-anchored (warm-up + on-air-start) steps and stays
         on-air until aborted. on_air_end may be None in that case.
 
-        overrides maps a step's index (its position in seq.steps) to a StepOverride
-        whose args/replace_args replace the stored step's — so a plan can run this
-        sequence with per-task parameters that differ from its saved definition. The
+        overrides maps a step's index (its position in `steps`) to a StepOverride
+        whose args/replace_args replace the step's — so a plan can run a sequence
+        with per-task parameters that differ from its saved definition. The stored
         sequence is not mutated; only this run's StepFires carry the new args.
         """
         overrides = overrides or {}
         fires: List[StepFire] = []
-        for i, s in enumerate(seq.steps):
+        for i, s in enumerate(steps):
             if s.anchor == "stop":
                 if open_ended:
                     continue   # no stop in an open-ended run; abort handles shutdown
@@ -326,6 +322,14 @@ class SequenceRunner:
         """
         seq = self.get_sequence(seq_id)
 
+        # A plan may supply a complete, plan-local step list that replaces the
+        # stored sequence's steps for this run only (the sequence is untouched).
+        if req.steps is not None:
+            self._validate_steps(req.steps)
+            eff_steps = list(req.steps)
+        else:
+            eff_steps = seq.steps
+
         on_air_at  = _parse(req.on_air_at)
         now = _utcnow_dt()
 
@@ -339,7 +343,7 @@ class SequenceRunner:
                 raise ValueError("on_air_end must be after on_air_at")
 
         # The earliest step (most negative start-anchored offset) must be in the future
-        lead_in = self._stop_offset(seq)   # most negative offset, e.g. -120
+        lead_in = self._lead_offset(eff_steps)   # most negative offset, e.g. -120
         earliest_fire = on_air_at + timedelta(seconds=lead_in)
         if earliest_fire <= now:
             raise ValueError(
@@ -347,8 +351,8 @@ class SequenceRunner:
                 f"(on-air start needs {abs(lead_in):.0f}s lead-in; choose a later on_air_at)"
             )
 
-        overrides = self._validate_overrides(seq, req.step_overrides)
-        steps = self._resolve_steps(seq, on_air_at, on_air_end, req.resume_offset_s,
+        overrides = self._validate_overrides(eff_steps, req.step_overrides)
+        steps = self._resolve_steps(eff_steps, on_air_at, on_air_end, req.resume_offset_s,
                                     open_ended, overrides)
 
         run = SequenceRun(
@@ -413,10 +417,6 @@ class SequenceRunner:
             if new_end <= _parse(run.on_air_at):
                 raise ValueError("on-air end must be after on-air start")
 
-            seq = self._sequences.get(run.sequence_id)
-            if seq is None:
-                raise ValueError("underlying sequence no longer exists")
-
             old_end = run.on_air_end
             run.on_air_end = new_end.isoformat()
             # The end moved — allow the off-air marker to fire again at the new end
@@ -426,12 +426,21 @@ class SequenceRunner:
             # Recompute only stop-anchored steps that haven't fired yet; keep
             # the fired_actual on already-fired steps. Simplest correct approach:
             # rebuild all steps, then re-apply fired_actual for matching steps.
+            # Rebuild from THIS RUN's own steps (the choreography it was armed with),
+            # not the stored sequence — which may have been edited, or replaced by a
+            # plan-local step list, since the run was armed.
             fired_map = {
                 (f.anchor, f.offset_s, f.action, f.task_name, tuple(f.args)): f.fired_actual
                 for f in run.steps
             }
+            armed_steps = [
+                SequenceStep(anchor=f.anchor, offset_s=f.offset_s, action=f.action,
+                             task_name=f.task_name, args=list(f.args),
+                             replace_args=f.replace_args)
+                for f in run.steps
+            ]
             rebuilt = self._resolve_steps(
-                seq, _parse(run.on_air_at), new_end, run.resume_offset_s
+                armed_steps, _parse(run.on_air_at), new_end, run.resume_offset_s
             )
             for f in rebuilt:
                 key = (f.anchor, f.offset_s, f.action, f.task_name, tuple(f.args))

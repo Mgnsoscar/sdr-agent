@@ -345,6 +345,12 @@ class ArmSequenceRequest(BaseModel):
     plan_id: str = ""
     plan_name: str = ""
     step_overrides: list[StepOverride] = []
+    # A complete step list that REPLACES the stored sequence's steps for this run
+    # only (the sequence is not modified). Used by plans that keep a plan-local
+    # copy of a sequence with different task timing and parameters. When None the
+    # stored sequence's own steps are used. Any step_overrides still apply on top,
+    # addressed by index into these steps.
+    steps: Optional[list[SequenceStep]] = None
 
 
 class PatchSequenceRunRequest(BaseModel):
