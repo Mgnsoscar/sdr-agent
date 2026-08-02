@@ -21,6 +21,8 @@ LOG_DIR    = Path(os.environ.get("SDR_LOG_DIR",   BASE_DIR / "logs"))
 EVENTS_FILE = Path(os.environ.get("SDR_EVENTS_FILE", BASE_DIR / "configs" / "events.json"))
 SEQUENCES_FILE = Path(os.environ.get("SDR_SEQUENCES_FILE", BASE_DIR / "configs" / "sequences.json"))
 SEQUENCE_RUNS_FILE = Path(os.environ.get("SDR_SEQUENCE_RUNS_FILE", BASE_DIR / "configs" / "sequence_runs.json"))
+PLANS_FILE = Path(os.environ.get("SDR_PLANS_FILE", BASE_DIR / "configs" / "plans.json"))
+SCHEDULE_FILE = Path(os.environ.get("SDR_SCHEDULE_FILE", BASE_DIR / "configs" / "schedule.json"))
 
 # ── Agent identity ────────────────────────────────────────────────────────────
 

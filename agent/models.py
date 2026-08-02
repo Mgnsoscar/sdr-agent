@@ -380,3 +380,89 @@ class PanicResult(BaseModel):
     events_cancelled: list[str]
     runs_aborted: list[str]
     at: str
+
+
+# ── Library (the shared definition set, replicated identically to every unit) ──
+#
+# A unit's definitions — its scripts, tasks, and sequences — as one snapshot. The
+# client keeps a canonical library and deploys it here so every unit holds the
+# same definitions (per-unit differences are parameters, and those live in the
+# plan that arms a run, not in these definitions). GET /library returns this
+# unit's current set; PUT /library converges the unit to a supplied one, touching
+# definitions only — a running task or an active run is never disturbed.
+
+class LibraryScript(BaseModel):
+    name: str                          # script filename, e.g. "freq.py"
+    content: str = ""                  # the script's source
+    params: list[dict] = []            # argparse/paramkit schema (as /scripts/{name}/params)
+
+
+class Library(BaseModel):
+    scripts: list[LibraryScript] = []
+    tasks: list[TaskConfig] = []
+    sequences: list[Sequence] = []
+
+
+class DeployLibraryRequest(BaseModel):
+    """Apply a library to this unit. prune converges exactly (removes scripts,
+    tasks, and sequences the library doesn't contain); with prune False the deploy
+    only adds/updates and never removes."""
+    library: Library
+    prune: bool = True
+
+
+class DeployLibraryResult(BaseModel):
+    """What a PUT /library actually changed. Items left running/active that could
+    not be removed are reported in the *_skipped fields (definitions only — nothing
+    on air is ever stopped)."""
+    scripts_written: list[str] = []
+    scripts_deleted: list[str] = []
+    tasks_reload: dict = {}
+    tasks_skipped: list[str] = []       # running tasks not removed
+    sequences_upserted: list[str] = []
+    sequences_deleted: list[str] = []
+    sequences_skipped: list[str] = []   # sequences with an active run, not removed
+
+
+# ── Client state (plans + schedule), replicated to every unit for recovery ─────
+#
+# Plans and their schedule are authored on the PC and are cross-unit (a plan arms
+# sequences on several units at once), so they don't "belong" to any one unit. But
+# the PC is disposable: a replacement that knows only the unit IPs must be able to
+# rebuild everything. So the client replicates the same plans + schedule to every
+# unit, which store them opaquely (they are never executed here — the client
+# orchestrates arming). A fresh PC pulls them back from any reachable unit and
+# de-dupes by id.
+
+class PlanItem(BaseModel):
+    hostname: str
+    unit_label: str = ""
+    sequence_id: str
+    sequence_name: str = ""
+    steps: list[SequenceStep] = []
+    overrides: list[StepOverride] = []
+    on_air_offset_s: float = 0.0
+    off_air_offset_s: float = 0.0
+
+
+class Plan(BaseModel):
+    id: str
+    name: str
+    description: str = ""
+    items: list[PlanItem] = []
+
+
+class ScheduledPlan(BaseModel):
+    id: str
+    plan_id: str
+    plan_name: str = ""
+    start: str                          # ISO-8601 local datetime — on-air (T0)
+    stop: str                           # ISO-8601 local datetime — off-air (T_end)
+
+
+class PutPlansRequest(BaseModel):
+    plans: list[Plan] = []
+
+
+class PutScheduleRequest(BaseModel):
+    schedule: list[ScheduledPlan] = []

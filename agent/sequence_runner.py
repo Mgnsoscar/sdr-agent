@@ -228,6 +228,44 @@ class SequenceRunner:
             self._persist_sequences()
         logger.info("Sequence %s deleted", seq_id)
 
+    def _has_active_run(self, seq_id: str) -> bool:
+        return any(r.sequence_id == seq_id and r.state in (
+            SequenceState.ARMED, SequenceState.RUNNING) for r in self._runs.values())
+
+    async def apply_sequences(self, sequences: List[Sequence], prune: bool):
+        """Converge this unit's sequences to `sequences`, PRESERVING their ids so
+        every unit shares the same sequence_id a plan references.
+
+        Definitions only: upsert each incoming sequence (by id), and — when prune —
+        delete stored ones the library omits, EXCEPT any with an armed/running run
+        (those are kept and reported as skipped; an in-flight broadcast captured its
+        own steps at arm time, so it is unaffected either way). Returns
+        (upserted_ids, deleted_ids, skipped_ids). Raises ValueError if a step
+        references a task this unit doesn't have (deploy tasks before sequences)."""
+        for seq in sequences:
+            self._validate_steps(seq.steps)
+        upserted: List[str] = []
+        deleted: List[str] = []
+        skipped: List[str] = []
+        incoming = {s.id for s in sequences}
+        async with self._lock:
+            for seq in sequences:
+                self._sequences[seq.id] = Sequence(
+                    id=seq.id, name=seq.name, description=seq.description,
+                    steps=list(seq.steps))
+                upserted.append(seq.id)
+            if prune:
+                for seq_id in [s for s in self._sequences if s not in incoming]:
+                    if self._has_active_run(seq_id):
+                        skipped.append(seq_id)
+                        continue
+                    del self._sequences[seq_id]
+                    deleted.append(seq_id)
+            self._persist_sequences()
+        logger.info("apply_sequences: upserted %d, deleted %d, skipped %d",
+                    len(upserted), len(deleted), len(skipped))
+        return upserted, deleted, skipped
+
     # ── On-air window helpers ─────────────────────────────────────────────────
 
     @staticmethod
