@@ -30,6 +30,24 @@ import socket
 HOSTNAME   = socket.gethostname()
 UNIT_ID    = os.environ.get("SDR_UNIT_ID", HOSTNAME)
 
+
+def machine_id() -> str:
+    """A stable, unique identifier for this physical machine, from
+    /etc/machine-id (generated once at OS install; survives hostname changes and
+    reboots). Empty string if it can't be read. This is the client's reliable
+    fingerprint for 'the same Pi', independent of hostname/IP/label."""
+    for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            v = Path(p).read_text(encoding="utf-8").strip()
+            if v:
+                return v
+        except OSError:
+            continue
+    return ""
+
+
+MACHINE_ID = machine_id()
+
 # ── HTTP server ───────────────────────────────────────────────────────────────
 
 AGENT_HOST    = os.environ.get("SDR_AGENT_HOST", "0.0.0.0")

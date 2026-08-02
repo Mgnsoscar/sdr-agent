@@ -19,10 +19,12 @@ SERVICE_TYPE = "_sdragent._tcp.local."
 
 
 class MdnsAdvertiser:
-    def __init__(self, unit_id: str, port: int, agent_version: str):
+    def __init__(self, unit_id: str, port: int, agent_version: str,
+                 machine_id: str = ""):
         self.unit_id = unit_id
         self.port = port
         self.agent_version = agent_version
+        self.machine_id = machine_id
         self._zc = None
         self._info = None
 
@@ -93,6 +95,7 @@ class MdnsAdvertiser:
                 port=self.port,
                 properties={
                     "unit_id": self.unit_id,
+                    "machine_id": self.machine_id,
                     "version": self.agent_version,
                     "api": f"http://{server}:{self.port}",
                 },
