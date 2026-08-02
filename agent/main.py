@@ -71,7 +71,8 @@ from . import config as cfg
 from . import system as sysmon
 from .models import (
     AgentInfo, ArmSequenceRequest, CreateEventRequest, CreateSequenceRequest,
-    ExitRecord, PanicResult, PatchEventRequest, PatchSequenceRunRequest,
+    DeployLibraryRequest, DeployLibraryResult, ExitRecord, Library, LibraryScript,
+    PanicResult, PatchEventRequest, PatchSequenceRunRequest,
     ProcessStatus, ScheduledEvent, SdrStatus, Sequence, SequenceRun,
     StartRequest, SystemHealth, TaskConfig,
 )
@@ -834,6 +835,106 @@ async def delete_sequence(seq_id: str, runner: SequenceRunner = Depends(get_runn
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+
+
+# ── Library (deploy / snapshot the whole definition set) ──────────────────────
+# The client keeps a canonical library (scripts + tasks + sequences) and deploys
+# it here so every unit holds the same definitions. Applying one is DEFINITION-ONLY
+# and safe to run at any time — including while a broadcast is on air: rewriting
+# tasks.yaml reloads the registry but keeps running tasks alive (they adopt the new
+# command on their next start), and a sequence with an active run is never deleted.
+# An in-flight run captured its own steps at arm time, so it is immune regardless.
+
+def _library_scripts() -> list[LibraryScript]:
+    out: list[LibraryScript] = []
+    for path in sorted(SCRIPTS_DIR.glob("*.py")):
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            content = ""
+        try:
+            params = (extract_params(content) or {}).get("params", [])
+        except Exception:  # noqa: BLE001 — a script we can't parse still belongs
+            params = []
+        out.append(LibraryScript(name=path.name, content=content, params=params))
+    return out
+
+
+@app.get("/library", response_model=Library, tags=["library"],
+         dependencies=[Depends(verify_key)])
+async def get_library(runner: SequenceRunner = Depends(get_runner)):
+    """This unit's current definitions: scripts (+ their param schema), tasks
+    (from tasks.yaml), and sequences. The client compares it to its canonical
+    library to detect drift."""
+    tasks = list(cfg.load_tasks().values())
+    return Library(scripts=_library_scripts(), tasks=tasks,
+                   sequences=runner.list_sequences())
+
+
+@app.put("/library", response_model=DeployLibraryResult, tags=["library"],
+         dependencies=[Depends(verify_key)])
+async def deploy_library(
+    req: DeployLibraryRequest,
+    manager: ProcessManager = Depends(get_manager),
+    runner: SequenceRunner = Depends(get_runner),
+):
+    """Converge this unit's definitions to the supplied library. Order matters —
+    scripts, then tasks (so sequence-step validation sees the new tasks), then
+    sequences. Definition-only: never stops a running task or deletes a sequence
+    with an active run."""
+    lib = req.library
+    result = DeployLibraryResult()
+
+    # 1) Scripts — write each; prune removes .py files the library omits.
+    wanted_scripts = {}
+    for s in lib.scripts:
+        if "/" in s.name or "\\" in s.name or not s.name.endswith(".py"):
+            raise HTTPException(status_code=400, detail=f"Invalid script name: {s.name}")
+        wanted_scripts[s.name] = s
+    for name, s in wanted_scripts.items():
+        dest = SCRIPTS_DIR / name
+        try:
+            dest.write_text(s.content, encoding="utf-8")
+            dest.chmod(0o755)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to write {name}: {exc}")
+        result.scripts_written.append(name)
+    if req.prune:
+        for path in sorted(SCRIPTS_DIR.glob("*.py")):
+            if path.name not in wanted_scripts:
+                try:
+                    path.unlink()
+                    result.scripts_deleted.append(path.name)
+                except OSError as exc:
+                    logger.warning("deploy: could not delete script %s: %s", path.name, exc)
+
+    # 2) Tasks — rewrite tasks.yaml to the library (merged if not pruning) and
+    #    reload. reload() keeps running tasks alive; any it couldn't remove because
+    #    they're running are reported as skipped.
+    doc = _load_tasks_doc()
+    if req.prune:
+        doc["tasks"] = [_spec_to_entry(t) for t in lib.tasks]
+    else:
+        by_name = {e.get("name"): e for e in doc["tasks"]}
+        for t in lib.tasks:
+            by_name[t.name] = _spec_to_entry(t)
+        doc["tasks"] = list(by_name.values())
+    _save_tasks_doc(doc)
+    reload_result = await manager.reload(cfg.load_tasks())
+    result.tasks_reload = reload_result
+    result.tasks_skipped = list(reload_result.get("skipped", []))
+
+    # 3) Sequences — upsert (preserving ids) and prune, skipping active runs.
+    try:
+        up, deleted, skipped = await runner.apply_sequences(lib.sequences, req.prune)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"sequence deploy rejected: {exc}")
+    result.sequences_upserted = up
+    result.sequences_deleted = deleted
+    result.sequences_skipped = skipped
+
+    logger.info("Library deployed: %s", result.model_dump())
+    return result
 
 
 # ── Arm a sequence → creates a run ────────────────────────────────────────────

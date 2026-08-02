@@ -380,3 +380,45 @@ class PanicResult(BaseModel):
     events_cancelled: list[str]
     runs_aborted: list[str]
     at: str
+
+
+# ── Library (the shared definition set, replicated identically to every unit) ──
+#
+# A unit's definitions — its scripts, tasks, and sequences — as one snapshot. The
+# client keeps a canonical library and deploys it here so every unit holds the
+# same definitions (per-unit differences are parameters, and those live in the
+# plan that arms a run, not in these definitions). GET /library returns this
+# unit's current set; PUT /library converges the unit to a supplied one, touching
+# definitions only — a running task or an active run is never disturbed.
+
+class LibraryScript(BaseModel):
+    name: str                          # script filename, e.g. "freq.py"
+    content: str = ""                  # the script's source
+    params: list[dict] = []            # argparse/paramkit schema (as /scripts/{name}/params)
+
+
+class Library(BaseModel):
+    scripts: list[LibraryScript] = []
+    tasks: list[TaskConfig] = []
+    sequences: list[Sequence] = []
+
+
+class DeployLibraryRequest(BaseModel):
+    """Apply a library to this unit. prune converges exactly (removes scripts,
+    tasks, and sequences the library doesn't contain); with prune False the deploy
+    only adds/updates and never removes."""
+    library: Library
+    prune: bool = True
+
+
+class DeployLibraryResult(BaseModel):
+    """What a PUT /library actually changed. Items left running/active that could
+    not be removed are reported in the *_skipped fields (definitions only — nothing
+    on air is ever stopped)."""
+    scripts_written: list[str] = []
+    scripts_deleted: list[str] = []
+    tasks_reload: dict = {}
+    tasks_skipped: list[str] = []       # running tasks not removed
+    sequences_upserted: list[str] = []
+    sequences_deleted: list[str] = []
+    sequences_skipped: list[str] = []   # sequences with an active run, not removed
