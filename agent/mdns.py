@@ -27,19 +27,44 @@ class MdnsAdvertiser:
         self._info = None
 
     def _local_ip(self) -> Optional[str]:
-        """Best-effort primary IP of this host (the one used for outbound traffic)."""
+        """Kept for compatibility — the first real (non-loopback) address, or None."""
+        ips = self._local_ips()
+        return ips[0] if ips else None
+
+    def _local_ips(self):
+        """Every real IPv4 address of this host — the addresses a client can
+        actually reach us at. LOOPBACK IS EXCLUDED: on Debian/Raspberry Pi OS the
+        machine's own hostname is mapped to 127.0.1.1 in /etc/hosts, so resolving
+        our hostname (or a fragile default-route probe with no internet) yields a
+        loopback the client can't use. We enumerate interfaces instead (psutil), so
+        the wifi and/or ethernet IP is advertised regardless of internet access."""
+        ips = []
+
+        # The primary outbound interface, when there IS a route (put first).
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            # Doesn't actually send anything; just selects the right interface.
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
             s.close()
-            return ip
+            if not ip.startswith("127.") and ip not in ips:
+                ips.append(ip)
         except OSError:
-            try:
-                return socket.gethostbyname(socket.gethostname())
-            except OSError:
-                return None
+            pass
+
+        # Every non-loopback IPv4 on any interface (works with no default route,
+        # e.g. a direct ethernet link).
+        try:
+            import psutil
+            for addrs in psutil.net_if_addrs().values():
+                for a in addrs:
+                    if (a.family == socket.AF_INET and a.address
+                            and not a.address.startswith("127.")
+                            and a.address not in ips):
+                        ips.append(a.address)
+        except Exception:  # noqa: BLE001 — psutil missing or odd platform
+            pass
+
+        return ips
 
     def start(self) -> None:
         try:
@@ -49,9 +74,10 @@ class MdnsAdvertiser:
                            "(GUI can still connect by hostname)")
             return
 
-        ip = self._local_ip()
-        if ip is None:
-            logger.warning("Could not determine local IP — mDNS advertisement disabled")
+        ips = self._local_ips()
+        if not ips:
+            logger.warning("Could not determine a non-loopback IP — mDNS advertisement "
+                           "disabled (add this unit by address in the GUI instead)")
             return
 
         # Service instance name must be unique on the network.
@@ -63,7 +89,7 @@ class MdnsAdvertiser:
             self._info = ServiceInfo(
                 type_=SERVICE_TYPE,
                 name=instance,
-                addresses=[socket.inet_aton(ip)],
+                addresses=[socket.inet_aton(ip) for ip in ips],
                 port=self.port,
                 properties={
                     "unit_id": self.unit_id,
@@ -75,7 +101,7 @@ class MdnsAdvertiser:
             self._zc = Zeroconf()
             self._zc.register_service(self._info)
             logger.info("mDNS: advertising %s at %s:%d (%s)",
-                        self.unit_id, ip, self.port, SERVICE_TYPE)
+                        self.unit_id, ", ".join(ips), self.port, SERVICE_TYPE)
         except Exception as exc:
             logger.warning("mDNS advertisement failed: %s (continuing without it)", exc)
             self._cleanup()
