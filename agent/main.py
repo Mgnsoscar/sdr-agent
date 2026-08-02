@@ -72,10 +72,12 @@ from . import system as sysmon
 from .models import (
     AgentInfo, ArmSequenceRequest, CreateEventRequest, CreateSequenceRequest,
     DeployLibraryRequest, DeployLibraryResult, ExitRecord, Library, LibraryScript,
-    PanicResult, PatchEventRequest, PatchSequenceRunRequest,
-    ProcessStatus, ScheduledEvent, SdrStatus, Sequence, SequenceRun,
+    PanicResult, PatchEventRequest, PatchSequenceRunRequest, Plan,
+    ProcessStatus, PutPlansRequest, PutScheduleRequest, ScheduledEvent,
+    ScheduledPlan, SdrStatus, Sequence, SequenceRun,
     StartRequest, SystemHealth, TaskConfig,
 )
+from .client_state import ClientStateStore
 from .argspec import extract_params
 from .process_manager import ProcessManager
 from .scheduler import Scheduler
@@ -98,11 +100,12 @@ _manager: ProcessManager | None = None
 _scheduler: Scheduler | None = None
 _runner: SequenceRunner | None = None
 _mdns: MdnsAdvertiser | None = None
+_client_state: ClientStateStore | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _manager, _scheduler, _runner, _mdns
+    global _manager, _scheduler, _runner, _mdns, _client_state
     tasks = cfg.load_tasks()
     _manager = ProcessManager(tasks, cfg.LOG_DIR, cfg.UNIT_ID)
     await _manager.startup()
@@ -114,6 +117,9 @@ async def lifespan(app: FastAPI):
         _manager, cfg.UNIT_ID, cfg.SEQUENCES_FILE, cfg.SEQUENCE_RUNS_FILE, cfg.LOG_DIR
     )
     await _runner.startup()
+
+    # The unit's replica of the PC's plans + schedule (stored, never executed here).
+    _client_state = ClientStateStore(cfg.PLANS_FILE, cfg.SCHEDULE_FILE)
 
     # mDNS advertisement is best-effort; failure here never blocks startup.
     _mdns = MdnsAdvertiser(cfg.UNIT_ID, cfg.AGENT_PORT, cfg.AGENT_VERSION)
@@ -148,6 +154,11 @@ def get_scheduler() -> Scheduler:
 def get_runner() -> SequenceRunner:
     assert _runner is not None, "SequenceRunner not initialised"
     return _runner
+
+
+def get_client_state() -> ClientStateStore:
+    assert _client_state is not None, "ClientStateStore not initialised"
+    return _client_state
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -935,6 +946,41 @@ async def deploy_library(
 
     logger.info("Library deployed: %s", result.model_dump())
     return result
+
+
+# ── Client state: plans + schedule (stored replica, not executed here) ────────
+# The PC replicates its plans and schedule to every unit so a replacement PC can
+# rebuild from unit IPs alone. GET returns this unit's copy; PUT replaces it
+# wholesale. These are opaque to the agent — it never arms a plan itself.
+
+@app.get("/plans", response_model=list[Plan], tags=["client-state"],
+         dependencies=[Depends(verify_key)])
+async def get_plans(store: ClientStateStore = Depends(get_client_state)):
+    return store.get_plans()
+
+
+@app.put("/plans", response_model=list[Plan], tags=["client-state"],
+         dependencies=[Depends(verify_key)])
+async def put_plans(req: PutPlansRequest,
+                    store: ClientStateStore = Depends(get_client_state)):
+    """Replace this unit's plan replica with the supplied set."""
+    store.set_plans(req.plans)
+    return store.get_plans()
+
+
+@app.get("/schedule", response_model=list[ScheduledPlan], tags=["client-state"],
+         dependencies=[Depends(verify_key)])
+async def get_schedule(store: ClientStateStore = Depends(get_client_state)):
+    return store.get_schedule()
+
+
+@app.put("/schedule", response_model=list[ScheduledPlan], tags=["client-state"],
+         dependencies=[Depends(verify_key)])
+async def put_schedule(req: PutScheduleRequest,
+                       store: ClientStateStore = Depends(get_client_state)):
+    """Replace this unit's schedule replica with the supplied set."""
+    store.set_schedule(req.schedule)
+    return store.get_schedule()
 
 
 # ── Arm a sequence → creates a run ────────────────────────────────────────────

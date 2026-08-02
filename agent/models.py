@@ -422,3 +422,47 @@ class DeployLibraryResult(BaseModel):
     sequences_upserted: list[str] = []
     sequences_deleted: list[str] = []
     sequences_skipped: list[str] = []   # sequences with an active run, not removed
+
+
+# ── Client state (plans + schedule), replicated to every unit for recovery ─────
+#
+# Plans and their schedule are authored on the PC and are cross-unit (a plan arms
+# sequences on several units at once), so they don't "belong" to any one unit. But
+# the PC is disposable: a replacement that knows only the unit IPs must be able to
+# rebuild everything. So the client replicates the same plans + schedule to every
+# unit, which store them opaquely (they are never executed here — the client
+# orchestrates arming). A fresh PC pulls them back from any reachable unit and
+# de-dupes by id.
+
+class PlanItem(BaseModel):
+    hostname: str
+    unit_label: str = ""
+    sequence_id: str
+    sequence_name: str = ""
+    steps: list[SequenceStep] = []
+    overrides: list[StepOverride] = []
+    on_air_offset_s: float = 0.0
+    off_air_offset_s: float = 0.0
+
+
+class Plan(BaseModel):
+    id: str
+    name: str
+    description: str = ""
+    items: list[PlanItem] = []
+
+
+class ScheduledPlan(BaseModel):
+    id: str
+    plan_id: str
+    plan_name: str = ""
+    start: str                          # ISO-8601 local datetime — on-air (T0)
+    stop: str                           # ISO-8601 local datetime — off-air (T_end)
+
+
+class PutPlansRequest(BaseModel):
+    plans: list[Plan] = []
+
+
+class PutScheduleRequest(BaseModel):
+    schedule: list[ScheduledPlan] = []
