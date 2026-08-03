@@ -383,6 +383,20 @@ class PanicResult(BaseModel):
     at: str
 
 
+class SetTimeRequest(BaseModel):
+    """POST /time — set this unit's system clock. `epoch` is UTC seconds since
+    1970 (the client's current time), used to correct a Pi with no NTP (e.g. a
+    direct-ethernet test rig) so scheduled plans fire at the intended moment."""
+    epoch: float
+
+
+class SetTimeResult(BaseModel):
+    """Returned by POST /time."""
+    ok: bool
+    utc_now: str = ""                  # the unit's clock after the set (ISO-8601)
+    detail: str = ""                   # error message when ok is False
+
+
 # ── Library (the shared definition set, replicated identically to every unit) ──
 #
 # A unit's definitions — its scripts, tasks, and sequences — as one snapshot. The
