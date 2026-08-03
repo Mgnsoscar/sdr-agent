@@ -72,6 +72,7 @@ class AgentInfo(BaseModel):
     """Returned by GET /info."""
     hostname: str
     unit_id: str                       # From config or hostname fallback
+    machine_id: str = ""               # stable per-machine id (/etc/machine-id)
     agent_version: str
     python_version: str
     tasks: list[str]

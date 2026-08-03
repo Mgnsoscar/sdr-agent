@@ -122,7 +122,8 @@ async def lifespan(app: FastAPI):
     _client_state = ClientStateStore(cfg.PLANS_FILE, cfg.SCHEDULE_FILE)
 
     # mDNS advertisement is best-effort; failure here never blocks startup.
-    _mdns = MdnsAdvertiser(cfg.UNIT_ID, cfg.AGENT_PORT, cfg.AGENT_VERSION)
+    _mdns = MdnsAdvertiser(cfg.UNIT_ID, cfg.AGENT_PORT, cfg.AGENT_VERSION,
+                           machine_id=cfg.MACHINE_ID)
     _mdns.start()
 
     yield
@@ -201,6 +202,7 @@ async def info(manager: ProcessManager = Depends(get_manager)):
     return AgentInfo(
         hostname       = cfg.HOSTNAME,
         unit_id        = cfg.UNIT_ID,
+        machine_id     = cfg.MACHINE_ID,
         agent_version  = cfg.AGENT_VERSION,
         python_version = platform.python_version(),
         tasks          = manager.task_names(),
