@@ -6,16 +6,27 @@ GUI can auto-discover units by hostname without static IPs. Uses the `zeroconf`
 library. If zeroconf isn't installed or registration fails, the agent logs a
 warning and continues — discovery is a convenience, not a requirement (the GUI
 can still reach units by hostname directly).
+
+Advertisement is refreshed on a background thread: it retries until a usable
+(non-loopback) IP exists, and re-binds/re-registers whenever the host's addresses
+change. This matters on a direct-ethernet link, where the link-local (169.254.x)
+address only appears once the cable is up — often AFTER the agent booted — and
+would otherwise be missed forever.
 """
 from __future__ import annotations
 
 import logging
 import socket
-from typing import Optional
+import threading
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
 SERVICE_TYPE = "_sdragent._tcp.local."
+
+# How often to re-check the host's addresses (seconds). A change triggers a
+# re-advertise; steady state is just a cheap interface enumeration.
+REFRESH_INTERVAL_S = 15.0
 
 
 class MdnsAdvertiser:
@@ -27,6 +38,9 @@ class MdnsAdvertiser:
         self.machine_id = machine_id
         self._zc = None
         self._info = None
+        self._current_ips: List[str] = []
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
 
     def _local_ip(self) -> Optional[str]:
         """Kept for compatibility — the first real (non-loopback) address, or None."""
@@ -70,24 +84,45 @@ class MdnsAdvertiser:
 
     def start(self) -> None:
         try:
-            from zeroconf import ServiceInfo, Zeroconf
+            import zeroconf  # noqa: F401 — probe availability once
         except ImportError:
             logger.warning("zeroconf not installed — mDNS advertisement disabled "
                            "(GUI can still connect by hostname)")
             return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._loop, name="mdns-advertise",
+                                        daemon=True)
+        self._thread.start()
 
-        ips = self._local_ips()
-        if not ips:
-            logger.warning("Could not determine a non-loopback IP — mDNS advertisement "
-                           "disabled (add this unit by address in the GUI instead)")
+    def _loop(self) -> None:
+        # Advertise now if we can, then keep the advertisement in sync with the
+        # host's addresses (retrying while there is none — e.g. before a direct
+        # ethernet link's link-local address is assigned).
+        while True:
+            try:
+                self._sync()
+            except Exception as exc:  # noqa: BLE001 — never let the loop die
+                logger.debug("mDNS refresh error: %s", exc)
+            if self._stop_event.wait(REFRESH_INTERVAL_S):
+                return
+
+    def _sync(self) -> None:
+        """Re-advertise iff the set of addresses changed. Recreates the Zeroconf
+        instance on a change so it (re-)binds interfaces that came up after start."""
+        ips = sorted(self._local_ips())
+        if ips == self._current_ips:
             return
-
-        # Service instance name must be unique on the network.
-        instance = f"{self.unit_id}.{SERVICE_TYPE}"
-        hostname = socket.gethostname()
-        server = hostname if hostname.endswith(".local.") else f"{hostname}.local."
-
+        self._teardown()
+        self._current_ips = ips
+        if not ips:
+            logger.info("mDNS: no non-loopback IP yet — will retry (add by address "
+                        "in the GUI meanwhile)")
+            return
         try:
+            from zeroconf import ServiceInfo, Zeroconf, InterfaceChoice
+            instance = f"{self.unit_id}.{SERVICE_TYPE}"
+            hostname = socket.gethostname()
+            server = hostname if hostname.endswith(".local.") else f"{hostname}.local."
             self._info = ServiceInfo(
                 type_=SERVICE_TYPE,
                 name=instance,
@@ -101,18 +136,25 @@ class MdnsAdvertiser:
                 },
                 server=server,
             )
-            self._zc = Zeroconf()
+            # InterfaceChoice.All so a link-local-only interface is bound too.
+            self._zc = Zeroconf(interfaces=InterfaceChoice.All)
             self._zc.register_service(self._info)
             logger.info("mDNS: advertising %s at %s:%d (%s)",
                         self.unit_id, ", ".join(ips), self.port, SERVICE_TYPE)
-        except Exception as exc:
-            logger.warning("mDNS advertisement failed: %s (continuing without it)", exc)
-            self._cleanup()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("mDNS advertisement failed: %s (will retry)", exc)
+            self._teardown()
+            self._current_ips = []   # force a fresh attempt next cycle
 
     def stop(self) -> None:
-        self._cleanup()
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+            self._thread = None
+        self._teardown()
+        self._current_ips = []
 
-    def _cleanup(self) -> None:
+    def _teardown(self) -> None:
         try:
             if self._zc and self._info:
                 self._zc.unregister_service(self._info)
