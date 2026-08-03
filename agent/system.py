@@ -146,6 +146,38 @@ async def get_health(unit_id: str) -> SystemHealth:
     return await loop.run_in_executor(None, _collect_health, unit_id)
 
 
+# ── Clock setting ──────────────────────────────────────────────────────────────
+
+def _set_clock(epoch: float) -> tuple[bool, str]:
+    """Set the system clock to `epoch` (UTC seconds since 1970). Runs as root via
+    the systemd service, so `date` succeeds without extra privilege.
+
+    We use `date -u -s @<epoch>` rather than `timedatectl set-time` because the
+    latter refuses while NTP is enabled — and we deliberately DON'T disable NTP:
+    on a Pi with no internet (a direct-ethernet test rig) timesyncd has nothing to
+    correct against, so the manual time sticks; once the Pi is back online it
+    re-syncs to real time on its own. Returns (ok, detail-or-new-utc)."""
+    if shutil.which("date") is None:
+        return False, "`date` command not found"
+    try:
+        proc = subprocess.run(
+            ["date", "-u", "-s", f"@{epoch:.3f}"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        return False, f"could not run date: {exc}"
+    if proc.returncode != 0:
+        # Most likely cause: the agent isn't running as root.
+        return False, (proc.stderr.strip()
+                       or f"date exited {proc.returncode} (is the agent root?)")
+    return True, datetime.now(timezone.utc).isoformat()
+
+
+async def set_clock(epoch: float) -> tuple[bool, str]:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _set_clock, epoch)
+
+
 # ── SDR probing ───────────────────────────────────────────────────────────────
 
 def _parse_uhd_output(text: str) -> list[SdrDevice]:

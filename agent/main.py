@@ -75,7 +75,7 @@ from .models import (
     PanicResult, PatchEventRequest, PatchSequenceRunRequest, Plan,
     ProcessStatus, PutPlansRequest, PutScheduleRequest, ScheduledEvent,
     ScheduledPlan, SdrStatus, Sequence, SequenceRun,
-    StartRequest, SystemHealth, TaskConfig,
+    SetTimeRequest, SetTimeResult, StartRequest, SystemHealth, TaskConfig,
 )
 from .client_state import ClientStateStore
 from .argspec import extract_params
@@ -618,6 +618,21 @@ async def delete_task(name: str, manager: ProcessManager = Depends(get_manager))
 async def system_health():
     """CPU load + temp + throttle state, memory, disk, uptime, load average."""
     return await sysmon.get_health(cfg.UNIT_ID)
+
+
+@app.post("/time", response_model=SetTimeResult, tags=["health"],
+          dependencies=[Depends(verify_key)])
+async def set_time(req: SetTimeRequest):
+    """Set this unit's system clock to the supplied UTC epoch (the client's time).
+    Lets a Pi with no NTP — e.g. a direct-ethernet test rig — be corrected so
+    scheduled plans, which fire on the unit's own clock, land at the intended
+    moment. Runs as root via the service, so no extra privilege is needed."""
+    ok, detail = await sysmon.set_clock(req.epoch)
+    if ok:
+        logger.info("System clock set from client (utc_now=%s)", detail)
+        return SetTimeResult(ok=True, utc_now=detail)
+    logger.warning("Could not set system clock: %s", detail)
+    return SetTimeResult(ok=False, detail=detail)
 
 
 # ── SDR device probe ──────────────────────────────────────────────────────────
