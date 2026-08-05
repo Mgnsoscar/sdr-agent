@@ -118,6 +118,39 @@ which widget to render. A host can fetch this at runtime by running the script
 with `--describe-params` (it prints the JSON and exits before doing any real
 work).
 
+## Live parameters (retune while running)
+
+Mark a parameter `live=True` and a host can change it *while the script runs* —
+no restart. It shows up as `"live": true` in the schema, and the script applies
+updates from its own main loop, so device access stays single-threaded:
+
+```python
+s = (Script("capture")
+     .number("-f", "--freq", unit="Hz", min=70e6, max=6e9, default=100e6, live=True)
+     .integer("-g", "--gain", unit="dB", min=0, max=49, default=30, live=True))
+args = s.parse()
+ctrl = s.live_control(args)          # opens the control socket, if the host set one
+
+sdr.set_freq(args.freq); sdr.set_gain(args.gain)
+while running:
+    for change in ctrl.drain():                    # applied on THIS thread
+        if change.name == "freq":
+            ctrl.report("freq", sdr.set_freq(change.value))   # report the value
+        elif change.name == "gain":                            # the device took
+            ctrl.report("gain", sdr.set_gain(change.value))
+    process(sdr.read())
+```
+
+* `drain()` returns the changes received since the last call (validated against
+  the schema — out-of-range values are rejected before they ever reach you) and
+  is a no-op when the script is run straight from the CLI, so the same script
+  still works without a host.
+* `report(name, value)` sends back the value the device actually took (e.g. a
+  gain quantised to the nearest step) so the UI reflects reality.
+
+The agent (sdr-agent) provisions a per-run Unix socket via the `SDR_CTRL_SOCK`
+env var and exposes `POST /tasks/{name}/params` to push updates to it.
+
 ## Status & roadmap
 
 This is the first cut: the library, the frequency example, and tests

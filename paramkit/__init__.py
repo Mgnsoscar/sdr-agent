@@ -29,6 +29,7 @@ from .params import (
     Script,
     slug,
 )
+from .live import CTRL_SOCK_ENV, Change, LiveControl
 
 __all__ = [
     "Script",
@@ -40,6 +41,9 @@ __all__ = [
     "TEXT",
     "CHOICE",
     "FLAG",
+    "LiveControl",
+    "Change",
+    "CTRL_SOCK_ENV",
 ]
 
 __version__ = "0.1.0"

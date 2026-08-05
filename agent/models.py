@@ -68,6 +68,14 @@ class StartRequest(BaseModel):
     replace_args: bool = False
 
 
+class SetParamsRequest(BaseModel):
+    """Retune a running task's live parameters (paramkit.live). `values` maps a
+    live parameter's name to its new value; `wait` is how long (seconds) to block
+    for the script to apply and report each change before returning it as pending."""
+    values: Dict[str, Any] = {}
+    wait: float = 1.0
+
+
 class AgentInfo(BaseModel):
     """Returned by GET /info."""
     hostname: str

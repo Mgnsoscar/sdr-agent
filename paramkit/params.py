@@ -413,6 +413,17 @@ class Script:
             del args.describe_params
         return args
 
+    # ── Live control (retune while running) ───────────────────────────────────
+
+    def live_control(self, args: Any, *, socket_path: Optional[str] = None):
+        """Open a control channel for this script's live parameters, seeded from
+        the parsed ``args``. Returns a paramkit.live.LiveControl — call drain() in
+        your main loop to apply changes on your own thread. With no socket (no
+        SDR_CTRL_SOCK and no explicit path) it's an inert no-op, so the same script
+        still runs fine on the CLI."""
+        from .live import LiveControl
+        return LiveControl(self._params, args, socket_path=socket_path)
+
     # ── Schema (for GUIs / hosts) ────────────────────────────────────────────
 
     def describe(self) -> Dict[str, Any]:

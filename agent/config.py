@@ -23,6 +23,10 @@ SEQUENCES_FILE = Path(os.environ.get("SDR_SEQUENCES_FILE", BASE_DIR / "configs" 
 SEQUENCE_RUNS_FILE = Path(os.environ.get("SDR_SEQUENCE_RUNS_FILE", BASE_DIR / "configs" / "sequence_runs.json"))
 PLANS_FILE = Path(os.environ.get("SDR_PLANS_FILE", BASE_DIR / "configs" / "plans.json"))
 SCHEDULE_FILE = Path(os.environ.get("SDR_SCHEDULE_FILE", BASE_DIR / "configs" / "schedule.json"))
+# Per-run control sockets for live-parameter tuning (paramkit.live). Kept short —
+# AF_UNIX paths are capped at ~108 bytes — and outside configs/ since they're
+# ephemeral runtime state, not saved config.
+CTRL_DIR   = Path(os.environ.get("SDR_CTRL_DIR", BASE_DIR / "run" / "ctl"))
 
 # ── Agent identity ────────────────────────────────────────────────────────────
 

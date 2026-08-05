@@ -75,7 +75,8 @@ from .models import (
     PanicResult, PatchEventRequest, PatchSequenceRunRequest, Plan,
     ProcessStatus, PutPlansRequest, PutScheduleRequest, ScheduledEvent,
     ScheduledPlan, SdrStatus, Sequence, SequenceRun,
-    SetTimeRequest, SetTimeResult, StartRequest, SystemHealth, TaskConfig,
+    SetParamsRequest, SetTimeRequest, SetTimeResult, StartRequest, SystemHealth,
+    TaskConfig,
 )
 from .client_state import ClientStateStore
 from .argspec import extract_params
@@ -269,6 +270,38 @@ async def restart_task(
         return await manager.restart(name, request)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+
+
+# ── Live parameters (retune while running) ─────────────────────────────────────
+
+@app.get("/tasks/{name}/params/live", tags=["tasks"],
+         dependencies=[Depends(verify_key)])
+async def get_live_params(name: str, manager: ProcessManager = Depends(get_manager)):
+    """The running task's current + applied live-parameter values (from its
+    control socket). 409 if the task isn't running or exposes no live params."""
+    try:
+        return await manager.get_params(name)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.post("/tasks/{name}/params", tags=["tasks"], dependencies=[Depends(verify_key)])
+async def set_live_params(
+    name: str,
+    request: SetParamsRequest,
+    manager: ProcessManager = Depends(get_manager),
+):
+    """Retune a running task's live parameters. Returns
+    {ok, accepted, rejected, applied, pending}. 404 unknown task, 409 not running
+    or no live params."""
+    try:
+        return await manager.set_params(name, request.values, request.wait)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 # ── Log fetch (HTTP) ──────────────────────────────────────────────────────────

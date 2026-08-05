@@ -12,22 +12,61 @@ connected SSE subscribers (best-effort, non-blocking, stdlib-only).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 import signal
+import socket
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic as _monotonic
 from typing import Deque, Dict, List, Optional
 
+from . import config as _agentcfg   # module import; container methods use a local `cfg`
 from .log_manager import LogManager
 from .models import (
     CrashEvent, ExitRecord, ProcessState, ProcessStatus,
     StartRequest, TaskConfig, TaskEvent,
 )
 
+try:
+    from paramkit.live import CTRL_SOCK_ENV
+except Exception:   # noqa: BLE001 — paramkit always present on a real unit
+    CTRL_SOCK_ENV = "SDR_CTRL_SOCK"
+
 logger = logging.getLogger(__name__)
+
+
+def _ctrl_sock_path(name: str) -> str:
+    """A short, per-task Unix-socket path for live-parameter control. Sanitised
+    and length-capped so it stays under the AF_UNIX ~108-byte limit."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:60] or "task"
+    return str(_agentcfg.CTRL_DIR / f"{safe}.sock")
+
+
+def _ctrl_rpc(path: str, req: dict, timeout: float) -> dict:
+    """Blocking one-shot request/response against a script's control socket.
+    Raises RuntimeError with a friendly message when the socket isn't there (the
+    task doesn't use paramkit.live, or hasn't bound yet)."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(path)
+    except (FileNotFoundError, ConnectionRefusedError, OSError) as exc:
+        raise RuntimeError(
+            "task does not expose live parameters (or isn't ready yet)") from exc
+    try:
+        f = s.makefile("rwb")
+        f.write((json.dumps(req) + "\n").encode("utf-8"))
+        f.flush()
+        line = f.readline()
+        if not line:
+            raise RuntimeError("no response from the task's control socket")
+        return json.loads(line.decode("utf-8"))
+    finally:
+        s.close()
 
 
 def _utcnow() -> str:
@@ -131,6 +170,8 @@ class ManagedProcess:
         self._log_fh = None
         self._dispatcher = dispatcher
         self._unit_id = unit_id
+        # Path of this run's live-parameter control socket (set on start).
+        self._ctrl_sock: Optional[str] = None
 
         # Set when a manual stop is requested, so an in-progress restart-delay in
         # the watcher aborts instead of relaunching (lets you stop a crash-looping
@@ -165,6 +206,19 @@ class ManagedProcess:
         # Force unbuffered output so both streams flush live. A task that really
         # wants buffering can still override this in its env.
         env.setdefault("PYTHONUNBUFFERED", "1")
+
+        # Provision a control socket for live-parameter tuning. paramkit.live binds
+        # it iff the script declares live params and calls script.live_control();
+        # otherwise nothing listens and set-params calls report cleanly that the
+        # task exposes none. The path is per-task and ephemeral.
+        try:
+            _agentcfg.CTRL_DIR.mkdir(parents=True, exist_ok=True)
+            self._ctrl_sock = _ctrl_sock_path(self.config.name)
+            env[CTRL_SOCK_ENV] = self._ctrl_sock
+        except OSError as exc:
+            logger.warning("Could not prepare control socket dir for '%s': %s",
+                           self.config.name, exc)
+            self._ctrl_sock = None
 
         self.log.rotate()
         self.log.cleanup()   # prune old archives so the SD card never fills
@@ -241,6 +295,27 @@ class ManagedProcess:
             restart_count = self.restart_count,
             log_file      = str(self.log.current),
         )
+
+    # ── Live parameters (retune a running task) ────────────────────────────────
+
+    async def set_params(self, values: dict, wait: float = 1.0) -> dict:
+        """Push live-parameter updates to the running script over its control
+        socket and return {ok, accepted, rejected, applied, pending}. Raises
+        RuntimeError if the task isn't running or exposes no live params."""
+        if self.state != ProcessState.RUNNING or not self._ctrl_sock:
+            raise RuntimeError(f"Task '{self.config.name}' is not running")
+        # The socket read must outlast the script-side wait for applied values.
+        timeout = max(0.0, float(wait)) + 5.0
+        return await asyncio.to_thread(
+            _ctrl_rpc, self._ctrl_sock,
+            {"op": "set", "values": values, "wait": wait}, timeout)
+
+    async def get_params(self) -> dict:
+        """Read the running script's current + applied live-parameter values."""
+        if self.state != ProcessState.RUNNING or not self._ctrl_sock:
+            raise RuntimeError(f"Task '{self.config.name}' is not running")
+        return await asyncio.to_thread(
+            _ctrl_rpc, self._ctrl_sock, {"op": "get"}, 5.0)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -353,6 +428,16 @@ class ManagedProcess:
             except OSError:
                 pass
             self._log_fh = None
+
+        # Remove this run's control socket. The script unlinks its own on a clean
+        # exit; this also clears a stale file left by a crash so it can't fool a
+        # later set-params into connecting to nothing.
+        if self._ctrl_sock:
+            try:
+                os.unlink(self._ctrl_sock)
+            except OSError:
+                pass
+            self._ctrl_sock = None
 
         if set_state:
             self.state = ProcessState.STOPPED
@@ -525,6 +610,15 @@ class ProcessManager:
         if source == "manual":
             await self._fire_task_event("task_stopped", status)
         return status
+
+    async def set_params(self, name: str, values: dict, wait: float = 1.0) -> dict:
+        """Retune a running task's live parameters. Raises KeyError (unknown task)
+        or RuntimeError (not running / no live params)."""
+        return await self._get(name).set_params(values, wait)
+
+    async def get_params(self, name: str) -> dict:
+        """Read a running task's current + applied live-parameter values."""
+        return await self._get(name).get_params()
 
     async def restart(self, name: str, request: Optional[StartRequest] = None,
                       source: str = "manual") -> ProcessStatus:
