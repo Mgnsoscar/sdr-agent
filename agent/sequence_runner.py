@@ -344,6 +344,7 @@ class SequenceRunner:
                 resume_offset_s=inject,
                 args=args,
                 replace_args=replace_args,
+                params=dict(s.params or {}),
             ))
         # Sort by fire time so the runner fires them in order
         fires.sort(key=lambda f: _parse(f.fire_at))
@@ -474,7 +475,7 @@ class SequenceRunner:
             armed_steps = [
                 SequenceStep(anchor=f.anchor, offset_s=f.offset_s, action=f.action,
                              task_name=f.task_name, args=list(f.args),
-                             replace_args=f.replace_args)
+                             replace_args=f.replace_args, params=dict(f.params or {}))
                 for f in run.steps
             ]
             rebuilt = self._resolve_steps(
@@ -628,10 +629,12 @@ class SequenceRunner:
 
         rl = self._run_logs.get(run.id)
         if rl is not None:
-            glyph = {"start": "▶ start", "run": "⚡ run", "stop": "⏹ stop"}.get(
-                step.action, step.action)
+            glyph = {"start": "▶ start", "run": "⚡ run", "stop": "⏹ stop",
+                     "tune": "◈ tune"}.get(step.action, step.action)
             line = f"{glyph} {step.task_name}"
-            if step.args:
+            if step.action == "tune" and step.params:
+                line += " " + " ".join(f"{k}={v}" for k, v in step.params.items())
+            elif step.args:
                 line += " " + " ".join(step.args)
             if step.resume_offset_s:
                 line += f"  (resume +{step.resume_offset_s:.0f}s)"
@@ -657,6 +660,16 @@ class SequenceRunner:
                 # same script (e.g. attenuator sets) can run without colliding.
                 await self._manager.run_oneshot(
                     step.task_name, list(step.args), run_id=run.id)
+            elif step.action == "tune":
+                # Retune a running duration task's live parameters. The task must
+                # already be running (started by an earlier step); if it isn't, or
+                # exposes no live params, set_params raises and we log it below
+                # without derailing the rest of the run.
+                result = await self._manager.set_params(
+                    step.task_name, dict(step.params), wait=0.0)
+                if rl is not None and isinstance(result, dict) and result.get("rejected"):
+                    rl.annotate("   ⚠ tune rejected: " + "; ".join(
+                        f"{k} ({v})" for k, v in result["rejected"].items()))
             else:  # stop
                 await self._manager.stop(step.task_name, source="sequence")
         except Exception as exc:

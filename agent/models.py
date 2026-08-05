@@ -223,6 +223,7 @@ class StepAction(str, Enum):
     START = "start"   # launch a long-running task (stopped later by a STOP step)
     STOP  = "stop"    # stop a long-running task
     RUN   = "run"     # fire-and-exit one-shot: launch, let it self-terminate, no stop
+    TUNE  = "tune"    # retune a running task's live parameters (see SequenceStep.params)
 
 
 class SequenceStep(BaseModel):
@@ -249,6 +250,9 @@ class SequenceStep(BaseModel):
     # defaults. When False (legacy), args are appended to the task's command.
     replace_args: bool = False
     inject_resume_offset: bool = False # If true and resuming, pass the offset to this task's start
+    # For a TUNE step: the live-parameter values to apply to the (already running)
+    # task at this step's offset, as {param-name: value}. Ignored for other actions.
+    params: dict = {}
 
 
 class Sequence(BaseModel):
@@ -289,6 +293,7 @@ class StepFire(BaseModel):
     resume_offset_s: Optional[float] = None  # offset injected, if any
     args: list[str] = []               # CLI args for this step's start/run (see SequenceStep.args)
     replace_args: bool = False         # args are the complete set (replace defaults), see SequenceStep
+    params: dict = {}                  # TUNE step: live-param values to apply (see SequenceStep.params)
 
 
 class SequenceRun(BaseModel):
