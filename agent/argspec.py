@@ -139,6 +139,9 @@ def extract_argparse_spec(source: str) -> Dict[str, Any]:
             "nargs": (kw["nargs"].value if "nargs" in kw
                       and isinstance(kw["nargs"], ast.Constant) else None),
             "help": _joined_help(kw["help"], consts) if "help" in kw else "",
+            # Plain argparse can't declare live tuning; keep the key present so
+            # consumers can rely on it existing regardless of the schema source.
+            "live": False,
         })
     return {"params": params}
 
@@ -247,6 +250,7 @@ def extract_paramkit_spec(source: str) -> Dict[str, Any]:
         choices = [str(c) for c in raw_choices] if raw_choices else None
         multiple = bool(_literal(kw["multiple"], consts)) if "multiple" in kw else False
         required = bool(_literal(kw["required"], consts)) if "required" in kw else False
+        live = bool(_literal(kw["live"], consts)) if "live" in kw else False
         default = (_literal(kw["default"], consts) if "default" in kw
                    else (False if kind == "flag" else None))
 
@@ -260,6 +264,7 @@ def extract_paramkit_spec(source: str) -> Dict[str, Any]:
             "step": _num(_literal(kw["step"], consts)) if "step" in kw else None,
             "presets": presets,
             "multiple": multiple,
+            "live": live,
             # classic (argparse-compatible) fields
             "dest": name,
             "flags": options,

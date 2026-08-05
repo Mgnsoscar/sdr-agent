@@ -147,6 +147,7 @@ class Param:
     default: Any = None
     required: bool = False
     multiple: bool = False          # accept more than one value (argparse nargs="+")
+    live: bool = False              # tunable while the script runs (see Script.live_control)
 
     @property
     def display_name(self) -> str:
@@ -169,6 +170,7 @@ class Param:
             "default": self.default,
             "required": self.required,
             "multiple": self.multiple,
+            "live": self.live,
         }
 
 
@@ -268,57 +270,64 @@ class Script:
                unit: str = "", min: Optional[float] = None, max: Optional[float] = None,
                step: Optional[float] = None, presets: PresetsInput = None,
                default: Optional[float] = None, required: bool = False,
-               multiple: bool = False) -> "Script":
-        """A floating-point parameter with optional unit, range, and named presets."""
+               multiple: bool = False, live: bool = False) -> "Script":
+        """A floating-point parameter with optional unit, range, and named presets.
+
+        Pass live=True to mark it tunable while the script runs — a GUI can then
+        offer a control that applies changes mid-run (the script reads updates via
+        Script.live_control)."""
         n, flags = self._derive_name(flags, name)
         return self._add(Param(
             name=n, flags=flags, kind=NUMBER, help=help, unit=unit, min=min, max=max,
             step=step, presets=_normalise_presets(presets), default=default,
-            required=required, multiple=multiple,
+            required=required, multiple=multiple, live=live,
         ))
 
     def integer(self, *flags: str, name: Optional[str] = None, help: str = "",
                 unit: str = "", min: Optional[int] = None, max: Optional[int] = None,
                 step: Optional[int] = None, presets: PresetsInput = None,
                 default: Optional[int] = None, required: bool = False,
-                multiple: bool = False) -> "Script":
-        """A whole-number parameter. Like number() but values are ints."""
+                multiple: bool = False, live: bool = False) -> "Script":
+        """A whole-number parameter. Like number() but values are ints. See number()
+        for the live= flag."""
         n, flags = self._derive_name(flags, name)
         return self._add(Param(
             name=n, flags=flags, kind=INTEGER, help=help, unit=unit, min=min, max=max,
             step=step, presets=_normalise_presets(presets), default=default,
-            required=required, multiple=multiple,
+            required=required, multiple=multiple, live=live,
         ))
 
     def choice(self, *flags: str, options: Sequence[str], name: Optional[str] = None,
                help: str = "", default: Optional[str] = None,
-               required: bool = False) -> "Script":
-        """A string parameter restricted to a fixed set of options (a GUI dropdown)."""
+               required: bool = False, live: bool = False) -> "Script":
+        """A string parameter restricted to a fixed set of options (a GUI dropdown).
+        See number() for the live= flag."""
         n, flags = self._derive_name(flags, name)
         opts = [str(o) for o in options]
         if default is not None and str(default) not in opts:
             raise ValueError(f"default {default!r} is not one of the options {opts}")
         return self._add(Param(
             name=n, flags=flags, kind=CHOICE, help=help, choices=opts,
-            default=default, required=required,
+            default=default, required=required, live=live,
         ))
 
     def text(self, *flags: str, name: Optional[str] = None, help: str = "",
              default: Optional[str] = None, required: bool = False,
-             multiple: bool = False) -> "Script":
-        """A free-form string parameter."""
+             multiple: bool = False, live: bool = False) -> "Script":
+        """A free-form string parameter. See number() for the live= flag."""
         n, flags = self._derive_name(flags, name)
         return self._add(Param(
             name=n, flags=flags, kind=TEXT, help=help, default=default,
-            required=required, multiple=multiple,
+            required=required, multiple=multiple, live=live,
         ))
 
     def flag(self, *flags: str, name: Optional[str] = None, help: str = "",
-             default: bool = False) -> "Script":
-        """A boolean on/off switch (a GUI checkbox). Present on the CLI ⇒ True."""
+             default: bool = False, live: bool = False) -> "Script":
+        """A boolean on/off switch (a GUI checkbox). Present on the CLI ⇒ True.
+        See number() for the live= flag."""
         n, flags = self._derive_name(flags, name)
         return self._add(Param(
-            name=n, flags=flags, kind=FLAG, help=help, default=bool(default),
+            name=n, flags=flags, kind=FLAG, help=help, default=bool(default), live=live,
         ))
 
     # ── argparse construction ────────────────────────────────────────────────
