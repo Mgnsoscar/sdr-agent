@@ -66,6 +66,7 @@ from pydantic import BaseModel
 
 import yaml
 from ruamel.yaml import YAML
+from ruamel.yaml.scalarstring import SingleQuotedScalarString
 
 from . import config as cfg
 from . import system as sysmon
@@ -580,6 +581,16 @@ def _task_index(doc, name: str) -> int:
     return -1
 
 
+def _yaml_env(env: dict) -> dict:
+    """Env values, single-quoted for the YAML dump. We write with ruamel (YAML
+    1.2) but config.load_tasks reads with PyYAML (YAML 1.1), where bare tokens
+    like on/off/yes/no parse as booleans — which then fail TaskConfig's
+    Dict[str, str] and drop the whole task. Quoting both keys and values forces
+    them back as strings on read, so an env like LIVE=on survives the round-trip."""
+    return {SingleQuotedScalarString(str(k)): SingleQuotedScalarString(str(v))
+            for k, v in env.items()}
+
+
 def _spec_to_entry(spec: TaskConfig) -> dict:
     """A clean tasks.yaml entry — the commonly-edited fields only."""
     return {
@@ -587,7 +598,7 @@ def _spec_to_entry(spec: TaskConfig) -> dict:
         "description": spec.description,
         "command": list(spec.command),
         "working_dir": spec.working_dir or str(SCRIPTS_DIR),
-        "env": dict(spec.env),
+        "env": _yaml_env(spec.env),
         "autostart": spec.autostart,
         "restart_on_crash": spec.restart_on_crash,
     }
