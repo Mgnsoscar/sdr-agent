@@ -44,3 +44,39 @@ tasks:
       GR_DONT_LOAD_PREFS: "1"          # skip slow pref scan in headless mode
     autostart: false
     restart_on_crash: false
+
+
+  # ── GPS-style PRN transmitter (high sample rate) ────────────────────────────
+  # Transmits a BPSK GPS C/A Gold code at L1, replayed from a precomputed file so
+  # a Pi can sustain 40 MS/s (→ a ~20 MHz-wide 10.23 Mcps code). See the script's
+  # docstring for the full rationale (precompute+loop, sc8 over the wire, quiet).
+  #
+  # Live-tunable while running: --code_rate (1.023 ↔ 10.23 Mcps), --gain,
+  # --amplitude. --prn / --freq / --samp_rate / --otw are fixed per run.
+  #
+  # ⚠  L1 is a live GNSS band. Transmit ONLY into a shielded / conducted setup you
+  #    are LICENSED / AUTHORISED to use — never radiate over the air.
+  - name: GPS-PRN
+    description: "GPS C/A PRN TX at L1, file-replay (40 MS/s, sc8, seamless loop)."
+    command:
+      - python3
+      - /opt/sdr-agent/scripts/gps_prn_tx.py
+      - --prn
+      - "1"
+      - --code_rate
+      - "1.023"        # Mcps: 1.023 (~2 MHz BW) or 10.23 (~20 MHz BW)
+      - --gain
+      - "50"           # TX gain [dB]
+      - --amplitude
+      - "0.9"
+    working_dir: /opt/sdr-agent/scripts
+    env:
+      GR_DONT_LOAD_PREFS: "1"          # skip slow pref scan in headless mode
+      # Quiet mid-run: block-buffer stdout (the agent forces PYTHONUNBUFFERED=1;
+      # override it here) and silence UHD's fastpath underflow spam, so status
+      # writes never steal USB/CPU from the stream at high rate.
+      PYTHONUNBUFFERED: "0"
+      UHD_LOG_FASTPATH_DISABLE: "1"
+      UHD_LOG_CONSOLE_LEVEL: "off"
+    autostart: false
+    restart_on_crash: false
