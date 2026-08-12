@@ -180,10 +180,10 @@ class SequenceRunner:
                     raise ValueError(f"ramp step for '{s.task_name}' has no ramp definition")
                 try:
                     if s.anchor == "both":
-                        if s.ramp.step is None and s.ramp.hold_s is None:
-                            raise ValueError("a window-filling ramp needs a step size or hold time")
+                        if s.ramp.steps is None and s.ramp.step is None and s.ramp.hold_s is None:
+                            raise ValueError("a window-filling ramp needs a step count or hold time")
                     else:
-                        ramp.resolve_ramp(s.ramp.start, s.ramp.stop, step=s.ramp.step,
+                        ramp.resolve_ramp(s.ramp.start, s.ramp.stop, steps=s.ramp.steps, step=s.ramp.step,
                                           hold_s=s.ramp.hold_s, duration_s=s.ramp.duration_s)
                 except ValueError as exc:
                     raise ValueError(f"ramp step for '{s.task_name}': {exc}")
@@ -388,7 +388,7 @@ class SequenceRunner:
             end_inset = s.offset_end_s or 0.0
             window_s = (on_air_end - on_air_at).total_seconds() - (s.offset_s or 0.0) + end_inset
         try:
-            resolved = ramp.resolve_ramp(r.start, r.stop, step=r.step, hold_s=r.hold_s,
+            resolved = ramp.resolve_ramp(r.start, r.stop, steps=r.steps, step=r.step, hold_s=r.hold_s,
                                          duration_s=r.duration_s, window_s=window_s)
             points = ramp.place_ramp(s.anchor, s.offset_s, resolved)
         except ValueError as exc:
@@ -915,4 +915,4 @@ class SequenceRunner:
             logger.info("Loaded %d run(s)", len(self._runs))
         except (OSError, json.JSONDecodeError, KeyError) as exc:
             logger.error("Failed to load sequence_runs.json (%s) — starting empty", exc)
-            self._runs = {}
+            self._runs = {}

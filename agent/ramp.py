@@ -45,10 +45,13 @@ class ResolvedRamp:
     n_intervals: int        # number of steps taken (points - 1)
 
 
-def resolve_ramp(start: float, stop: float, *, step: Optional[float] = None,
-                 hold_s: Optional[float] = None, duration_s: Optional[float] = None,
+def resolve_ramp(start: float, stop: float, *, steps: Optional[int] = None,
+                 step: Optional[float] = None, hold_s: Optional[float] = None,
+                 duration_s: Optional[float] = None,
                  window_s: Optional[float] = None) -> ResolvedRamp:
     """Compute the concrete points of a ramp from any valid combination of inputs.
+    Prefer `steps` (the number of equal increments) — it always divides the range
+    and the duration evenly; `step` (a fixed increment size) is still accepted.
     `window_s`, when given (dual-anchor), is the duration and overrides duration_s.
     Raises ValueError if under-specified, degenerate, or it would expand too far."""
     if start == stop:
@@ -60,7 +63,19 @@ def resolve_ramp(start: float, stop: float, *, step: Optional[float] = None,
     # A window (dual-anchor) is the duration; otherwise use an explicit duration.
     D = window_s if window_s is not None else duration_s
 
-    if step is not None:
+    if steps is not None:
+        # A fixed number of equal increments: value range and duration both divide
+        # exactly, so there's never a ragged last step.
+        n_intervals = max(1, int(steps))
+        if D is not None:
+            hold = D / n_intervals
+        elif hold_s is not None:
+            hold = float(hold_s)
+        else:
+            raise ValueError("ramp needs a hold time or a duration alongside the step count")
+        _guard(n_intervals)
+        values = [float(start) + delta * (i / n_intervals) for i in range(n_intervals + 1)]
+    elif step is not None:
         # Honour the step size: values increment by `step`, last clamped to stop.
         if step <= 0:
             raise ValueError("ramp step must be positive")
@@ -126,7 +141,8 @@ def min_on_air_duration(steps) -> float:
                 max_start = max(max_start, offset)
                 min_stop = min(min_stop, end)
                 continue
-            span = resolve_ramp(r.start, r.stop, step=r.step, hold_s=r.hold_s,
+            span = resolve_ramp(r.start, r.stop, steps=getattr(r, "steps", None),
+                                 step=r.step, hold_s=r.hold_s,
                                  duration_s=r.duration_s).duration_s
             if anchor == "start":
                 max_start = max(max_start, offset + span)

@@ -235,7 +235,8 @@ class RampSpec(BaseModel):
     param: str
     start: float
     stop: float
-    step: Optional[float] = None        # value increment per point
+    steps: Optional[int] = None         # number of equal increments (divides evenly)
+    step: Optional[float] = None        # OR a fixed value increment per point
     hold_s: Optional[float] = None      # dwell between points
     duration_s: Optional[float] = None  # first point → last point (single-anchor)
 
