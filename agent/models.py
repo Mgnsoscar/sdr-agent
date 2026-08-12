@@ -252,7 +252,10 @@ class SequenceStep(BaseModel):
                       offsets and move automatically when the stop is extended.
     """
     anchor: str = "start"              # "start" | "stop" | "both" (ramp filling the window)
-    offset_s: float                    # relative to the chosen anchor
+    offset_s: float                    # relative to the chosen anchor (on-air side for "both")
+    # For a "both"-anchored ramp: the off-air-side inset (≤ 0 = before off-air). The
+    # ramp fills [on-air + offset_s, off-air + offset_end_s]. Ignored otherwise.
+    offset_end_s: Optional[float] = None
     action: StepAction
     task_name: str
     # CLI args for this step's start/run. So one registered task (e.g. a set-gain

@@ -23,11 +23,11 @@ def _runner(tmp: Path):
     return mgr, runner
 
 
-def _base_steps(ramp: RampSpec, anchor="start", offset=0.0):
+def _base_steps(ramp: RampSpec, anchor="start", offset=0.0, offset_end=None):
     return [
         SequenceStep(anchor="start", offset_s=0.0, action=StepAction.START, task_name="chirp"),
-        SequenceStep(anchor=anchor, offset_s=offset, action=StepAction.RAMP,
-                     task_name="chirp", ramp=ramp),
+        SequenceStep(anchor=anchor, offset_s=offset, offset_end_s=offset_end,
+                     action=StepAction.RAMP, task_name="chirp", ramp=ramp),
         SequenceStep(anchor="stop", offset_s=0.0, action=StepAction.STOP, task_name="chirp"),
     ]
 
@@ -95,6 +95,29 @@ def test_both_anchor_ramp_fills_window(tmp_path):
                            key=lambda s: s.offset_s)
             assert tunes[0].offset_s == 0 and tunes[0].params["gain"] == 0
             assert tunes[-1].offset_s == pytest.approx(60) and tunes[-1].params["gain"] == 30
+        finally:
+            await runner.shutdown(); await mgr.shutdown()
+    asyncio.run(scenario())
+
+
+def test_both_anchor_ramp_respects_insets(tmp_path):
+    async def scenario():
+        mgr, runner = _runner(tmp_path)
+        await mgr.startup(); await runner.startup()
+        try:
+            ramp = RampSpec(param="gain", start=0, stop=30, hold_s=10)
+            # 60s window, start 5s after on-air, end 5s before off-air ⇒ 50s span.
+            seq = await runner.create_sequence(CreateSequenceRequest(
+                name="inset", steps=_base_steps(ramp, anchor="both", offset=5.0, offset_end=-5.0)))
+            now = datetime.now(timezone.utc)
+            run = await runner.arm(
+                seq.id,
+                ArmSequenceRequest(on_air_at=(now + timedelta(seconds=30)).isoformat()),
+                (now + timedelta(seconds=90)).isoformat(),   # 60s window
+            )
+            tunes = sorted((s for s in run.steps if s.action == "tune"), key=lambda s: s.offset_s)
+            assert tunes[0].offset_s == pytest.approx(5)     # starts at on-air + 5
+            assert tunes[-1].offset_s == pytest.approx(55)   # ends at off-air - 5 (60-5)
         finally:
             await runner.shutdown(); await mgr.shutdown()
     asyncio.run(scenario())

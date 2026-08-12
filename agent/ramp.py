@@ -98,9 +98,8 @@ def place_ramp(anchor: str, offset_s: float,
         # Last point sits at off-air + offset_s; earlier points precede it.
         return [("stop", offset_s - (n - i) * hold, v)
                 for i, v in enumerate(resolved.values)]
-    # "start" runs forward from offset_s; "both" fills the window from T0 (offset 0).
-    base = offset_s if anchor == "start" else 0.0
-    return [("start", base + i * hold, v) for i, v in enumerate(resolved.values)]
+    # "start" runs forward from offset_s; "both" starts at its on-air inset offset_s.
+    return [("start", offset_s + i * hold, v) for i, v in enumerate(resolved.values)]
 
 
 # ── Minimum on-air duration ───────────────────────────────────────────────────
@@ -122,6 +121,10 @@ def min_on_air_duration(steps) -> float:
         if _action_str(getattr(s, "action", "")) == "ramp" and getattr(s, "ramp", None):
             r = s.ramp
             if anchor == "both":
+                # Fills the window between its insets: on-air+offset .. off-air+end.
+                end = float(getattr(s, "offset_end_s", 0.0) or 0.0)
+                max_start = max(max_start, offset)
+                min_stop = min(min_stop, end)
                 continue
             span = resolve_ramp(r.start, r.stop, step=r.step, hold_s=r.hold_s,
                                  duration_s=r.duration_s).duration_s

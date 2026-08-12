@@ -383,7 +383,10 @@ class SequenceRunner:
         if s.anchor == "both":
             if on_air_end is None:
                 return []
-            window_s = (on_air_end - on_air_at).total_seconds()
+            # The ramp fills [on-air + offset_s, off-air + offset_end_s]; its
+            # duration is the window minus whatever the insets carve off.
+            end_inset = s.offset_end_s or 0.0
+            window_s = (on_air_end - on_air_at).total_seconds() - (s.offset_s or 0.0) + end_inset
         try:
             resolved = ramp.resolve_ramp(r.start, r.stop, step=r.step, hold_s=r.hold_s,
                                          duration_s=r.duration_s, window_s=window_s)
