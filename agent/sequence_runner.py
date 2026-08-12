@@ -35,6 +35,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from . import ramp
 from .log_manager import LogManager
 from .models import (
     ArmSequenceRequest, CreateSequenceRequest, Sequence, SequenceRun,
@@ -169,8 +170,23 @@ class SequenceRunner:
         for s in steps:
             if not self._manager.has_task(s.task_name):
                 raise ValueError(f"unknown task in step: '{s.task_name}'")
-            if s.anchor not in ("start", "stop"):
-                raise ValueError(f"step anchor must be 'start' or 'stop', got '{s.anchor}'")
+            action = s.action.value if hasattr(s.action, "value") else str(s.action)
+            if s.anchor not in ("start", "stop", "both"):
+                raise ValueError(f"step anchor must be 'start', 'stop' or 'both', got '{s.anchor}'")
+            if s.anchor == "both" and action != "ramp":
+                raise ValueError("only a ramp step can be anchored to both edges")
+            if action == "ramp":
+                if s.ramp is None:
+                    raise ValueError(f"ramp step for '{s.task_name}' has no ramp definition")
+                try:
+                    if s.anchor == "both":
+                        if s.ramp.step is None and s.ramp.hold_s is None:
+                            raise ValueError("a window-filling ramp needs a step size or hold time")
+                    else:
+                        ramp.resolve_ramp(s.ramp.start, s.ramp.stop, step=s.ramp.step,
+                                          hold_s=s.ramp.hold_s, duration_s=s.ramp.duration_s)
+                except ValueError as exc:
+                    raise ValueError(f"ramp step for '{s.task_name}': {exc}")
         # Must have an on-air start (a start-anchored action at offset 0 is the
         # conventional T0 action, but we don't force it — we just require that
         # there's at least one start-anchored and one stop-anchored step so the
@@ -319,6 +335,10 @@ class SequenceRunner:
         overrides = overrides or {}
         fires: List[StepFire] = []
         for i, s in enumerate(steps):
+            action = s.action.value if hasattr(s.action, "value") else str(s.action)
+            if action == "ramp":
+                fires.extend(self._resolve_ramp(s, on_air_at, on_air_end, open_ended))
+                continue
             if s.anchor == "stop":
                 if open_ended:
                     continue   # no stop in an open-ended run; abort handles shutdown
@@ -350,6 +370,41 @@ class SequenceRunner:
         fires.sort(key=lambda f: _parse(f.fire_at))
         return fires
 
+    def _resolve_ramp(self, s: SequenceStep, on_air_at: datetime,
+                      on_air_end: Optional[datetime], open_ended: bool) -> List[StepFire]:
+        """Expand a RAMP step into a series of `tune` fires. A both-anchored ramp
+        fills the on-air window (skipped when the run is open-ended, since there's
+        no window). A bad/under-specified ramp is logged and dropped rather than
+        sinking the whole run."""
+        if s.ramp is None:
+            return []
+        r = s.ramp
+        window_s = None
+        if s.anchor == "both":
+            if on_air_end is None:
+                return []
+            window_s = (on_air_end - on_air_at).total_seconds()
+        try:
+            resolved = ramp.resolve_ramp(r.start, r.stop, step=r.step, hold_s=r.hold_s,
+                                         duration_s=r.duration_s, window_s=window_s)
+            points = ramp.place_ramp(s.anchor, s.offset_s, resolved)
+        except ValueError as exc:
+            logger.error("Ramp step for '%s' could not be resolved: %s", s.task_name, exc)
+            return []
+        out: List[StepFire] = []
+        for fire_anchor, off, value in points:
+            if fire_anchor == "stop":
+                if open_ended or on_air_end is None:
+                    continue
+                base = on_air_end
+            else:
+                base = on_air_at
+            out.append(StepFire(
+                anchor=fire_anchor, offset_s=off, action="tune",
+                task_name=s.task_name, fire_at=(base + timedelta(seconds=off)).isoformat(),
+                params={r.param: value}))
+        return out
+
     # ── Arming ────────────────────────────────────────────────────────────────
 
     async def arm(self, seq_id: str, req: ArmSequenceRequest, on_air_end_iso: Optional[str]) -> SequenceRun:
@@ -380,6 +435,14 @@ class SequenceRunner:
             on_air_end = _parse(on_air_end_iso)
             if on_air_end <= on_air_at:
                 raise ValueError("on_air_end must be after on_air_at")
+            # Hard block: the on-air window must fit the sequence's fixed-duration
+            # content (e.g. a 60s ramp-up + a 60s ramp-down ⇒ ≥120s).
+            window_s = (on_air_end - on_air_at).total_seconds()
+            min_dur = ramp.min_on_air_duration(eff_steps)
+            if window_s + 1e-6 < min_dur:
+                raise ValueError(
+                    f"on-air window is {window_s:.0f}s but this sequence needs at "
+                    f"least {min_dur:.0f}s (its ramps don't fit)")
 
         # The earliest step (most negative start-anchored offset) must be in the future
         lead_in = self._lead_offset(eff_steps)   # most negative offset, e.g. -120
