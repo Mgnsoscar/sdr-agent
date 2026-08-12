@@ -66,6 +66,16 @@ API_KEY = os.environ.get("SDR_API_KEY", "")
 
 # ── Task registry ─────────────────────────────────────────────────────────────
 
+def _env_str(v) -> str:
+    """Coerce a YAML-parsed env value back to the string env always is. Bools and
+    null get conventional forms rather than Python's 'True'/'None'."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if v is None:
+        return ""
+    return str(v)
+
+
 def load_tasks() -> Dict[str, TaskConfig]:
     """Parse tasks.yaml and return a dict keyed by task name."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -84,6 +94,12 @@ def load_tasks() -> Dict[str, TaskConfig]:
     tasks: Dict[str, TaskConfig] = {}
     for entry in raw.get("tasks", []):
         try:
+            if isinstance(entry, dict) and isinstance(entry.get("env"), dict):
+                # Env is all strings, but YAML may have parsed a value like `on` or
+                # `8080` as a bool/int (e.g. a hand-edited or legacy file). Coerce
+                # so a stray type never drops the whole task.
+                entry = {**entry, "env": {str(k): _env_str(v)
+                                          for k, v in entry["env"].items()}}
             task = TaskConfig(**entry)
             tasks[task.name] = task
         except Exception as exc:
