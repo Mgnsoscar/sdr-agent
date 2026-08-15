@@ -37,6 +37,23 @@ else
     printf '127.0.1.1\t%s\n' "$PROV_HOSTNAME" >> /etc/hosts
 fi
 
+# cloud-init (Ubuntu Server for Pi, and some Raspberry Pi OS images) re-applies the
+# hostname AND network config from its datasource on every boot unless told not to —
+# which is exactly why a manually-set hostname "resets after a reboot". If it's
+# present, pin the hostname and hand network control to the OS-native tools we
+# configure just below (otherwise cloud-init would clobber the static IP too).
+if [ -d /etc/cloud ] || command -v cloud-init >/dev/null 2>&1; then
+    echo "==> cloud-init detected — pinning hostname + disabling its network takeover"
+    mkdir -p /etc/cloud/cloud.cfg.d
+    cat > /etc/cloud/cloud.cfg.d/99-sdr-provision.cfg <<EOF
+# Written by sdr provision_network.sh ($STAMP). Stops cloud-init reverting the
+# hostname and re-writing the network on each boot; the static config below (and
+# NetworkManager/dhcpcd) owns the network from here on.
+preserve_hostname: true
+network: {config: disabled}
+EOF
+fi
+
 nm_writer() {
     # NetworkManager (Bookworm and later). One connection profile per interface.
     local iface="$1" ip="$2" gw="$3"

@@ -362,7 +362,12 @@ changes — the agent is installed *by* this flow.
 - `provision_network.sh` — sets the hostname and STATIC IPs, then reboots. Detects
   the stack (NetworkManager `nmcli` vs `dhcpcd`) and writes whichever applies, with a
   timestamped backup of the prior config. Runs **last** (it drops the SSH session at
-  the IP change / reboot — the re-IP gotcha in §4.4).
+  the IP change / reboot — the re-IP gotcha in §4.4). If **cloud-init** is present
+  (Ubuntu Server for Pi, some RPi OS images) it drops
+  `/etc/cloud/cloud.cfg.d/99-sdr-provision.cfg` with `preserve_hostname: true` +
+  `network: {config: disabled}` — otherwise cloud-init re-applies the old hostname
+  and network from its datasource on every boot (the classic "hostname resets after
+  reboot").
 - `build_bundle.sh` now embeds `configs/` (seed state) and `deploy/` (these scripts)
   in the bundle, so the single artifact serves OTA *and* provisioning. For OTA the
   extra dirs land unused in the release dir (state is read from `SDR_STATE_DIR`).
