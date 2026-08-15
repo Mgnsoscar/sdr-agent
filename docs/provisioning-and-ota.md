@@ -1,9 +1,9 @@
 # Provisioning & OTA updates — design spec
 
-> **Phase 1 (OTA update of known units) is implemented on the agent side** — see
-> [§11](#11-phase-1--implemented-agent-side). The client "Update" button and the
-> bundle-embedding for the installer are the remaining Phase 1 work; Phases 2–3 are
-> still design-only.
+> **Phase 1 (OTA update of known units) is implemented** — agent side in
+> [§11](#11-phase-1--implemented-agent-side); the client "Update agent…" button ships
+> too. **Phase 2 (SSH bootstrap provisioning) is implemented** — see
+> [§12](#12-phase-2--implemented). Phase 3 (base image) is still design-only.
 
 **Status:** design / spec. For review.
 **Scope decisions (from discussion):** support both Bookworm (NetworkManager) and
@@ -340,6 +340,56 @@ updater). All green.
 defaults to `BASE_DIR`, and the `/admin/*` queries just return empty/None until the
 unit is migrated to the versioned layout.
 
-**Still to do for Phase 1:** client `update_agent`/`agent_releases`/`rollback_agent`
-fleet calls, a frozen-path bundle locator, and the per-unit Update button + version
-display + one-at-a-time "Update all".
+**Client side (shipped):** `AgentClient.update_agent`/`rollback_agent`/`agent_releases`
+(with a per-call timeout for the long upload), a frozen-path bundle locator
+(`state/agent_bundle.py`), and the per-unit **"Update agent…"** button + version
+display + one-click roll back (`ui/agent_update_dialog.py`). Still open: a
+one-at-a-time fleet **"Update all"**.
+
+---
+
+## 12. Phase 2 — implemented
+
+SSH bootstrap provisioning of a fresh Pi, driven from the client. No agent code
+changes — the agent is installed *by* this flow.
+
+**Agent repo (`deploy/`)**
+- `provision_install.sh` — from-scratch versioned-layout install straight from an
+  unpacked bundle (the counterpart to `migrate_layout.sh`, which converts a classic
+  install). Lays code down as a release, symlinks `current`, seeds shared state
+  (non-destructively), installs deps + the OTA service + confirm timer, and writes
+  the unit's `SDR_UNIT_ID`/`SDR_API_KEY` into a 0600 service drop-in.
+- `provision_network.sh` — sets the hostname and STATIC IPs, then reboots. Detects
+  the stack (NetworkManager `nmcli` vs `dhcpcd`) and writes whichever applies, with a
+  timestamped backup of the prior config. Runs **last** (it drops the SSH session at
+  the IP change / reboot — the re-IP gotcha in §4.4).
+- `build_bundle.sh` now embeds `configs/` (seed state) and `deploy/` (these scripts)
+  in the bundle, so the single artifact serves OTA *and* provisioning. For OTA the
+  extra dirs land unused in the release dir (state is read from `SDR_STATE_DIR`).
+
+**Client repo**
+- `config.py` — `ProvisionScheme` (hostname prefix, eth/wlan subnets, prefix, gateway,
+  DNS, SSH user, WiFi SSID), persisted in `units.yaml` under `provision:`. Computes a
+  unit's hostname + static IPs from its number `N`.
+- `state/provisioner.py` — `Provisioner` (paramiko): connect → sanity-check
+  (Pi + sudo + python3) → upload+unpack bundle → `provision_install.sh` → verify the
+  agent is active → `provision_network.sh` → reboot. Secrets (passwords, PSK, API key)
+  go over stdin / root-only env files, never on a command line. Progress via an
+  `on_step` callback; no Qt.
+- `ui/provision_dialog.py` — **"Provision new Pi…"** dialog (Units tab): target
+  address + SSH login + unit number, editable addressing scheme, optional WiFi, a live
+  computed hostname/IP preview, a streamed step log, then registers the unit at its new
+  addresses and waits for it to come back after the reboot.
+- `requirements.txt` — adds `paramiko`.
+- `tests/test_provisioner.py` — 9 tests over a fake SSH transport (ordered steps,
+  sudo-from-bundle, secrets-never-on-a-command-line, env-file identity, auth/sudo/
+  agent-down/missing-bundle failures).
+
+**Using it**
+1. Flash a Pi with Raspberry Pi Imager, pre-seeding SSH-on + a user/password (and
+   WiFi so it joins the network) — the Phase 3 base-image story, done by hand for now.
+2. In the client: Units → **Provision new Pi…**, enter its current IP + login + a unit
+   number, confirm the computed hostname/IPs, **Provision**.
+
+**Still to do:** Phase 3 (a documented base image + Imager pre-seed snippet) and the
+fleet "Update all".
