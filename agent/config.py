@@ -16,17 +16,38 @@ logger = logging.getLogger(__name__)
 # ── Paths ────────────────────────────────────────────────────────────────────
 
 BASE_DIR   = Path(os.environ.get("SDR_AGENT_BASE", "/opt/sdr-agent"))
-TASKS_YAML = Path(os.environ.get("SDR_TASKS_FILE", BASE_DIR / "configs" / "tasks.yaml"))
-LOG_DIR    = Path(os.environ.get("SDR_LOG_DIR",   BASE_DIR / "logs"))
-EVENTS_FILE = Path(os.environ.get("SDR_EVENTS_FILE", BASE_DIR / "configs" / "events.json"))
-SEQUENCES_FILE = Path(os.environ.get("SDR_SEQUENCES_FILE", BASE_DIR / "configs" / "sequences.json"))
-SEQUENCE_RUNS_FILE = Path(os.environ.get("SDR_SEQUENCE_RUNS_FILE", BASE_DIR / "configs" / "sequence_runs.json"))
-PLANS_FILE = Path(os.environ.get("SDR_PLANS_FILE", BASE_DIR / "configs" / "plans.json"))
-SCHEDULE_FILE = Path(os.environ.get("SDR_SCHEDULE_FILE", BASE_DIR / "configs" / "schedule.json"))
+# State (configs, logs, runtime) lives in STATE_DIR, decoupled from the code so an
+# OTA update — which replaces the code dir — never touches tasks/sequences/plans/
+# logs. Defaults to BASE_DIR, so a classic single-dir install is unchanged; a
+# versioned OTA install sets SDR_STATE_DIR to a shared dir outside the release.
+STATE_DIR  = Path(os.environ.get("SDR_STATE_DIR", BASE_DIR))
+TASKS_YAML = Path(os.environ.get("SDR_TASKS_FILE", STATE_DIR / "configs" / "tasks.yaml"))
+LOG_DIR    = Path(os.environ.get("SDR_LOG_DIR",   STATE_DIR / "logs"))
+EVENTS_FILE = Path(os.environ.get("SDR_EVENTS_FILE", STATE_DIR / "configs" / "events.json"))
+SEQUENCES_FILE = Path(os.environ.get("SDR_SEQUENCES_FILE", STATE_DIR / "configs" / "sequences.json"))
+SEQUENCE_RUNS_FILE = Path(os.environ.get("SDR_SEQUENCE_RUNS_FILE", STATE_DIR / "configs" / "sequence_runs.json"))
+PLANS_FILE = Path(os.environ.get("SDR_PLANS_FILE", STATE_DIR / "configs" / "plans.json"))
+SCHEDULE_FILE = Path(os.environ.get("SDR_SCHEDULE_FILE", STATE_DIR / "configs" / "schedule.json"))
 # Per-run control sockets for live-parameter tuning (paramkit.live). Kept short —
 # AF_UNIX paths are capped at ~108 bytes — and outside configs/ since they're
 # ephemeral runtime state, not saved config.
-CTRL_DIR   = Path(os.environ.get("SDR_CTRL_DIR", BASE_DIR / "run" / "ctl"))
+CTRL_DIR   = Path(os.environ.get("SDR_CTRL_DIR", STATE_DIR / "run" / "ctl"))
+
+# ── OTA update layout ─────────────────────────────────────────────────────────
+# Release dirs live under RELEASES_DIR as <version>/ (the code), and BASE_DIR is a
+# symlink to the active one that the updater flips atomically. OTA markers live in
+# RELEASES_DIR/.markers (never inside a replaced release). All three are outside
+# the code dir, so they survive an update. A classic install leaves BASE_DIR a
+# plain dir and simply never uses these.
+RELEASES_DIR = Path(os.environ.get("SDR_RELEASES_DIR", str(BASE_DIR) + "-releases"))
+CURRENT_LINK = Path(os.environ.get("SDR_CURRENT_LINK", BASE_DIR))
+# The systemd unit the agent restarts to load a freshly-activated release.
+SERVICE_NAME = os.environ.get("SDR_SERVICE_NAME", "sdr-agent")
+# The agent marks a freshly-activated release healthy after serving this long…
+UPDATE_CONFIRM_DELAY_S = float(os.environ.get("SDR_UPDATE_CONFIRM_DELAY_S", "30"))
+# …and the external confirm timer rolls it back if it's still unconfirmed after
+# this long (larger than the confirm delay, so a healthy agent always wins the race).
+UPDATE_HEALTH_GRACE_S = float(os.environ.get("SDR_UPDATE_HEALTH_GRACE_S", "90"))
 
 # ── Agent identity ────────────────────────────────────────────────────────────
 

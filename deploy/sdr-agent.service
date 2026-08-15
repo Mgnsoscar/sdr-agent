@@ -1,0 +1,28 @@
+[Unit]
+Description=SDR Agent (OTA / versioned layout)
+After=network.target
+
+[Service]
+Type=simple
+# /opt/sdr-agent is a SYMLINK to the active release under /opt/sdr-agent-releases/.
+# WorkingDirectory + PYTHONPATH follow the symlink, so a restart loads whatever the
+# updater last activated. State lives outside the release (SDR_STATE_DIR) so an
+# update never touches tasks/sequences/plans/logs.
+WorkingDirectory=/opt/sdr-agent
+Environment=PYTHONPATH=/opt/sdr-agent
+Environment=SDR_STATE_DIR=/opt/sdr-agent-shared
+Environment=SDR_RELEASES_DIR=/opt/sdr-agent-releases
+Environment=SDR_CURRENT_LINK=/opt/sdr-agent
+ExecStart=/usr/bin/python3 -m uvicorn agent.main:app --host 0.0.0.0 --port 8765
+Restart=on-failure
+RestartSec=5
+
+# Set a shared secret so /admin/* (and the rest of the API) require it.
+# Environment=SDR_API_KEY=changeme
+# Environment=SDR_UNIT_ID=broadcaster-1
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

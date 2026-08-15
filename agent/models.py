@@ -84,6 +84,23 @@ class AgentInfo(BaseModel):
     agent_version: str
     python_version: str
     tasks: list[str]
+    previous_version: Optional[str] = None   # rollback target, if a release is installed
+
+
+class UpdateResult(BaseModel):
+    """Returned by POST /admin/update — the version swap that was applied."""
+    ok: bool
+    from_version: str = ""
+    to_version: str = ""
+    message: str = ""
+
+
+class AgentRelease(BaseModel):
+    """One installed agent release (GET /admin/releases)."""
+    version: str
+    active: bool
+    healthy: bool
+    path: str
 
 
 class CrashEvent(BaseModel):

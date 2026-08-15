@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 
@@ -71,14 +72,15 @@ from ruamel.yaml.scalarstring import SingleQuotedScalarString
 from . import config as cfg
 from . import system as sysmon
 from .models import (
-    AgentInfo, ArmSequenceRequest, CreateEventRequest, CreateSequenceRequest,
+    AgentInfo, AgentRelease, ArmSequenceRequest, CreateEventRequest, CreateSequenceRequest,
     DeployLibraryRequest, DeployLibraryResult, ExitRecord, Library, LibraryScript,
     PanicResult, PatchEventRequest, PatchSequenceRunRequest, Plan,
     ProcessStatus, PutPlansRequest, PutScheduleRequest, ScheduledEvent,
     ScheduledPlan, SdrStatus, Sequence, SequenceRun,
     SetParamsRequest, SetTimeRequest, SetTimeResult, StartRequest, SystemHealth,
-    TaskConfig,
+    TaskConfig, UpdateResult,
 )
+from .updater import Updater, UpdateError
 from .client_state import ClientStateStore
 from .argspec import extract_params
 from .process_manager import ProcessManager
@@ -128,6 +130,10 @@ async def lifespan(app: FastAPI):
                            machine_id=cfg.MACHINE_ID)
     _mdns.start()
 
+    # OTA: if we just booted a freshly-activated release, confirm it healthy after
+    # the grace period (the external confirm timer rolls back if we never do).
+    asyncio.create_task(_confirm_release_after_grace(), name="ota-confirm")
+
     yield
 
     if _mdns:
@@ -162,6 +168,28 @@ def get_runner() -> SequenceRunner:
 def get_client_state() -> ClientStateStore:
     assert _client_state is not None, "ClientStateStore not initialised"
     return _client_state
+
+
+def _make_updater() -> Updater:
+    """An Updater bound to this install's OTA layout. Cheap to construct per call;
+    on a classic (non-versioned) install its queries just return empty/None."""
+    return Updater(cfg.RELEASES_DIR, cfg.CURRENT_LINK, service_name=cfg.SERVICE_NAME)
+
+
+async def _confirm_release_after_grace() -> None:
+    """If we booted a freshly-activated release, prove it healthy after the grace
+    period so the external confirm timer won't roll it back. If this agent had
+    crashed/hung instead, we'd never get here and the timer would revert."""
+    up = _make_updater()
+    pending = up.pending_version()
+    if not pending:
+        return
+    await asyncio.sleep(cfg.UPDATE_CONFIRM_DELAY_S)
+    try:
+        if up.current_version() == pending:
+            up.confirm_healthy(pending)
+    except Exception:   # noqa: BLE001 — health confirmation is best-effort
+        logger.exception("Could not confirm release %s healthy", pending)
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -208,7 +236,61 @@ async def info(manager: ProcessManager = Depends(get_manager)):
         agent_version  = cfg.AGENT_VERSION,
         python_version = platform.python_version(),
         tasks          = manager.task_names(),
+        previous_version = _make_updater().previous_version(),
     )
+
+
+# ── Admin: OTA agent updates ──────────────────────────────────────────────────
+
+@app.get("/admin/releases", response_model=list[AgentRelease], tags=["admin"],
+         dependencies=[Depends(verify_key)])
+async def admin_releases():
+    """The agent releases installed on this unit and which one is active/healthy."""
+    return [AgentRelease(version=r.version, active=r.active, healthy=r.healthy, path=r.path)
+            for r in _make_updater().list_releases()]
+
+
+@app.post("/admin/update", response_model=UpdateResult,
+          status_code=status.HTTP_202_ACCEPTED, tags=["admin"],
+          dependencies=[Depends(verify_key)])
+async def admin_update(bundle: UploadFile = File(...)):
+    """Apply an uploaded agent bundle: stage → install deps → flip the `current`
+    symlink → schedule a restart. Replies before the restart lands; the client then
+    polls /info for the version to change (or, on failure, the agent auto-rolls back
+    and /info keeps the old version)."""
+    import shutil, tempfile
+    from pathlib import Path
+    up = _make_updater()
+    from_v = up.current_version() or cfg.AGENT_VERSION
+    fd, tmp_name = tempfile.mkstemp(prefix="sdr-bundle-", suffix=".tar.gz")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            shutil.copyfileobj(bundle.file, fh)
+        # Staging installs deps (can be slow) → run off the event loop.
+        to_v = await asyncio.to_thread(up.apply, tmp)
+    except (UpdateError, OSError) as exc:
+        logger.error("Update failed: %s", exc)
+        return UpdateResult(ok=False, from_version=from_v, message=str(exc))
+    finally:
+        tmp.unlink(missing_ok=True)
+    logger.info("Update staged %s → %s; restarting", from_v, to_v)
+    return UpdateResult(ok=True, from_version=from_v, to_version=to_v,
+                        message="update staged; agent restarting")
+
+
+@app.post("/admin/rollback", response_model=UpdateResult, tags=["admin"],
+          dependencies=[Depends(verify_key)])
+async def admin_rollback():
+    """Revert to the previous release and restart."""
+    up = _make_updater()
+    from_v = up.current_version() or ""
+    to_v = await asyncio.to_thread(up.rollback)
+    if to_v is None:
+        return UpdateResult(ok=False, from_version=from_v,
+                            message="no previous release to roll back to")
+    return UpdateResult(ok=True, from_version=from_v, to_version=to_v,
+                        message="rolled back; agent restarting")
 
 
 # ── Task list ─────────────────────────────────────────────────────────────────

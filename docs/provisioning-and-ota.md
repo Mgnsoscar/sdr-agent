@@ -1,6 +1,11 @@
 # Provisioning & OTA updates — design spec
 
-**Status:** design / spec (not implemented). For review.
+> **Phase 1 (OTA update of known units) is implemented on the agent side** — see
+> [§11](#11-phase-1--implemented-agent-side). The client "Update" button and the
+> bundle-embedding for the installer are the remaining Phase 1 work; Phases 2–3 are
+> still design-only.
+
+**Status:** design / spec. For review.
 **Scope decisions (from discussion):** support both Bookworm (NetworkManager) and
 Bullseye (dhcpcd) by detecting the stack at provision time; provisioning access is
 by **SSH user + password**; blank‑SD‑card imaging stays in Raspberry Pi Imager.
@@ -290,3 +295,51 @@ pastes into Imager's advanced options.
 - Is systemd guaranteed on every unit (it is today)? The rollback design assumes it.
 - Should provisioning also push the current library (tasks/sequences/plans) to a
   freshly‑provisioned unit, or leave that to the existing sync? (Probably the latter.)
+
+---
+
+## 11. Phase 1 — implemented (agent side)
+
+What shipped in the agent for OTA update of a known unit:
+
+**Code**
+- `agent/updater.py` — `Updater`: `stage` (safe-extract + dep install), `activate`
+  (atomic symlink flip + record previous + pending marker), `confirm_healthy`,
+  `needs_rollback`, `rollback`, `prune`, `apply`. Pure/testable; the two side
+  effects (dep install, service restart) are injectable.
+- `agent/main.py` — `POST /admin/update` (upload a bundle → `apply`, off the event
+  loop), `POST /admin/rollback`, `GET /admin/releases`; `/info` now reports
+  `previous_version`; on boot the agent confirms a freshly-activated release healthy
+  after `SDR_UPDATE_CONFIRM_DELAY_S`.
+- `agent/config.py` — `STATE_DIR` (state decoupled from code), OTA layout constants
+  (`RELEASES_DIR`, `CURRENT_LINK`, `SERVICE_NAME`, confirm/grace timings).
+- `agent/models.py` — `UpdateResult`, `AgentRelease`, `AgentInfo.previous_version`.
+
+**Tests** — `tests/test_updater.py` (staging, safety, activate, confirm, rollback,
+prune, apply) and `tests/test_update_endpoint.py` (the handlers with an injected
+updater). All green.
+
+**Deploy artifacts (`deploy/`)**
+- `build_bundle.sh` — builds `dist/sdr-agent-<version>.tar.gz` (+ `.sha256`).
+- `sdr-agent.service` — the versioned-layout unit (symlinked `WorkingDirectory`,
+  `SDR_STATE_DIR` state).
+- `sdr-agent-confirm.sh` + `.service` + `.timer` — the external, self-contained
+  rollback watchdog (mirrors `Updater.rollback`; keep them in sync).
+- `migrate_layout.sh` — one-time classic → versioned migration, run once per Pi.
+
+**Deploying it**
+1. On the build machine: `bash deploy/build_bundle.sh` → a bundle in `dist/`.
+2. On each Pi (once): `sudo deploy/migrate_layout.sh` — moves state to
+   `/opt/sdr-agent-shared`, lays the current code down as a release under
+   `/opt/sdr-agent-releases/<version>/`, points `/opt/sdr-agent` at it, and installs
+   the OTA service + confirm timer.
+3. Thereafter: `POST /admin/update` the bundle (the client's Update button, once
+   built) → the unit stages, swaps, restarts, and self-rolls-back if unhealthy.
+
+**Backward compatible:** a classic single-dir install still works — `STATE_DIR`
+defaults to `BASE_DIR`, and the `/admin/*` queries just return empty/None until the
+unit is migrated to the versioned layout.
+
+**Still to do for Phase 1:** client `update_agent`/`agent_releases`/`rollback_agent`
+fleet calls, a frozen-path bundle locator, and the per-unit Update button + version
+display + one-at-a-time "Update all".

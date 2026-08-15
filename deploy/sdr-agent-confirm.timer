@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodically check for and roll back an unhealthy SDR agent release
+
+[Timer]
+# First check shortly after boot (catches a release that hangs on start), then
+# every 30s. The grace window in the script (default 90s) decides when a still-
+# unconfirmed release is actually reverted.
+OnBootSec=45s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

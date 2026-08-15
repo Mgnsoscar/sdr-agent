@@ -1,0 +1,12 @@
+[Unit]
+Description=SDR Agent — roll back an unhealthy OTA release
+After=network.target
+
+[Service]
+Type=oneshot
+# Point at your install's OTA layout if it isn't the defaults below.
+Environment=SDR_RELEASES_DIR=/opt/sdr-agent-releases
+Environment=SDR_CURRENT_LINK=/opt/sdr-agent
+Environment=SDR_UPDATE_HEALTH_GRACE_S=90
+Environment=SDR_SERVICE_NAME=sdr-agent
+ExecStart=/usr/local/bin/sdr-agent-confirm
