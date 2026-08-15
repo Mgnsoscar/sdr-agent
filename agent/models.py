@@ -231,7 +231,15 @@ class RampSpec(BaseModel):
     """A parameter ramp for a RAMP step: sweep `param` from start to stop in steps.
     Give any two of {step, hold_s, duration_s}; the third derives. For a step
     anchored to BOTH edges the duration is the plan's on-air window, so only one of
-    {step, hold_s} is given. See agent.ramp for the expansion."""
+    {step, hold_s} is given. See agent.ramp for the expansion.
+
+    mode selects how each point is applied:
+      - "tune": set_params on an already-running duration task (a live parameter).
+      - "run":  fire the task once per point with the value as a CLI argument (e.g.
+                an attenuator-set script), so no running task is needed. The other
+                params' fixed values are carried in SequenceStep.args; `flag` is the
+                ramped param's option string (e.g. "--atten"), None for positional,
+                and `integer` rounds each value to a whole number for int params."""
     param: str
     start: float
     stop: float
@@ -239,6 +247,9 @@ class RampSpec(BaseModel):
     step: Optional[float] = None        # OR a fixed value increment per point
     hold_s: Optional[float] = None      # dwell between points
     duration_s: Optional[float] = None  # first point → last point (single-anchor)
+    mode: str = "tune"                  # "tune" (live set_params) | "run" (task per point)
+    flag: Optional[str] = None          # run mode: CLI flag for the ramped param
+    integer: bool = False               # run mode: round each value to an int
 
 
 class SequenceStep(BaseModel):
