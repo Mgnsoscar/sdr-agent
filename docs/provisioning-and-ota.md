@@ -192,7 +192,13 @@ Default (all editable in client config):
 | hostname     | `broadcaster-<N>`      | `broadcaster-2`   |
 | Ethernet IP  | `10.0.0.<N>/24`        | `10.0.0.2`        |
 | WiFi IP      | `10.0.1.<N>/24`        | `10.0.1.2`        |
-| gateway/DNS  | fixed per subnet       | `10.0.0.1` / …    |
+| gateway/DNS  | fixed per subnet       | `10.0.0.254` / …  |
+
+The gateway defaults to `.254`, **not** `.1`: with `unit N → <subnet>.N`, a `.1`
+gateway collides with unit 1's own IP, and a host can't be its own gateway
+(NetworkManager rejects it and the interface comes up with no IP). The client blocks
+provisioning when a unit's IP equals its gateway. Leave the gateway blank for an
+isolated switch with no router.
 
 The client computes these from `N` and shows them for confirmation before writing.
 `N` also seeds `SDR_UNIT_ID` (e.g. `broadcaster-2`) and the display label.
