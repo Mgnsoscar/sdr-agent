@@ -33,6 +33,23 @@ VERSION="$(tr -d ' \t\r\n' < "$HERE/VERSION")"
 
 echo "==> Provisioning agent $VERSION"
 
+# Bootstrap an existing CLASSIC install (a real dir at $BASE, not the versioned
+# symlink) — e.g. a unit still running a pre-OTA agent, which is why the client's
+# Update button 404s (no /admin/update route yet). Preserve its state into $SHARED
+# before we replace it with the symlink, so the unit's sequences/plans/library
+# survive the switch to the OTA layout. A fresh Pi has no $BASE and skips this.
+if [ -e "$BASE" ] && [ ! -L "$BASE" ]; then
+    echo "==> Existing classic install found at $BASE — migrating its state to $SHARED"
+    systemctl stop sdr-agent 2>/dev/null || true
+    mkdir -p "$SHARED"
+    for d in configs logs run; do
+        if [ -d "$BASE/$d" ] && [ ! -e "$SHARED/$d" ]; then
+            cp -a "$BASE/$d" "$SHARED/$d"
+        fi
+    done
+    rm -rf "$BASE"
+fi
+
 echo "==> Preparing shared state ($SHARED)"
 mkdir -p "$SHARED/logs" "$SHARED/run" "$SHARED/configs"
 # Seed default configs only where absent — never clobber a unit's existing state.
