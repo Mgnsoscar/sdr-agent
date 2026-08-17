@@ -54,13 +54,33 @@ class ReleaseInfo:
 
 
 def _default_deps_install(release_dir: Path) -> None:
-    """Install the release's Python deps system-wide (mirrors install.sh)."""
+    """Install the release's Python deps system-wide, OFFLINE-FIRST.
+
+    Try an install that never touches the network (``--no-index``): when the deps are
+    already satisfied — the common case for an update — this finishes instantly. When
+    they're not, it fails fast instead of pip retrying an unreachable PyPI for every
+    package with time-outs and back-off (the "update with no internet takes forever").
+    Only if the offline pass can't satisfy everything do we fall back to a normal
+    online install, and even then with fast fail-out rather than a long hang. A
+    bundled ``wheels/`` dir (if present) feeds the offline pass so a never-online Pi
+    can still install."""
     req = release_dir / "requirements.txt"
     if not req.is_file():
         return
+    base = ["pip3", "install", "--break-system-packages", "--root-user-action=ignore",
+            "--disable-pip-version-check", "--no-input"]
+    offline = base + ["--no-index"]
+    wheels = release_dir / "wheels"
+    if wheels.is_dir():
+        offline += ["--find-links", str(wheels)]
+    offline += ["-r", str(req)]
+    if subprocess.run(offline).returncode == 0:
+        return
+    # Something is genuinely missing — go online, but fail fast rather than hang for
+    # minutes if there's no route to the index.
     subprocess.run(
-        ["pip3", "install", "--break-system-packages", "--root-user-action=ignore",
-         "--upgrade", "--upgrade-strategy", "only-if-needed", "-r", str(req)],
+        base + ["--retries", "1", "--timeout", "15",
+                "--upgrade", "--upgrade-strategy", "only-if-needed", "-r", str(req)],
         check=True,
     )
 

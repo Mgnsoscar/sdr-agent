@@ -73,13 +73,29 @@ echo "==> Activating release (symlink $BASE -> $REL)"
 ln -sfn "$REL" "$BASE"
 
 echo "==> Installing system packages (apt)"
-apt-get update -qq
-apt-get install -y python3-psutil >/dev/null
+# psutil ships as a Debian package; only reach for apt (needs internet) if it isn't
+# already importable — so re-provisioning an offline unit doesn't hang on apt.
+if python3 -c "import psutil" 2>/dev/null; then
+    echo "    psutil already present — skipping apt"
+else
+    apt-get update -qq && apt-get install -y python3-psutil >/dev/null || \
+        echo "    !! could not install python3-psutil (no internet?) — will try a pip wheel"
+fi
 
-echo "==> Installing Python dependencies (pip)"
-pip3 install --break-system-packages --root-user-action=ignore \
-    --upgrade --upgrade-strategy only-if-needed \
-    -r "$REL/requirements.txt"
+echo "==> Installing Python dependencies (pip, offline-first)"
+# Offline-first: an install that never touches the network finishes instantly when
+# the deps are already satisfied, and fails fast (instead of pip retrying an
+# unreachable PyPI for every package) when they aren't. Only then fall back online.
+PIP_BASE=(pip3 install --break-system-packages --root-user-action=ignore
+          --disable-pip-version-check --no-input)
+WHEELS=""; [ -d "$HERE/wheels" ] && WHEELS="$HERE/wheels"
+if "${PIP_BASE[@]}" --no-index ${WHEELS:+--find-links "$WHEELS"} -r "$REL/requirements.txt"; then
+    echo "    dependencies satisfied offline"
+else
+    echo "    offline install incomplete — falling back to online (fast fail-out)"
+    "${PIP_BASE[@]}" --retries 1 --timeout 15 \
+        --upgrade --upgrade-strategy only-if-needed -r "$REL/requirements.txt"
+fi
 
 echo "==> Installing systemd units"
 install -m644 "$HERE/deploy/sdr-agent.service"          /etc/systemd/system/sdr-agent.service
