@@ -506,6 +506,9 @@ class ScheduledPlan(BaseModel):
     plan_name: str = ""
     start: str                          # ISO-8601 local datetime — on-air (T0)
     stop: str                           # ISO-8601 local datetime — off-air (T_end)
+    # Optional per-slot copy of the plan (the client edits a scheduled slot without
+    # touching the library plan). Replicated so a restore-from-unit keeps the edit.
+    plan: Optional["Plan"] = None
 
 
 class PutPlansRequest(BaseModel):
