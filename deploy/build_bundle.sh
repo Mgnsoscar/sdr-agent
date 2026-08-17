@@ -13,12 +13,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 
-VERSION="$(python3 - <<'PY'
-import re
-s = open("agent/config.py").read()
-print(re.search(r'AGENT_VERSION\s*=\s*"([^"]+)"', s).group(1))
-PY
-)"
+# Read AGENT_VERSION straight out of config.py with sed — no Python needed, so this
+# runs anywhere bash + tar exist (Linux, macOS, Git Bash on Windows). On Windows the
+# `python3` command hits the Microsoft Store alias stub and fails, which is why we
+# avoid it here.
+VERSION="$(sed -n -E 's/^AGENT_VERSION[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' agent/config.py | head -1)"
+[ -n "$VERSION" ] || { echo "could not read AGENT_VERSION from agent/config.py" >&2; exit 1; }
 
 OUT="dist/sdr-agent-${VERSION}.tar.gz"
 mkdir -p dist
