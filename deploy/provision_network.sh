@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
-# provision_network.sh — set a Pi's hostname and STATIC IPs, then reboot. Run as
-# root, LAST in provisioning (it drops the SSH session it's run over once the IP
-# changes / the box reboots). Detects the network stack (NetworkManager vs dhcpcd)
-# and writes whichever applies. Prior config is backed up so a bad run is recoverable
-# from a console.
+# provision_network.sh — set a Pi's hostname, and OPTIONALLY a static IP. Run as root,
+# LAST in provisioning.
 #
-# Inputs via environment (all required unless noted):
-#   PROV_HOSTNAME     e.g. broadcaster-2
+# Two modes, chosen by PROV_STATIC:
+#   PROV_STATIC=0 (default) — DHCP mode. Set the hostname only, pin it against
+#       cloud-init, re-advertise mDNS under the new name, and DO NOT reboot. The unit
+#       keeps its current (DHCP / link-local) address and stays reachable throughout —
+#       the right default for units reached by broadcaster-N.local across a WiFi, a
+#       transparent bridge, or a direct cable (see docs/connectivity.md).
+#   PROV_STATIC=1 — static mode. Also write a static IP on eth0 (+ optional wlan0),
+#       detecting the stack (NetworkManager vs dhcpcd), then reboot. This drops the SSH
+#       session at the IP change; only for a dedicated fleet subnet the PC also joins.
+#
+# Inputs via environment:
+#   PROV_HOSTNAME     e.g. broadcaster-2                         (required)
+#   PROV_STATIC       0 (DHCP, default) or 1 (assign a static IP)
+#   --- static mode only (PROV_STATIC=1): ---
 #   PROV_ETH_IP       e.g. 10.0.0.2         (address only; PROV_PREFIX is the mask)
 #   PROV_WLAN_IP      e.g. 10.0.1.2         (optional — omit to leave wlan as-is)
 #   PROV_PREFIX       CIDR prefix, e.g. 24
-#   PROV_ETH_GW       e.g. 10.0.0.1
-#   PROV_WLAN_GW      e.g. 10.0.1.1         (optional; defaults to PROV_ETH_GW)
-#   PROV_DNS          space/comma-separated, e.g. "10.0.0.1 1.1.1.1"
+#   PROV_ETH_GW       e.g. 10.0.0.254
+#   PROV_WLAN_GW      e.g. 10.0.1.254       (optional; defaults to PROV_ETH_GW)
+#   PROV_DNS          space/comma-separated, e.g. "10.0.0.254 1.1.1.1"
 #   PROV_WLAN_SSID    WiFi SSID             (optional — only if configuring wlan)
 #   PROV_WLAN_PSK     WiFi passphrase       (optional)
 #   PROV_NO_REBOOT    set to 1 to skip the reboot (testing)
@@ -20,14 +29,10 @@ set -euo pipefail
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
 
 : "${PROV_HOSTNAME:?PROV_HOSTNAME required}"
-: "${PROV_ETH_IP:?PROV_ETH_IP required}"
-: "${PROV_PREFIX:=24}"
-: "${PROV_WLAN_GW:=${PROV_ETH_GW:-}}"
-DNS_LIST="$(echo "${PROV_DNS:-}" | tr ',' ' ')"
+PROV_STATIC="${PROV_STATIC:-0}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
 echo "==> Setting hostname to $PROV_HOSTNAME"
-OLD_HOST="$(hostname)"
 hostnamectl set-hostname "$PROV_HOSTNAME"
 # Keep /etc/hosts consistent so `sudo` and local name lookups don't hang.
 if grep -qE "^127\.0\.1\.1" /etc/hosts; then
@@ -38,21 +43,37 @@ else
 fi
 
 # cloud-init (Ubuntu Server for Pi, and some Raspberry Pi OS images) re-applies the
-# hostname AND network config from its datasource on every boot unless told not to —
-# which is exactly why a manually-set hostname "resets after a reboot". If it's
-# present, pin the hostname and hand network control to the OS-native tools we
-# configure just below (otherwise cloud-init would clobber the static IP too).
+# hostname from its datasource on every boot unless told not to — the classic
+# "hostname resets after a reboot". Pin it in BOTH modes. Only in static mode do we
+# also disable cloud-init's network management (we own the network then); in DHCP mode
+# we must leave it alone or we'd tear down the very DHCP the unit relies on.
 if [ -d /etc/cloud ] || command -v cloud-init >/dev/null 2>&1; then
-    echo "==> cloud-init detected — pinning hostname + disabling its network takeover"
+    echo "==> cloud-init detected — pinning hostname"
     mkdir -p /etc/cloud/cloud.cfg.d
-    cat > /etc/cloud/cloud.cfg.d/99-sdr-provision.cfg <<EOF
-# Written by sdr provision_network.sh ($STAMP). Stops cloud-init reverting the
-# hostname and re-writing the network on each boot; the static config below (and
-# NetworkManager/dhcpcd) owns the network from here on.
-preserve_hostname: true
-network: {config: disabled}
-EOF
+    {
+        echo "# Written by sdr provision_network.sh ($STAMP)."
+        echo "preserve_hostname: true"
+        [ "$PROV_STATIC" = "1" ] && echo "network: {config: disabled}"
+    } > /etc/cloud/cloud.cfg.d/99-sdr-provision.cfg
 fi
+
+# ── DHCP mode: hostname only, no static IP, no reboot ────────────────────────────
+if [ "$PROV_STATIC" != "1" ]; then
+    echo "==> DHCP mode — no static IP. Re-advertising mDNS under the new hostname."
+    systemctl restart avahi-daemon 2>/dev/null || true
+    # The agent reads its hostname at startup; restart it so it re-announces as
+    # broadcaster-N.local (mDNS) without a reboot.
+    systemctl restart sdr-agent 2>/dev/null || true
+    echo "==> Done (DHCP). The unit stays reachable at its current address and now"
+    echo "    also answers to $PROV_HOSTNAME.local — no reboot needed."
+    exit 0
+fi
+
+# ── Static mode: write a static IP, then reboot ──────────────────────────────────
+: "${PROV_ETH_IP:?PROV_ETH_IP required in static mode}"
+: "${PROV_PREFIX:=24}"
+: "${PROV_WLAN_GW:=${PROV_ETH_GW:-}}"
+DNS_LIST="$(echo "${PROV_DNS:-}" | tr ',' ' ')"
 
 nm_writer() {
     # NetworkManager (Bookworm and later). One connection profile per interface.
