@@ -60,12 +60,28 @@ fi
 # ── DHCP mode: hostname only, no static IP, no reboot ────────────────────────────
 if [ "$PROV_STATIC" != "1" ]; then
     echo "==> DHCP mode — no static IP. Re-advertising mDNS under the new hostname."
+    # Make eth0 reachable over a DIRECT cable (no DHCP server). Without this, eth0
+    # waits out the full DHCP timeout and may never self-assign an IPv4 link-local
+    # (169.254.x), so broadcaster-N.local never comes up when the Pi is plugged
+    # straight into a PC. Guarantee a link-local fallback and shorten the DHCP wait so
+    # it's reachable within seconds — on a real network the DHCP lease still wins.
+    if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
+        ETH_CON="$(nmcli -t -f NAME,DEVICE,TYPE connection show 2>/dev/null \
+                   | awk -F: '$3 ~ /ethernet/ {print $1; exit}')"
+        if [ -n "$ETH_CON" ]; then
+            echo "    tuning '$ETH_CON' for direct-cable (link-local + short DHCP timeout)"
+            nmcli connection modify "$ETH_CON" ipv4.dhcp-timeout 15 2>/dev/null || true
+            nmcli connection modify "$ETH_CON" ipv4.link-local enabled 2>/dev/null \
+                || echo "    (this NetworkManager has no ipv4.link-local; the DHCP-timeout fallback still applies)"
+            nmcli connection up "$ETH_CON" >/dev/null 2>&1 || true
+        fi
+    fi
     systemctl restart avahi-daemon 2>/dev/null || true
     # The agent reads its hostname at startup; restart it so it re-announces as
     # broadcaster-N.local (mDNS) without a reboot.
     systemctl restart sdr-agent 2>/dev/null || true
-    echo "==> Done (DHCP). The unit stays reachable at its current address and now"
-    echo "    also answers to $PROV_HOSTNAME.local — no reboot needed."
+    echo "==> Done (DHCP). The unit stays reachable at its current address, answers to"
+    echo "    $PROV_HOSTNAME.local, and is reachable over a direct Ethernet cable — no reboot."
     exit 0
 fi
 
