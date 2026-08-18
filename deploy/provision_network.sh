@@ -60,30 +60,38 @@ fi
 # ── DHCP mode: hostname only, no static IP, no reboot ────────────────────────────
 if [ "$PROV_STATIC" != "1" ]; then
     echo "==> DHCP mode — no static IP. Re-advertising mDNS under the new hostname."
-    # Make eth0 reachable over a DIRECT cable (no DHCP server). Without this, eth0
-    # waits out the full DHCP timeout and may never self-assign an IPv4 link-local
-    # (169.254.x), so broadcaster-N.local never comes up when the Pi is plugged
-    # straight into a PC. Guarantee a link-local fallback and shorten the DHCP wait so
-    # it's reachable within seconds — on a real network the DHCP lease still wins.
-    if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
-        ETH_CON="$(nmcli -t -f NAME,DEVICE,TYPE connection show 2>/dev/null \
-                   | awk -F: '$3 ~ /ethernet/ {print $1; exit}')"
-        if [ -n "$ETH_CON" ]; then
-            # Prefer ipv4.link-local=enabled: eth0 always gets a 169.254 address IN
-            # ADDITION to DHCP, assigned immediately at activation — so a direct cable
-            # is reachable in seconds while DHCP on a real network (WiFi bridge) is left
-            # completely untouched: full default timeout, real lease still used. Only if
-            # this NetworkManager is too old for the property do we fall back to
-            # shortening the DHCP timeout (which trades a little slow-DHCP robustness for
-            # the direct-cable fallback — modern Bookworm NM never takes this path).
-            if nmcli connection modify "$ETH_CON" ipv4.link-local enabled 2>/dev/null; then
-                echo "    eth0 ('$ETH_CON'): link-local always on — direct-cable ready, DHCP unaffected"
-            else
-                nmcli connection modify "$ETH_CON" ipv4.dhcp-timeout 20 2>/dev/null || true
-                echo "    eth0 ('$ETH_CON'): older NM — shortened DHCP timeout for direct-cable fallback"
-            fi
-            nmcli connection up "$ETH_CON" >/dev/null 2>&1 || true
-        fi
+    # Make eth0 reliably reachable over a DIRECT cable (no DHCP server). We give it a
+    # STABLE static link-local (169.254.1.<N>) via a netplan drop-in, plus optional:true
+    # so a missing DHCP server never tears the interface down (the "works then drops
+    # every 45s" fail/retry loop). Why static, not dynamic: on this netplan+NM stack the
+    # dynamic IPv4-link-local knob is a no-op (the interface ends up with no IPv4 at
+    # all), whereas a static address comes up reliably. It's derived from the unit
+    # number so it's unique per unit (no collisions on a shared switch) and hands-off —
+    # you still reach units by broadcaster-N.local. dhcp4 stays on, so the WiFi-bridge
+    # mode still gets a real lease; the static just rides alongside. Applied SURGICALLY
+    # (generate + reload + per-device reapply) so it never bounces the wlan0/eth link
+    # we're provisioning over — no full `netplan apply`, no dropped SSH.
+    N="${PROV_HOSTNAME##*-}"
+    if command -v netplan >/dev/null 2>&1 \
+       && printf '%s' "$N" | grep -qE '^[0-9]+$' && [ "$N" -ge 1 ] && [ "$N" -le 254 ]; then
+        echo "    eth0 direct-cable address: 169.254.1.$N/16 (netplan drop-in)"
+        cat > /etc/netplan/99-sdr-eth0.yaml <<NETPLAN
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: true
+      optional: true
+      addresses:
+        - "169.254.1.$N/16"
+NETPLAN
+        chmod 600 /etc/netplan/99-sdr-eth0.yaml
+        netplan generate 2>/dev/null || true
+        nmcli connection reload 2>/dev/null || true    # load the new eth0 config…
+        nmcli device reapply eth0 2>/dev/null || true  # …and apply it to eth0 only
+    else
+        echo "    (no netplan or no unit number in '$PROV_HOSTNAME' — skipping the "
+        echo "     direct-cable static address; DHCP/mDNS still work on a real network)"
     fi
     systemctl restart avahi-daemon 2>/dev/null || true
     # The agent reads its hostname at startup; restart it so it re-announces as
