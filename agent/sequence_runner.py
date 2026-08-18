@@ -794,10 +794,16 @@ class SequenceRunner:
     async def _abort_run(self, run: SequenceRun, reason: str) -> None:
         """Stop EVERY task this run's sequence touches, mark aborted, halt steps."""
         seq = self._sequences.get(run.sequence_id)
-        task_names = (
-            sorted({s.task_name for s in seq.steps}) if seq
-            else sorted({s.task_name for s in run.steps})
-        )
+        # Stop the tasks THIS RUN actually armed (run.steps) — authoritative, and the
+        # only correct source when a plan armed edited/override steps that differ from
+        # the stored sequence (e.g. a per-slot plan edit that added or swapped a task).
+        # Using seq.steps alone would miss such a task and leave it running after Stop.
+        # Union with the stored sequence's tasks as a defensive fallback (e.g. a legacy
+        # run persisted without steps).
+        task_names = {s.task_name for s in run.steps}
+        if seq:
+            task_names |= {s.task_name for s in seq.steps}
+        task_names = sorted(task_names)
 
         for name in task_names:
             try:
