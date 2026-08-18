@@ -48,3 +48,28 @@ def test_load_tasks_coerces_stray_env_types(tmp_path, monkeypatch):
     loaded = cfg.load_tasks()
     assert "rx" in loaded
     assert loaded["rx"].env == {"LIVE": "true", "PORT": "8080", "QUIET": "false"}
+
+
+def test_load_tasks_survives_empty_tasks_key(tmp_path, monkeypatch):
+    """A bare `tasks:` line parses that key as None. `.get("tasks", [])` returns the
+    default only when the key is ABSENT, so None used to slip through and crash agent
+    startup (a crash-loop on a freshly-seeded unit). It must load as no tasks."""
+    _point_at(tmp_path, monkeypatch)
+    (tmp_path / "tasks.yaml").write_text("tasks:\n")     # key present, value null
+    assert cfg.load_tasks() == {}
+
+
+def test_load_tasks_empty_file_and_absent_key(tmp_path, monkeypatch):
+    _point_at(tmp_path, monkeypatch)
+    (tmp_path / "tasks.yaml").write_text("")             # empty file
+    assert cfg.load_tasks() == {}
+    (tmp_path / "tasks.yaml").write_text("# only comments\n")
+    assert cfg.load_tasks() == {}
+
+
+def test_load_tasks_reads_real_entries(tmp_path, monkeypatch):
+    _point_at(tmp_path, monkeypatch)
+    (tmp_path / "tasks.yaml").write_text(
+        "tasks:\n  - name: t1\n    command: [echo, hi]\n")
+    loaded = cfg.load_tasks()
+    assert set(loaded) == {"t1"}

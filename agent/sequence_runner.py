@@ -919,7 +919,7 @@ class SequenceRunner:
             return
         try:
             data = json.loads(self._seq_store.read_text())
-            self._sequences = {s["id"]: Sequence(**s) for s in data.get("sequences", [])}
+            self._sequences = {s["id"]: Sequence(**s) for s in data.get("sequences") or []}
             logger.info("Loaded %d sequence(s)", len(self._sequences))
         except (OSError, json.JSONDecodeError, KeyError) as exc:
             logger.error("Failed to load sequences.json (%s) — starting empty", exc)
@@ -931,8 +931,8 @@ class SequenceRunner:
             return
         try:
             data = json.loads(self._run_store.read_text())
-            self._runs = {r["id"]: SequenceRun(**r) for r in data.get("runs", [])}
+            self._runs = {r["id"]: SequenceRun(**r) for r in data.get("runs") or []}
             logger.info("Loaded %d run(s)", len(self._runs))
         except (OSError, json.JSONDecodeError, KeyError) as exc:
             logger.error("Failed to load sequence_runs.json (%s) — starting empty", exc)
-            self._runs = {}
+            self._runs = {}

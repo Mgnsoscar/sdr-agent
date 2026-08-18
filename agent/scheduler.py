@@ -380,7 +380,7 @@ class Scheduler:
         try:
             data = json.loads(self._store.read_text())
             self._events = {
-                e["id"]: ScheduledEvent(**e) for e in data.get("events", [])
+                e["id"]: ScheduledEvent(**e) for e in data.get("events") or []
             }
             logger.info("Loaded %d persisted event(s)", len(self._events))
         except (OSError, json.JSONDecodeError, KeyError) as exc:

@@ -113,7 +113,11 @@ def load_tasks() -> Dict[str, TaskConfig]:
         return {}
 
     tasks: Dict[str, TaskConfig] = {}
-    for entry in raw.get("tasks", []):
+    # `raw.get("tasks", [])` is NOT enough: a file with a bare `tasks:` line (no
+    # entries) parses that key as None, and `.get` only returns the default when the
+    # key is ABSENT — so None slips through and iterating it crashes agent startup
+    # (a crash-loop on a freshly-seeded unit). `or []` treats null/empty as "no tasks".
+    for entry in (raw.get("tasks") or []):
         try:
             if isinstance(entry, dict) and isinstance(entry.get("env"), dict):
                 # Env is all strings, but YAML may have parsed a value like `on` or
