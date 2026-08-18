@@ -38,6 +38,7 @@ script = (
             required=True, help="Center frequency.")
     .number("-g", "--gain", unit="dB", min=0, max=89, default=40)
     .choice("--antenna", options=["TX/RX", "RX2"], default="TX/RX")
+    .choice("--otw", options={"sc8": "8-bit (halves USB)", "sc16": "16-bit"}, default="sc8")
     .flag("-v", "--verbose")
 )
 args = script.parse()
@@ -57,7 +58,7 @@ def main() -> int:
     check(spec.get("format") == "paramkit", "detected as paramkit")
     check(spec.get("description") == "demo tx", "description extracted")
     by = {p["name"]: p for p in spec["params"]}
-    check(set(by) == {"freq", "gain", "antenna", "verbose"}, "all params found")
+    check(set(by) == {"freq", "gain", "antenna", "otw", "verbose"}, "all params found")
 
     f = by["freq"]
     check(f["kind"] == "number", "freq kind=number")
@@ -80,6 +81,12 @@ def main() -> int:
 
     ant = by["antenna"]
     check(ant["kind"] == "choice" and ant["choices"] == ["TX/RX", "RX2"], "choice options")
+    check(ant["choice_labels"] is None, "list-choice has no labels")
+
+    otw = by["otw"]
+    check(otw["choices"] == ["sc8", "sc16"], "dict-choice values extracted statically")
+    check(otw["choice_labels"] == {"sc8": "8-bit (halves USB)", "sc16": "16-bit"},
+          "dict-choice labels extracted statically")
 
     v = by["verbose"]
     check(v["kind"] == "flag" and v["is_flag"] is True and v["default"] is False,

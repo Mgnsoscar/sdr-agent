@@ -247,7 +247,16 @@ def extract_paramkit_spec(source: str) -> Dict[str, Any]:
         unit = kw["unit"].value if "unit" in kw and isinstance(kw["unit"], ast.Constant) else ""
         presets = _presets_to_list(_literal(kw["presets"], consts)) if "presets" in kw else []
         raw_choices = _literal(kw["options"], consts) if "options" in kw else None
-        choices = [str(c) for c in raw_choices] if raw_choices else None
+        # options may be a [value, ...] sequence or a {value: label} mapping.
+        if isinstance(raw_choices, dict):
+            choices = [str(c) for c in raw_choices]
+            choice_labels = {str(k): str(v) for k, v in raw_choices.items()}
+        elif raw_choices:
+            choices = [str(c) for c in raw_choices]
+            choice_labels = None
+        else:
+            choices = None
+            choice_labels = None
         multiple = bool(_literal(kw["multiple"], consts)) if "multiple" in kw else False
         required = bool(_literal(kw["required"], consts)) if "required" in kw else False
         live = bool(_literal(kw["live"], consts)) if "live" in kw else False
@@ -273,6 +282,7 @@ def extract_paramkit_spec(source: str) -> Dict[str, Any]:
             "required": required,
             "default": default,
             "choices": choices,
+            "choice_labels": choice_labels,
             "is_flag": kind == "flag",
             "nargs": "+" if multiple else None,
             "help": _joined_help(kw["help"], consts) if "help" in kw else "",
