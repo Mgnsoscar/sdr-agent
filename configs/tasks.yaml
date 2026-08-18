@@ -1,46 +1,13 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # SDR Agent — Task Registry
 #
-# Add one entry per script you want to manage.
-# The agent hot-reloads this file on startup only (restart agent to pick up
-# new tasks).
+# Ships EMPTY. Tasks (and the scripts they run) are authored on the PC and
+# deployed to a unit from the client's Library — the agent is a blank slate until
+# then. Add entries here only if you want to bake a task into the image.
 #
-# Fields
-# ──────
-# name            (required) Unique string identifier, used in API URLs.
-# description     Human-readable label shown in status output.
-# command         List: executable + arguments.  Use absolute paths.
-# working_dir     CWD for the process. Default: /opt/sdr-agent
-# env             Extra environment variables (merged with system env).
-# autostart       true → start automatically when the agent boots.
-# restart_on_crash true → restart once if the process exits non-zero.
-# restart_delay_s Seconds to wait before the automatic restart. Default: 3.
+# Fields: name (required, unique), description, command (list: exe + args, absolute
+# paths), working_dir, env, autostart, restart_on_crash, restart_delay_s.
+# The agent reads this file at startup only — restart the agent to pick up changes.
 # ──────────────────────────────────────────────────────────────────────────────
 
-tasks:
-
-
-  # ── Chirp transmitter ──────────────────────────────────────────────────────
-  # NOTE: the script now takes its transmit parameters from the command line
-  # (see `sawtooth_fm_sweep.py --help`). The values below match the example in
-  # the script's docstring (2.4 GHz ISM band).
-  # ⚠  Set -f (center frequency) and -g (gain) to values you are LICENSED /
-  #    AUTHORISED to transmit on for your hardware and location.
-  - name: Chirp
-    description: "Linear chirp TX at a specified center frequency and bandwidth."
-    command:
-      - python3
-      - /opt/sdr-agent/scripts/sawtooth_fm_sweep.py
-      - -f
-      - "2.4e9"        # center frequency [Hz] — CHANGE to your authorised band
-      - -b
-      - "30e6"         # sweep bandwidth [Hz]
-      - -c
-      - "200e3"        # chirp repetition rate [Hz] (lower = more spectral lines)
-      - -g
-      - "40"           # TX gain [dB]
-    working_dir: /opt/sdr-agent/scripts
-    env:
-      GR_DONT_LOAD_PREFS: "1"          # skip slow pref scan in headless mode
-    autostart: false
-    restart_on_crash: false
+tasks: []

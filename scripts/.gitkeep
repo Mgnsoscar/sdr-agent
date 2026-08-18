@@ -1,0 +1,2 @@
+# scripts/ ships empty. Scripts are uploaded to a unit from the client
+# (Library → deploy), not baked into the agent bundle. See examples/ for samples.
