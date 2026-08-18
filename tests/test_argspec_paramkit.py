@@ -98,6 +98,22 @@ def main() -> int:
     names = {p["dest"] for p in spec2["params"]}
     check(names == {"freq", "verbose"}, "argparse params still extracted")
 
+    print("computed min/max bounds resolve statically:")
+    csrc = (
+        "from paramkit import Script\n"
+        "A, B = 30.0, 61.44\n"          # tuple-unpacked source vars
+        "C = 10\n"
+        "MAX_VALUE = A + B\n"           # named computed const
+        "script = (Script('d')\n"
+        "  .number('--x', min=0, max=MAX_VALUE)\n"
+        "  .number('--y', min=0, max=A + B)\n"   # inline expression
+        "  .integer('--n', min=1, max=C * 2 + 1))\n"
+    )
+    cby = {p["name"]: p for p in extract_params(csrc)["params"]}
+    check(cby["x"]["max"] == 91.44, "named computed const (A+B) resolves in schema")
+    check(cby["y"]["max"] == 91.44, "inline A+B resolves in schema")
+    check(cby["n"]["max"] == 21, "integer computed bound (C*2+1) resolves in schema")
+
     print("empty paramkit (no builder calls) falls back gracefully:")
     spec3 = extract_params("import paramkit\n")
     check(spec3.get("params") == [], "no params, no crash")
