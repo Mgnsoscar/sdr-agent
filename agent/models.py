@@ -42,6 +42,12 @@ class TaskConfig(BaseModel):
     resume_offset_flag: str = "--start-offset"   # used when mode == "arg"
     resume_offset_env: str = "SDR_START_OFFSET"  # used when mode == "env"
 
+    # Which unit types this task targets (the client scopes the shared library by
+    # this). Empty = shared/all — the default, so a unit only ever receives the
+    # tasks meant for its kind. The agent stores and round-trips it; it does not
+    # act on it (the client does the filtering before deploy).
+    types: list[str] = []
+
 
 
 class ProcessStatus(BaseModel):
@@ -314,6 +320,9 @@ class Sequence(BaseModel):
     name: str
     description: str = ""
     steps: list[SequenceStep]
+    # Unit types this sequence targets; empty = shared/all. Round-tripped for the
+    # client's library scoping (the agent does not act on it).
+    types: list[str] = []
 
 
 class CreateSequenceRequest(BaseModel):
@@ -471,6 +480,9 @@ class LibraryScript(BaseModel):
     name: str                          # script filename, e.g. "freq.py"
     content: str = ""                  # the script's source
     params: list[dict] = []            # argparse/paramkit schema (as /scripts/{name}/params)
+    # Unit types this script targets; empty = shared/all. Round-tripped for the
+    # client's library scoping (the agent does not act on it).
+    types: list[str] = []
 
 
 class Library(BaseModel):
