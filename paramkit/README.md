@@ -92,6 +92,21 @@ Each preset has:
 
 On the CLI you may pass the key *or* the exact label *or* a raw value.
 
+## Choice options
+
+`choice(...)` accepts its `options` in two forms:
+
+```python
+.choice("--otw", options=["sc8", "sc16"])                                   # plain values
+.choice("--otw", options={"sc8": "8-bit (halves USB)", "sc16": "16-bit"})   # {value: label}
+```
+
+The **mapping** form pairs each option value with a human-facing **placeholder label**
+for a GUI dropdown. Either way the value the script receives (and the CLI accepts) is
+the option **value** — the dict key; the labels are display-only. A plain list behaves
+exactly as before. In the schema, `choices` is always the list of values, and
+`choice_labels` is the `{value: label}` map (or `null` when a plain list was used).
+
 ## The schema (for GUIs / hosts)
 
 `script.describe()` returns a dict (and `to_json()` the JSON) shaped like:

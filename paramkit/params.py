@@ -88,6 +88,13 @@ def slug(text: str) -> str:
 # Presets may be given as {label: value}, [(label, value), ...], or [Preset, ...].
 PresetsInput = Union[Mapping[str, Any], Sequence[Any], None]
 
+# Choice options may be a plain sequence of values — ["sc8", "sc16"] — or a
+# {value: label} mapping pairing each value with a human-facing placeholder for a
+# GUI — {"sc8": "8-bit (halves USB)", "sc16": "16-bit"}. The value the script
+# receives is always the option value (the dict key); labels are display-only.
+# A plain sequence behaves exactly as before, so this is backwards compatible.
+ChoiceInput = Union[Sequence[str], Mapping[str, str]]
+
 
 def _normalise_presets(presets: PresetsInput) -> List[Preset]:
     if not presets:
@@ -143,6 +150,7 @@ class Param:
     max: Optional[float] = None
     step: Optional[float] = None
     choices: Optional[List[str]] = None
+    choice_labels: Optional[Dict[str, str]] = None  # {value: display label}, GUI only
     presets: List[Preset] = field(default_factory=list)
     default: Any = None
     required: bool = False
@@ -166,6 +174,7 @@ class Param:
             "max": self.max,
             "step": self.step,
             "choices": list(self.choices) if self.choices else None,
+            "choice_labels": dict(self.choice_labels) if self.choice_labels else None,
             "presets": [p.to_dict() for p in self.presets],
             "default": self.default,
             "required": self.required,
@@ -297,18 +306,30 @@ class Script:
             required=required, multiple=multiple, live=live,
         ))
 
-    def choice(self, *flags: str, options: Sequence[str], name: Optional[str] = None,
+    def choice(self, *flags: str, options: ChoiceInput, name: Optional[str] = None,
                help: str = "", default: Optional[str] = None,
                required: bool = False, live: bool = False) -> "Script":
         """A string parameter restricted to a fixed set of options (a GUI dropdown).
-        See number() for the live= flag."""
+
+        ``options`` is either a plain sequence of values —
+        ``["sc8", "sc16"]`` — or a ``{value: label}`` mapping that pairs each value
+        with a human-facing placeholder for a GUI —
+        ``{"sc8": "8-bit (halves USB)", "sc16": "16-bit"}``. Either way the value the
+        script receives (and the CLI accepts) is the option value — the dict key;
+        the labels are display-only. A plain sequence behaves exactly as before, so
+        existing scripts are unaffected. See number() for the live= flag."""
         n, flags = self._derive_name(flags, name)
-        opts = [str(o) for o in options]
+        if isinstance(options, Mapping):
+            opts = [str(k) for k in options]
+            labels = {str(k): str(v) for k, v in options.items()}
+        else:
+            opts = [str(o) for o in options]
+            labels = None
         if default is not None and str(default) not in opts:
             raise ValueError(f"default {default!r} is not one of the options {opts}")
         return self._add(Param(
             name=n, flags=flags, kind=CHOICE, help=help, choices=opts,
-            default=default, required=required, live=live,
+            choice_labels=labels, default=default, required=required, live=live,
         ))
 
     def text(self, *flags: str, name: Optional[str] = None, help: str = "",

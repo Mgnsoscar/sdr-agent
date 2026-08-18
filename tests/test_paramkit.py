@@ -111,6 +111,25 @@ def main() -> int:
     doc = json.loads(out.getvalue())
     check(doc["params"][0]["name"] == "freq", "--describe-params prints schema JSON")
 
+    print("labelled choices ({value: label} mapping):")
+    sc = (Script("y")
+          .choice("--otw", options={"sc8": "8-bit (halves USB)", "sc16": "16-bit"},
+                  default="sc8")
+          .choice("--band", options=["L1", "L2"], default="L1"))  # plain list, unchanged
+    schema = {p["name"]: p for p in sc.describe()["params"]}
+    check(schema["otw"]["choices"] == ["sc8", "sc16"], "dict-choice values become choices")
+    check(schema["otw"]["choice_labels"] == {"sc8": "8-bit (halves USB)", "sc16": "16-bit"},
+          "dict-choice labels captured in schema")
+    check(schema["band"]["choice_labels"] is None, "list-choice keeps choice_labels=None")
+    a = sc.parse(["--otw", "sc16"]); check(a.otw == "sc16", "CLI uses the value (dict key)")
+    expect_exit(lambda: sc.parse(["--otw", "8-bit (halves USB)"]),
+                "label is not accepted as a CLI value")
+    try:
+        Script("z").choice("--w", options={"a": "A", "b": "B"}, default="Q")
+        check(False, "bad default (not a value) should raise")
+    except ValueError:
+        check(True, "dict-choice default still validated against values")
+
     print("presets as list of Preset / tuples:")
     s2 = Script("x").number("--f", presets=[Preset("a", "Alpha", 1.0), ("Beta", 2.0)])
     a = s2.parse(["--f", "a"]); check(a.f == 1.0, "Preset object key resolves")
