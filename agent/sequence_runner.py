@@ -73,6 +73,14 @@ def _run_id() -> str:
     return "run_" + secrets.token_hex(4)
 
 
+def _fmt_ramp_value(value: float, integer: bool) -> str:
+    """A ramp point's value as a CLI argument string: whole integers (and int-typed
+    params) render without a decimal so `type=int` argparse accepts them."""
+    if integer:
+        return str(int(round(value)))
+    return str(int(value)) if float(value).is_integer() else str(value)
+
+
 class SequenceRunner:
     def __init__(
         self,
@@ -394,6 +402,7 @@ class SequenceRunner:
         except ValueError as exc:
             logger.error("Ramp step for '%s' could not be resolved: %s", s.task_name, exc)
             return []
+        is_run = getattr(r, "mode", "tune") == "run"
         out: List[StepFire] = []
         for fire_anchor, off, value in points:
             if fire_anchor == "stop":
@@ -402,10 +411,21 @@ class SequenceRunner:
                 base = on_air_end
             else:
                 base = on_air_at
-            out.append(StepFire(
-                anchor=fire_anchor, offset_s=off, action="tune",
-                task_name=s.task_name, fire_at=(base + timedelta(seconds=off)).isoformat(),
-                params={r.param: value}))
+            fire_at = (base + timedelta(seconds=off)).isoformat()
+            if is_run:
+                # A task ramp fires the task once per point with the value as a CLI
+                # arg (fixed args for the other params come from the step); no running
+                # task needed, so this works with any task.
+                vs = _fmt_ramp_value(value, r.integer)
+                val_args = [r.flag, vs] if r.flag else [vs]
+                out.append(StepFire(
+                    anchor=fire_anchor, offset_s=off, action="run",
+                    task_name=s.task_name, fire_at=fire_at,
+                    args=list(s.args or []) + val_args, replace_args=True))
+            else:
+                out.append(StepFire(
+                    anchor=fire_anchor, offset_s=off, action="tune",
+                    task_name=s.task_name, fire_at=fire_at, params={r.param: value}))
         return out
 
     # ── Arming ────────────────────────────────────────────────────────────────
