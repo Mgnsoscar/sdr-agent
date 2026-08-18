@@ -121,3 +121,66 @@ def test_both_anchor_ramp_respects_insets(tmp_path):
         finally:
             await runner.shutdown(); await mgr.shutdown()
     asyncio.run(scenario())
+
+
+def test_run_mode_ramp_expands_to_run_fires(tmp_path):
+    """A run-mode ramp fires the task once per point with the value as a CLI arg
+    (fixed args from the step, the ramped param appended as `flag value`)."""
+    async def scenario():
+        mgr, runner = _runner(tmp_path)
+        await mgr.startup(); await runner.startup()
+        try:
+            ramp = RampSpec(param="atten", start=0, stop=30, step=10, hold_s=1,
+                            mode="run", flag="--atten")
+            steps = [
+                SequenceStep(anchor="start", offset_s=0.0, action=StepAction.START, task_name="chirp"),
+                SequenceStep(anchor="start", offset_s=0.0, action=StepAction.RAMP, task_name="chirp",
+                             ramp=ramp, args=["--dwell", "5"]),
+                SequenceStep(anchor="stop", offset_s=0.0, action=StepAction.STOP, task_name="chirp"),
+            ]
+            seq = await runner.create_sequence(CreateSequenceRequest(name="run-ramp", steps=steps))
+            now = datetime.now(timezone.utc)
+            run = await runner.arm(
+                seq.id,
+                ArmSequenceRequest(on_air_at=(now + timedelta(seconds=30)).isoformat()),
+                (now + timedelta(seconds=90)).isoformat(),
+            )
+            runs = sorted((s for s in run.steps if s.action == "run"), key=lambda s: s.offset_s)
+            assert [s.args for s in runs] == [
+                ["--dwell", "5", "--atten", "0"],
+                ["--dwell", "5", "--atten", "10"],
+                ["--dwell", "5", "--atten", "20"],
+                ["--dwell", "5", "--atten", "30"],
+            ]
+            assert not [s for s in run.steps if s.action == "tune"]
+        finally:
+            await runner.shutdown(); await mgr.shutdown()
+    asyncio.run(scenario())
+
+
+def test_run_mode_integer_values_have_no_decimal(tmp_path):
+    """Integer-typed run ramps render whole numbers (so `type=int` argparse accepts)."""
+    async def scenario():
+        mgr, runner = _runner(tmp_path)
+        await mgr.startup(); await runner.startup()
+        try:
+            ramp = RampSpec(param="atten", start=0, stop=10, steps=3, hold_s=1,
+                            mode="run", flag="-a", integer=True)   # 0, 3.33, 6.67, 10 → rounded
+            steps = [
+                SequenceStep(anchor="start", offset_s=0.0, action=StepAction.START, task_name="chirp"),
+                SequenceStep(anchor="start", offset_s=0.0, action=StepAction.RAMP, task_name="chirp", ramp=ramp),
+                SequenceStep(anchor="stop", offset_s=0.0, action=StepAction.STOP, task_name="chirp"),
+            ]
+            seq = await runner.create_sequence(CreateSequenceRequest(name="int-ramp", steps=steps))
+            now = datetime.now(timezone.utc)
+            run = await runner.arm(
+                seq.id,
+                ArmSequenceRequest(on_air_at=(now + timedelta(seconds=30)).isoformat()),
+                (now + timedelta(seconds=90)).isoformat(),
+            )
+            vals = [s.args[-1] for s in sorted((s for s in run.steps if s.action == "run"),
+                                               key=lambda s: s.offset_s)]
+            assert vals == ["0", "3", "7", "10"]   # rounded, no ".0"
+        finally:
+            await runner.shutdown(); await mgr.shutdown()
+    asyncio.run(scenario())
