@@ -69,10 +69,19 @@ if [ "$PROV_STATIC" != "1" ]; then
         ETH_CON="$(nmcli -t -f NAME,DEVICE,TYPE connection show 2>/dev/null \
                    | awk -F: '$3 ~ /ethernet/ {print $1; exit}')"
         if [ -n "$ETH_CON" ]; then
-            echo "    tuning '$ETH_CON' for direct-cable (link-local + short DHCP timeout)"
-            nmcli connection modify "$ETH_CON" ipv4.dhcp-timeout 15 2>/dev/null || true
-            nmcli connection modify "$ETH_CON" ipv4.link-local enabled 2>/dev/null \
-                || echo "    (this NetworkManager has no ipv4.link-local; the DHCP-timeout fallback still applies)"
+            # Prefer ipv4.link-local=enabled: eth0 always gets a 169.254 address IN
+            # ADDITION to DHCP, assigned immediately at activation — so a direct cable
+            # is reachable in seconds while DHCP on a real network (WiFi bridge) is left
+            # completely untouched: full default timeout, real lease still used. Only if
+            # this NetworkManager is too old for the property do we fall back to
+            # shortening the DHCP timeout (which trades a little slow-DHCP robustness for
+            # the direct-cable fallback — modern Bookworm NM never takes this path).
+            if nmcli connection modify "$ETH_CON" ipv4.link-local enabled 2>/dev/null; then
+                echo "    eth0 ('$ETH_CON'): link-local always on — direct-cable ready, DHCP unaffected"
+            else
+                nmcli connection modify "$ETH_CON" ipv4.dhcp-timeout 20 2>/dev/null || true
+                echo "    eth0 ('$ETH_CON'): older NM — shortened DHCP timeout for direct-cable fallback"
+            fi
             nmcli connection up "$ETH_CON" >/dev/null 2>&1 || true
         fi
     fi
