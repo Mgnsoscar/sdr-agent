@@ -37,6 +37,24 @@ def _literal(node, consts) -> Any:
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
         v = _literal(node.operand, consts)
         return -v if isinstance(v, (int, float)) else None
+    if isinstance(node, ast.BinOp):
+        # Resolve simple numeric arithmetic on constants, e.g. max=A + B or a
+        # module-level MAX_VALUE = A + B, so computed bounds appear in the static
+        # schema too (the runtime already evaluates these before .number()).
+        left, right = _literal(node.left, consts), _literal(node.right, consts)
+        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+            op = node.op
+            try:
+                if isinstance(op, ast.Add): return left + right
+                if isinstance(op, ast.Sub): return left - right
+                if isinstance(op, ast.Mult): return left * right
+                if isinstance(op, ast.Div): return left / right
+                if isinstance(op, ast.FloorDiv): return left // right
+                if isinstance(op, ast.Mod): return left % right
+                if isinstance(op, ast.Pow): return left ** right
+            except (ZeroDivisionError, ValueError):
+                return None
+        return None
     if isinstance(node, (ast.List, ast.Tuple)):
         return [_literal(e, consts) for e in node.elts]
     if isinstance(node, ast.Dict):
@@ -83,14 +101,25 @@ def _collect_consts(tree) -> Dict[str, Any]:
     """Resolve module-level `NAME = <literal>` assignments (incl. dict/list)."""
     consts: Dict[str, Any] = {}
     for n in tree.body:
-        if (isinstance(n, ast.Assign) and len(n.targets) == 1
-                and isinstance(n.targets[0], ast.Name)):
+        if not isinstance(n, ast.Assign) or len(n.targets) != 1:
+            continue
+        target = n.targets[0]
+        if isinstance(target, ast.Name):
             if isinstance(n.value, ast.Constant):
-                consts[n.targets[0].id] = n.value.value
+                consts[target.id] = n.value.value
             else:
                 v = _literal(n.value, consts)
                 if v is not None:
-                    consts[n.targets[0].id] = v
+                    consts[target.id] = v
+        elif (isinstance(target, (ast.Tuple, ast.List))
+              and isinstance(n.value, (ast.Tuple, ast.List))
+              and len(target.elts) == len(n.value.elts)):
+            # tuple unpacking: A, B = 30.0, 61.44
+            for tgt, val in zip(target.elts, n.value.elts):
+                if isinstance(tgt, ast.Name):
+                    v = _literal(val, consts)
+                    if v is not None:
+                        consts[tgt.id] = v
     return consts
 
 
