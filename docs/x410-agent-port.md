@@ -40,24 +40,38 @@ delivery). Keep it that way — do not fork.
 
 ## 2. The gaps (all narrow, all in the install/env layer)
 
-### G1 — Dependency delivery without `apt` (the wheelhouse)
-Yocto/OpenEmbedded has no apt/dpkg, and pip on Yocto may not accept Debian's
-`--break-system-packages`. Most of the stack has **compiled** extensions that
-must match the device exactly:
+### G1 — Dependency delivery (pip is the path; wheelhouse only if offline)
+There is no apt/dpkg. OpenEmbedded's own package manager (**opkg**, `.ipk`) may
+be present, but it does **not** carry our app stack (FastAPI/pydantic/uvicorn/
+zeroconf at our pinned versions aren't in any NI/OE feed). So the delivery path
+for the Python deps is **pip, regardless of opkg**. Two ways to feed pip:
 
-- `pydantic 2.8.2` → **`pydantic-core`** (compiled Rust)
-- `uvicorn[standard]` → **`uvloop`, `httptools`, `websockets`** (compiled C)
-- `psutil`, `inotify-simple` (compiled C)
-- pure-Python: `fastapi`, `PyYAML`, `python-multipart`, `zeroconf`, `ruamel.yaml`
+- **Online** — if the X410 reaches the internet, `pip install -r requirements.txt`
+  just works: every dep publishes prebuilt **aarch64 manylinux** wheels on PyPI,
+  so pip downloads them, no compiling. **No wheelhouse needed in this case.**
+- **Offline / deterministic** — the on-device wheelhouse (below), for a unit with
+  no internet or when a repeatable pinned install is wanted.
 
-**Certainty rule:** the only way to be *sure* the wheels fit is to build the
-wheelhouse **on the X410 itself** (or a byte-identical Yocto SDK sysroot), so the
-wheels carry that interpreter's real ABI/arch/libc tags. `pip download
---platform …` from a laptop is fragile for exactly these manylibc/manylinux
-cases. `deploy/x410/build_wheelhouse.sh` runs on-device, produces `wheels/`, and
-prints the platform tags so we can verify before trusting them.
+opkg would matter only as a source of **build prerequisites** (compiler/headers)
+*iff* a dep had no aarch64 wheel and had to build from sdist — unlikely for our
+pinned set (all ship aarch64 wheels). `psutil` is pip-installed here (the Pi used
+apt only to avoid a pip-uninstall conflict that doesn't exist on the X410).
 
-`TODO(recon)`: exact `python3 --version` and platform tag (`cp311-cp311-…`).
+Compiled deps whose wheels must match the device: `pydantic-core` (Rust),
+`uvloop`/`httptools`/`websockets` (C), `psutil`, `inotify-simple` (C).
+
+**Wheelhouse certainty rule:** if we go offline, the only way to be *sure* the
+wheels fit is to build the wheelhouse **on the X410 itself** (or a byte-identical
+Yocto SDK sysroot) so the wheels carry that interpreter's real ABI/arch/libc
+tags — `pip download --platform …` from a laptop is fragile for exactly these
+manylinux cases. `deploy/x410/build_wheelhouse.sh` runs on-device, produces
+`wheels/`, and prints the platform tags to verify before trusting them.
+
+Also note `updater.py`'s pip args (`--break-system-packages`) may be rejected on
+Yocto — see G5.
+
+`TODO(recon)`: internet reachability (decides online vs wheelhouse); exact
+`python3 --version` and platform tag (`cp311-cp311-…`).
 
 ### G2 — Update-surviving storage (Mender A/B)
 An NI OS update swaps the whole rootfs (A/B slots), so anything under `/opt` on
@@ -82,21 +96,29 @@ the service drop-in, install the systemd units, enable + start. The client's
 paramiko provisioning transport (SSH `root@host`, upload tar, unpack, run script)
 works unchanged — it just runs this script instead.
 
-### G4 — Networking: in scope, but via the X410's own stack
+### G4 — Networking: same goals as the Pi, X410-native mechanism
 We *may* set eth0 IP + hostname on the X410 (worst case: revert by hand at
-hand-back). But `deploy/provision_network.sh` is Debian **netplan + NetworkManager
-+ cloud-init** and does **not** apply on Yocto. The X410 uses a different stack
-(systemd-networkd / ConnMan / NI's own config — confirm). So we need an
-X410-specific `provision_network` that:
-- sets the hostname the X410 way (persisting across reboot), and
-- sets a static eth0 address the X410 way,
-- **records the original config first** so revert is a one-liner.
+hand-back). `deploy/provision_network.sh` (Pi) is Debian **netplan +
+NetworkManager + cloud-init** and does **not** apply on Yocto — but its *goals*
+carry over one-for-one. The X410 stack is most likely **systemd-networkd**
+(possibly ConnMan or an NI-managed config — recon confirms).
 
-Until confirmed on hardware this stays a stub; the agent works fine with the
-factory addressing + mDNS in the meantime.
+The Pi's default (DHCP) mode achieves three goals; static mode adds a fourth.
+Mapped to the X410:
 
-`TODO(recon)`: which network stack manages eth0; how hostname persists; the
-factory eth0 address to snapshot.
+| Pi goal | Pi mechanism | X410 mechanism |
+|---|---|---|
+| Persistent hostname (survives reboot) | `hostnamectl` + cloud-init `preserve_hostname` pin + `/etc/hosts` | `hostnamectl set-hostname` (persistent; **no cloud-init pin needed** — the "resets after reboot" cause doesn't exist here) + avahi so `<hostname>.local` follows |
+| Stay reachable at `<hostname>.local`, no reboot | avahi + agent restart | restart avahi + `sdr-agent` to re-announce |
+| Direct-cable `169.254.1.N/16` on eth0, no DHCP server | netplan drop-in + `optional:true` (defeats NM teardown loop) | **simpler:** a `.network` with `Address=169.254.1.N/16` + `DHCP=yes`. networkd has no NM teardown loop, and `LinkLocalAddressing=ipv4` is a real knob (it was a no-op under netplan/NM) |
+| Static site IP (opt-in) + gateway/DNS, reboot | nmcli / dhcpcd writers | a `.network` with `Address=`/`Gateway=`/`DNS=`, `networkctl reload` (often no reboot) |
+
+Always **snapshot the original config first** so revert is a one-liner
+(borrowed unit). Until the stack is confirmed this stays a stub; the agent works
+fine on the factory addressing + mDNS meanwhile.
+
+`TODO(recon)`: which stack manages eth0 (`networkctl` / `connmanctl`); the
+factory eth0 address + hostname to snapshot.
 
 ### G5 — `updater.py` pip flag
 `_default_deps_install` hardcodes `--break-system-packages`. Make the pip base
