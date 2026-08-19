@@ -100,22 +100,23 @@ def main():
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    # Generate the tone with continuous phase across buffers (idx keeps advancing),
-    # so there's no phase jump every packet. tone_offset=0 -> constant = pure carrier.
-    two_pi_f_over_fs = 2.0 * np.pi * a.tone_offset / act_rate
-    idx = 0
+    # Generate the tone with continuous phase across buffers so there's no jump each
+    # packet. A running phase accumulator (wrapped to [0, 2pi)) keeps precision over
+    # long runs. tone_offset=0 -> inc=0 -> constant buffer = pure carrier at the LO.
+    inc = 2.0 * np.pi * a.tone_offset / act_rate
+    ramp = np.arange(spp)
+    phase = 0.0
     max_samps = int(a.duration * act_rate) if a.duration > 0 else 0
     sent = 0
     print("Transmitting. Ctrl-C to stop." if a.duration <= 0
           else f"Transmitting for {a.duration:g} s.", flush=True)
     try:
         while running["go"] and (max_samps == 0 or sent < max_samps):
-            n = np.arange(idx, idx + spp)
-            buff = (a.amplitude * np.exp(1j * two_pi_f_over_fs * n)).astype(np.complex64)
+            buff = (a.amplitude * np.exp(1j * (phase + inc * ramp))).astype(np.complex64)
             buff = np.ascontiguousarray(buff.reshape(1, spp))
             tx_streamer.send(buff, md)
             md.start_of_burst = False
-            idx += spp
+            phase = (phase + inc * spp) % (2.0 * np.pi)
             sent += spp
     finally:
         # End-of-burst so the DAC ramps down instead of leaving a stuck carrier.
