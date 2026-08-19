@@ -237,6 +237,8 @@ async def info(manager: ProcessManager = Depends(get_manager)):
         python_version = platform.python_version(),
         tasks          = manager.task_names(),
         previous_version = _make_updater().previous_version(),
+        scripts_dir      = str(SCRIPTS_DIR),
+        task_interpreter = cfg.TASK_INTERPRETER,
     )
 
 
