@@ -88,6 +88,10 @@ mkdir -p "$DROPIN"
     # release without shipping a separate unit file.
     printf 'WorkingDirectory=%s\n'              "$BASE"
     printf 'Environment=PYTHONPATH=%s\n'        "$BASE"
+    # UHD needs $HOME (for ~/.config/uhd) — systemd doesn't set it for services, so
+    # every SDR task the agent spawns would fail with get_xdg_config_home() without
+    # this. Root's home on the X410 is /root.
+    printf 'Environment=HOME=/root\n'
     printf 'Environment=SDR_AGENT_BASE=%s\n'    "$BASE"
     printf 'Environment=SDR_STATE_DIR=%s\n'     "$SHARED"
     printf 'Environment=SDR_RELEASES_DIR=%s\n'  "$RELEASES"

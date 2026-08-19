@@ -142,6 +142,19 @@ interface names; empty by default so the Pis are unaffected) — the X410 profil
 sets it to `int0`. This is read-only: the agent never configures `int0`, only
 declines to advertise it.
 
+### G9 — UHD tasks need `$HOME` and the system Python
+Two runtime facts for the SDR tasks the agent launches on the X410:
+- **`HOME` must be set.** UHD resolves `~/.config/uhd` and aborts with
+  `get_xdg_config_home(): Unable to find $HOME or $XDG_CONFIG_HOME` if it's unset —
+  and systemd does not set `HOME` for services. The X410 service sets
+  `Environment=HOME=/root`, which every spawned task inherits.
+- **Tasks run under the system Python, not the bundled one.** `uhd` + `numpy` live
+  in the system `python3.7` (that's what UHD ships with). The agent runs on the
+  isolated `/data/python` 3.11, but an SDR task's command must use
+  `/usr/bin/python3` so it can `import uhd`. (The agent now resolves a bare
+  `python3` via PATH too — needed because uvloop/libuv, unlike plain asyncio,
+  doesn't search PATH for argv[0].)
+
 ### G7 — Revert guarantee (borrowed unit)
 Before touching anything, snapshot the current state; provide a clean
 `deploy/x410/uninstall.sh` and a documented footprint so hand-back is
