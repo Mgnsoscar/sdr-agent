@@ -180,9 +180,11 @@ async def set_clock(epoch: float) -> tuple[bool, str]:
 
 # ── SDR probing ───────────────────────────────────────────────────────────────
 
-def _parse_uhd_output(text: str) -> list[SdrDevice]:
+def _parse_uhd_output(text: str) -> list[dict]:
     """
-    Parse `uhd_find_devices` output into SdrDevice objects.
+    Parse `uhd_find_devices` output into raw per-device dicts (every Device Address
+    key), so the caller can tell a locally-attached device from a networked USRP
+    merely discovered on the LAN.
 
     The output groups devices in blocks like:
         --------------------------------------------------
@@ -193,27 +195,46 @@ def _parse_uhd_output(text: str) -> list[SdrDevice]:
             name: MyB206
             product: B200
             type: b200
+    A network-discovered USRP (e.g. an X4xx seen from another host) additionally
+    carries an `addr:` line with its IP; a USB or on-board device has none.
     """
-    devices: list[SdrDevice] = []
+    devices: list[dict] = []
     current: dict[str, str] = {}
 
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("-- UHD Device"):
             if current:
-                devices.append(SdrDevice(**current))
+                devices.append(current)
                 current = {}
         elif ":" in line:
             key, _, val = line.partition(":")
             key = key.strip().lower()
             val = val.strip()
-            if key in ("type", "serial", "name", "product"):
+            if key and val:
                 current[key] = val
 
     if current:
-        devices.append(SdrDevice(**current))
+        devices.append(current)
 
     return devices
+
+
+def _is_local_device(raw: dict) -> bool:
+    """True if the device is physically attached to THIS host (USB or on-board),
+    rather than a networked USRP discovered over the LAN. UHD gives a
+    network-discovered device an `addr` (its IP); a USB/on-board device has none
+    (the X410's own device reports mgmt_addr 127.0.0.1 and no addr). So: local iff
+    there's no `addr`, or it's loopback."""
+    addr = (raw.get("addr") or "").strip()
+    return (not addr) or addr.startswith("127.")
+
+
+def _to_sdr_device(raw: dict) -> SdrDevice:
+    return SdrDevice(
+        type=raw.get("type", ""), serial=raw.get("serial", ""),
+        name=raw.get("name", ""), product=raw.get("product", ""),
+    )
 
 
 def _probe_sdr() -> SdrStatus:
@@ -249,11 +270,15 @@ def _probe_sdr() -> SdrStatus:
             raw_output=combined.strip(),
         )
 
-    devices = _parse_uhd_output(combined)
+    # Keep only devices physically attached to THIS host — drop networked USRPs
+    # merely discovered on the LAN (e.g. an X4xx seen by every other unit on the
+    # same subnet), so the SDR field reflects what's actually connected here.
+    raw = _parse_uhd_output(combined)
+    local = [_to_sdr_device(d) for d in raw if _is_local_device(d)]
     return SdrStatus(
-        detected=len(devices) > 0,
-        device_count=len(devices),
-        devices=devices,
+        detected=len(local) > 0,
+        device_count=len(local),
+        devices=local,
         raw_output=combined.strip(),
     )
 
