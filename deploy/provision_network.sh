@@ -57,48 +57,66 @@ if [ -d /etc/cloud ] || command -v cloud-init >/dev/null 2>&1; then
     } > /etc/cloud/cloud.cfg.d/99-sdr-provision.cfg
 fi
 
-# ── DHCP mode: hostname only, no static IP, no reboot ────────────────────────────
+# ── DHCP mode: hostname + a stable direct-cable link-local; no reboot ─────────────
 if [ "$PROV_STATIC" != "1" ]; then
-    echo "==> DHCP mode — no static IP. Re-advertising mDNS under the new hostname."
-    # Make eth0 reliably reachable over a DIRECT cable (no DHCP server). We give it a
-    # STABLE static link-local (169.254.1.<N>) via a netplan drop-in, plus optional:true
-    # so a missing DHCP server never tears the interface down (the "works then drops
-    # every 45s" fail/retry loop). Why static, not dynamic: on this netplan+NM stack the
-    # dynamic IPv4-link-local knob is a no-op (the interface ends up with no IPv4 at
-    # all), whereas a static address comes up reliably. It's derived from the unit
-    # number so it's unique per unit (no collisions on a shared switch) and hands-off —
-    # you still reach units by broadcaster-N.local. dhcp4 stays on, so the WiFi-bridge
-    # mode still gets a real lease; the static just rides alongside. Applied SURGICALLY
-    # (generate + reload + per-device reapply) so it never bounces the wlan0/eth link
-    # we're provisioning over — no full `netplan apply`, no dropped SSH.
+    echo "==> DHCP mode. Re-advertising mDNS under the new hostname."
+    # eth0 must work in TWO worlds: on a router (needs a DHCP lease) and on a direct
+    # cable to a PC (no DHCP server → needs a stable link-local). A single NM profile
+    # can't do both: with method=auto, NetworkManager ties activation success to
+    # getting a DHCP lease, so a missing server makes the connection FAIL and flush the
+    # interface every dhcp-timeout — the "holds a while then drops" loop. A static /
+    # link-local address on the same profile does NOT rescue it (it doesn't count as
+    # method=auto succeeding), and netplan's `optional:true` only affects boot-wait, not
+    # this runtime teardown — so the old single-profile drop-in never actually fixed it.
+    #
+    # The reliable pattern is TWO NM profiles selected by autoconnect priority:
+    #   <eth0 DHCP profile>  method=auto,   priority 10 — tried first; wins on a router
+    #   eth0-linklocal       method=manual 169.254.1.<N>/16, priority 5 — the fallback
+    #                        NM activates when DHCP fails (method=manual activates cleanly)
+    # Derived from the unit number so each unit's link-local is unique; you still reach
+    # units by <hostname>.local. Written WITHOUT bouncing eth0 (we may be provisioning
+    # over it) — the profiles persist (nmcli writes them back to /etc/netplan/90-NM-*.yaml
+    # on this OS) and take effect on the next eth0 carrier event / reboot.
     N="${PROV_HOSTNAME##*-}"
-    if command -v netplan >/dev/null 2>&1 \
+    if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager \
        && printf '%s' "$N" | grep -qE '^[0-9]+$' && [ "$N" -ge 1 ] && [ "$N" -le 254 ]; then
-        echo "    eth0 direct-cable address: 169.254.1.$N/16 (netplan drop-in)"
-        cat > /etc/netplan/99-sdr-eth0.yaml <<NETPLAN
-network:
-  version: 2
-  ethernets:
-    eth0:
-      dhcp4: true
-      optional: true
-      addresses:
-        - "169.254.1.$N/16"
-NETPLAN
-        chmod 600 /etc/netplan/99-sdr-eth0.yaml
-        netplan generate 2>/dev/null || true
-        nmcli connection reload 2>/dev/null || true    # load the new eth0 config…
-        nmcli device reapply eth0 2>/dev/null || true  # …and apply it to eth0 only
+        LL="169.254.1.$N/16"
+        echo "    direct-cable link-local: $LL  (DHCP-first, link-local fallback)"
+        # Primary DHCP profile — fail fast (may-fail no + short timeout + few retries)
+        # so NM drops to the fallback on a dead link instead of looping forever.
+        ETHCON="$(nmcli -t -f NAME,DEVICE connection show --active | awk -F: '$2=="eth0"{print $1; exit}')"
+        [ -n "$ETHCON" ] || ETHCON="$(nmcli -t -f NAME,DEVICE connection show | awk -F: '$2=="eth0"{print $1; exit}')"
+        [ -n "$ETHCON" ] || ETHCON="netplan-eth0"
+        nmcli connection modify "$ETHCON" \
+            ipv4.method auto ipv4.addresses "" ipv4.link-local disabled \
+            ipv4.may-fail no ipv4.dhcp-timeout 15 \
+            connection.autoconnect yes connection.autoconnect-priority 10 \
+            connection.autoconnect-retries 2 2>/dev/null \
+            || echo "    !! could not modify eth0 profile '$ETHCON'"
+        # Fallback static link-local profile (create, or update if re-provisioning).
+        if nmcli -t -f NAME connection show | grep -qx "eth0-linklocal"; then
+            nmcli connection modify eth0-linklocal \
+                ipv4.addresses "$LL" connection.autoconnect-priority 5 2>/dev/null || true
+        else
+            nmcli connection add type ethernet ifname eth0 con-name eth0-linklocal \
+                ipv4.method manual ipv4.addresses "$LL" ipv6.method link-local \
+                connection.autoconnect yes connection.autoconnect-priority 5 2>/dev/null \
+                || echo "    !! could not add eth0-linklocal profile"
+        fi
+        # Retire the old single-profile drop-in if an earlier provision wrote one.
+        rm -f /etc/netplan/99-sdr-eth0.yaml 2>/dev/null || true
+        echo "    (profiles saved; they take effect on the next eth0 carrier event/reboot,"
+        echo "     so we never drop a session we might be provisioning over)"
     else
-        echo "    (no netplan or no unit number in '$PROV_HOSTNAME' — skipping the "
-        echo "     direct-cable static address; DHCP/mDNS still work on a real network)"
+        echo "    (no NetworkManager or no unit number in '$PROV_HOSTNAME' — skipping the"
+        echo "     direct-cable link-local; DHCP/mDNS still work on a real network)"
     fi
     systemctl restart avahi-daemon 2>/dev/null || true
     # The agent reads its hostname at startup; restart it so it re-announces as
-    # broadcaster-N.local (mDNS) without a reboot.
+    # <hostname>.local (mDNS) without a reboot.
     systemctl restart sdr-agent 2>/dev/null || true
-    echo "==> Done (DHCP). The unit stays reachable at its current address, answers to"
-    echo "    $PROV_HOSTNAME.local, and is reachable over a direct Ethernet cable — no reboot."
+    echo "==> Done (DHCP). Answers to $PROV_HOSTNAME.local; takes a DHCP lease on a router"
+    echo "    and falls back to a stable 169.254.1.$N link-local on a direct cable."
     exit 0
 fi
 
