@@ -92,6 +92,9 @@ mkdir -p "$DROPIN"
     printf 'Environment=SDR_STATE_DIR=%s\n'     "$SHARED"
     printf 'Environment=SDR_RELEASES_DIR=%s\n'  "$RELEASES"
     printf 'Environment=SDR_CURRENT_LINK=%s\n'  "$BASE"
+    # Never advertise the internal RFSoC management NIC (169.254.0.1) as a unit
+    # address — a client can't reach it and it isn't ours to expose.
+    printf 'Environment=SDR_MDNS_EXCLUDE_IFACES=int0\n'
     [ -n "${SDR_UNIT_ID:-}" ] && printf 'Environment=SDR_UNIT_ID=%s\n' "$SDR_UNIT_ID"
     [ -n "${SDR_API_KEY:-}" ] && printf 'Environment=SDR_API_KEY=%s\n' "$SDR_API_KEY"
 } > "$DROPIN/override.conf"

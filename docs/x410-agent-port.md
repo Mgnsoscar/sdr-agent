@@ -133,6 +133,15 @@ returns `None`). Add a Zynq UltraScale thermal read (or accept
 
 `TODO(recon)`: `ls /sys/class/thermal/` and which zone is the SoC.
 
+### G8 — Don't advertise the internal `int0` NIC
+The X410 has an internal management interface `int0` (`169.254.0.1`, RFSoC/MPM
+side) that a client must never touch or reach. The agent's mDNS advertiser
+enumerates every non-loopback IPv4, so it would otherwise announce `int0`'s
+address as a unit address. Fixed with `SDR_MDNS_EXCLUDE_IFACES` (comma-separated
+interface names; empty by default so the Pis are unaffected) — the X410 profile
+sets it to `int0`. This is read-only: the agent never configures `int0`, only
+declines to advertise it.
+
 ### G7 — Revert guarantee (borrowed unit)
 Before touching anything, snapshot the current state; provide a clean
 `deploy/x410/uninstall.sh` and a documented footprint so hand-back is
