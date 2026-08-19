@@ -1,116 +1,108 @@
 #!/usr/bin/env bash
-# install.sh (X410) — install the SDR agent onto an Ettus/NI X410 in the OTA
-# versioned layout, with NO apt and dependencies from an on-device-built wheelhouse.
-# Counterpart to deploy/provision_install.sh (the Debian/Pi version).
+# install.sh (X410) — install the SDR agent onto an Ettus/NI X410, offline, with a
+# self-contained Python (the system python3.7 is too old for the agent's stack and
+# is left untouched — it's what UHD/GNU Radio use). Counterpart to the Debian/Pi
+# deploy/provision_install.sh. Validated on NI Alchemy/Zeus (aarch64, systemd 243).
 #
-# Run as root, from inside an unpacked bundle dir:
-#   VERSION  agent/  scripts/  paramkit/  requirements.txt  configs/  deploy/  wheels/
+# Run as root on the X410, from inside an unpacked bundle dir containing:
+#   python-aarch64.tar.gz   a python-build-standalone CPython (aarch64, install_only)
+#   wheels/                 aarch64 cp311 wheels for requirements.txt + psutil + uvloop
+#   agent/ scripts/ paramkit/ configs/ requirements.txt   the agent code
+# Build that bundle on a PC with internet — see deploy/x410/README.md.
 #
-# ── STATUS: SKELETON ──────────────────────────────────────────────────────────
-# Complete once recon (deploy/x410/recon.sh) confirms:
-#   * PERSIST_ROOT — a writable path that survives reboot AND an NI OS update.
-#   * that `wheels/` was built on THIS device (deploy/x410/build_wheelhouse.sh).
-#   * that pip does NOT need --break-system-packages here (adjust PIP_BASE).
-# Search this file for TODO(recon).
+# Everything lands under $PERSIST_ROOT (default /data, the X410's persistent
+# partition — survives reboot; a full NI OS image update would wipe /etc, so the
+# service unit is re-established by re-running this). Uninstall: deploy/x410/uninstall.sh.
 set -euo pipefail
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
 
-# TODO(recon): the persistent partition. On a Pi this is just /opt; on the X410 the
-# rootfs is A/B-swapped by Mender, so code + state must live on persistent storage.
-PERSIST_ROOT="${PERSIST_ROOT:-/data}"           # <-- confirm on hardware
-[ -d "$PERSIST_ROOT" ] && touch "$PERSIST_ROOT/.sdr_w" 2>/dev/null && rm -f "$PERSIST_ROOT/.sdr_w" || {
-    echo "PERSIST_ROOT=$PERSIST_ROOT is not writable — set it to the X410's persistent path" >&2
+PERSIST_ROOT="${PERSIST_ROOT:-/data}"
+touch "$PERSIST_ROOT/.sdr_w" 2>/dev/null && rm -f "$PERSIST_ROOT/.sdr_w" || {
+    echo "PERSIST_ROOT=$PERSIST_ROOT is not writable — set it to the persistent path" >&2
     exit 1
 }
 
-BASE="$PERSIST_ROOT/sdr-agent"                  # symlink -> active release
-RELEASES="$PERSIST_ROOT/sdr-agent-releases"
-SHARED="$PERSIST_ROOT/sdr-agent-shared"         # state: configs/logs/run (survives updates)
-DROPIN=/etc/systemd/system/sdr-agent.service.d
+PYROOT="$PERSIST_ROOT/python"            # bundled interpreter (isolated from system py)
+BASE="$PERSIST_ROOT/sdr-agent"           # agent code
+SHARED="$PERSIST_ROOT/sdr-agent-shared"  # state: configs/logs/run (survives updates)
+PYBIN="$PYROOT/bin/python3"
+PORT="${SDR_AGENT_PORT:-8765}"
+UNIT_ID="${SDR_UNIT_ID:-$(hostname)}"
 
-HERE="$(cd "$(dirname "$0")/../.." && pwd)"     # bundle root (this script is deploy/x410/)
-[ -f "$HERE/VERSION" ] || { echo "no VERSION in bundle at $HERE" >&2; exit 1; }
-VERSION="$(tr -d ' \t\r\n' < "$HERE/VERSION")"
-[ -n "$VERSION" ] || { echo "empty VERSION" >&2; exit 1; }
+HERE="$(cd "$(dirname "$0")/../.." && pwd)"   # bundle root (this script is deploy/x410/)
 
-echo "==> Provisioning X410 agent $VERSION into $PERSIST_ROOT"
+echo "==> Installing SDR agent under $PERSIST_ROOT (unit id: $UNIT_ID)"
 
-echo "==> Preparing shared state ($SHARED)"
-mkdir -p "$SHARED/logs" "$SHARED/run" "$SHARED/configs"
+# 1) Bundled Python — extract once; the tarball has a top-level python/ dir.
+if [ ! -x "$PYBIN" ]; then
+    PYTAR="$(ls "$HERE"/python*aarch64*.tar.gz "$HERE"/cpython-*.tar.gz 2>/dev/null | head -1 || true)"
+    [ -n "$PYTAR" ] || { echo "no python-*aarch64*.tar.gz in the bundle" >&2; exit 1; }
+    echo "==> Extracting bundled Python from $(basename "$PYTAR")"
+    rm -rf "$PYROOT"
+    tar -xzf "$PYTAR" -C "$PERSIST_ROOT"      # creates $PERSIST_ROOT/python
+    [ -x "$PYBIN" ] || { echo "expected $PYBIN after extract" >&2; exit 1; }
+fi
+echo "    interpreter: $("$PYBIN" --version 2>&1)"
+
+# 2) Agent code.
+echo "==> Laying down agent code at $BASE"
+mkdir -p "$BASE"
+cp -a "$HERE/agent" "$HERE/paramkit" "$HERE/requirements.txt" "$BASE/"
+mkdir -p "$BASE/scripts"
+[ -d "$HERE/scripts" ] && cp -a "$HERE/scripts/." "$BASE/scripts/" 2>/dev/null || true
+
+# 3) State — seed default configs only where absent (never clobber a unit's state).
+echo "==> Preparing state at $SHARED"
+mkdir -p "$SHARED/configs" "$SHARED/logs" "$SHARED/run"
 if [ -d "$HERE/configs" ]; then
     for f in "$HERE/configs/."/*; do
         [ -e "$f" ] || continue
-        name="$(basename "$f")"
-        [ -e "$SHARED/configs/$name" ] || cp -a "$f" "$SHARED/configs/$name"   # never clobber state
+        n="$(basename "$f")"
+        [ -e "$SHARED/configs/$n" ] || cp -a "$f" "$SHARED/configs/$n"
     done
 fi
 
-echo "==> Laying code down as release $VERSION"
-REL="$RELEASES/$VERSION"
-mkdir -p "$RELEASES"; rm -rf "$REL"; mkdir -p "$REL"
-cp -a "$HERE/agent" "$HERE/scripts" "$HERE/paramkit" "$HERE/requirements.txt" "$REL/"
+# 4) Dependencies — offline, into the bundled Python (never the system one).
+echo "==> Installing Python dependencies offline into the bundle"
+[ -d "$HERE/wheels" ] || { echo "no wheels/ in the bundle — see deploy/x410/README.md" >&2; exit 1; }
+"$PYBIN" -m pip install --no-index --find-links "$HERE/wheels" \
+    --root-user-action=ignore --disable-pip-version-check --no-input \
+    -r "$BASE/requirements.txt" psutil
+"$PYBIN" -c "import fastapi, uvicorn, uvloop, pydantic, psutil, zeroconf, ruamel.yaml, yaml, multipart, websockets, inotify_simple" \
+    && echo "    all agent deps import OK"
 
-echo "==> Activating release (symlink $BASE -> $REL)"
-ln -sfn "$REL" "$BASE"
+# 5) systemd service — bundled Python + persistent paths + the env UHD/agent need.
+echo "==> Writing systemd service"
+cat > /etc/systemd/system/sdr-agent.service <<EOF
+[Unit]
+Description=SDR Agent (X410)
+After=network.target
 
-echo "==> Installing Python dependencies (wheelhouse-first, NO apt)"
-# TODO(recon): drop --break-system-packages if this pip rejects it.
-PIP_BASE=(pip3 install --root-user-action=ignore --disable-pip-version-check --no-input)
-WHEELS=""; [ -d "$HERE/wheels" ] && WHEELS="$HERE/wheels"
-if [ -z "$WHEELS" ]; then
-    echo "    !! no wheels/ in the bundle — build it on-device first:" >&2
-    echo "       deploy/x410/build_wheelhouse.sh" >&2
-fi
-# psutil is pip-managed here (no apt), unlike the Pi.
-if "${PIP_BASE[@]}" --no-index ${WHEELS:+--find-links "$WHEELS"} -r "$REL/requirements.txt" psutil; then
-    echo "    dependencies satisfied offline from the wheelhouse"
-else
-    echo "    offline install incomplete — trying online (fast fail-out)"
-    "${PIP_BASE[@]}" --retries 1 --timeout 15 -r "$REL/requirements.txt" psutil
-fi
+[Service]
+Type=simple
+WorkingDirectory=$BASE
+Environment=PYTHONPATH=$BASE
+Environment=HOME=/root
+Environment=SDR_AGENT_BASE=$BASE
+Environment=SDR_STATE_DIR=$SHARED
+Environment=SDR_UNIT_ID=$UNIT_ID
+Environment=SDR_MDNS_EXCLUDE_IFACES=int0
+${SDR_API_KEY:+Environment=SDR_API_KEY=$SDR_API_KEY}
+ExecStart=$PYBIN -m uvicorn agent.main:app --host 0.0.0.0 --port $PORT
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
 
-echo "==> Installing systemd units"
-# TODO(recon): if an NI OS update wipes /etc/systemd/system, install these onto the
-# persistent partition and symlink them here instead (or accept re-provision).
-install -m644 "$HERE/deploy/sdr-agent.service"          /etc/systemd/system/sdr-agent.service
-install -m644 "$HERE/deploy/sdr-agent-confirm.service"  /etc/systemd/system/sdr-agent-confirm.service
-install -m644 "$HERE/deploy/sdr-agent-confirm.timer"    /etc/systemd/system/sdr-agent-confirm.timer
-install -m755 "$HERE/deploy/sdr-agent-confirm.sh"       /usr/local/bin/sdr-agent-confirm
-
-echo "==> Writing service env drop-in ($DROPIN/override.conf)"
-# This is where the X410's persistent paths are injected — no code change needed,
-# config.py reads all of these from the environment.
-mkdir -p "$DROPIN"
-{
-    echo "[Service]"
-    # The packaged sdr-agent.service hardcodes /opt/sdr-agent for WorkingDirectory +
-    # PYTHONPATH; a drop-in overrides both so the agent runs from the persistent
-    # release without shipping a separate unit file.
-    printf 'WorkingDirectory=%s\n'              "$BASE"
-    printf 'Environment=PYTHONPATH=%s\n'        "$BASE"
-    # UHD needs $HOME (for ~/.config/uhd) — systemd doesn't set it for services, so
-    # every SDR task the agent spawns would fail with get_xdg_config_home() without
-    # this. Root's home on the X410 is /root.
-    printf 'Environment=HOME=/root\n'
-    printf 'Environment=SDR_AGENT_BASE=%s\n'    "$BASE"
-    printf 'Environment=SDR_STATE_DIR=%s\n'     "$SHARED"
-    printf 'Environment=SDR_RELEASES_DIR=%s\n'  "$RELEASES"
-    printf 'Environment=SDR_CURRENT_LINK=%s\n'  "$BASE"
-    # Never advertise the internal RFSoC management NIC (169.254.0.1) as a unit
-    # address — a client can't reach it and it isn't ours to expose.
-    printf 'Environment=SDR_MDNS_EXCLUDE_IFACES=int0\n'
-    [ -n "${SDR_UNIT_ID:-}" ] && printf 'Environment=SDR_UNIT_ID=%s\n' "$SDR_UNIT_ID"
-    [ -n "${SDR_API_KEY:-}" ] && printf 'Environment=SDR_API_KEY=%s\n' "$SDR_API_KEY"
-} > "$DROPIN/override.conf"
-chmod 600 "$DROPIN/override.conf"
+[Install]
+WantedBy=multi-user.target
+EOF
 
 echo "==> Enabling + starting the agent"
 systemctl daemon-reload
-systemctl enable --now sdr-agent-confirm.timer
 systemctl enable sdr-agent
 systemctl restart sdr-agent
-
-echo "==> Done. Layout:"; ls -l "$BASE"
-echo "    releases: $(ls "$RELEASES" 2>/dev/null | tr '\n' ' ')"
-echo "    state:    $SHARED"
-echo "    verify:   curl -s http://127.0.0.1:8765/info"
+sleep 2
+systemctl --no-pager --lines=0 status sdr-agent | head -4 || true
+echo "==> Health:"; curl -s "http://127.0.0.1:$PORT/health" && echo
+echo "==> Done. Point FleetView at this unit's eth0 address (see deploy/x410/provision_network.sh)."
