@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import socket
 from collections import deque
@@ -87,8 +88,29 @@ def _build_command(command: list, args: list, replace: bool) -> list:
     """Build the launch command. replace=True → [interpreter, script, *args]
     (args are the complete set); replace=False → command + args (append)."""
     if replace and args:
-        return _script_prefix(command) + list(args)
-    return list(command) + list(args)
+        cmd = _script_prefix(command) + list(args)
+    else:
+        cmd = list(command) + list(args)
+    return _resolve_exe(cmd)
+
+
+def _resolve_exe(cmd: list) -> list:
+    """Resolve a bare executable name (no slash) to an absolute path via PATH.
+
+    Default asyncio searches PATH for argv[0], but uvloop/libuv does NOT — so a
+    task command like ['python3', ...] launches fine under plain asyncio yet fails
+    with FileNotFoundError once uvicorn[standard] pulls in uvloop (as on the X410).
+    Resolving here makes both event loops behave identically. A command that
+    already gives a path (contains '/') is left untouched; an unresolved bare name
+    is left as-is so the existing FileNotFoundError still surfaces a clear error."""
+    if not cmd:
+        return cmd
+    exe = cmd[0]
+    if exe and "/" not in exe:
+        resolved = shutil.which(exe)
+        if resolved:
+            return [resolved] + list(cmd[1:])
+    return cmd
 
 
 # ── Event dispatcher (SSE fan-out) ────────────────────────────────────────────

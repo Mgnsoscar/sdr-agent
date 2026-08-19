@@ -16,6 +16,7 @@ would otherwise be missed forever.
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import threading
 from typing import List, Optional
@@ -23,6 +24,14 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 
 SERVICE_TYPE = "_sdragent._tcp.local."
+
+# Interfaces whose addresses must NEVER be advertised — internal/management NICs a
+# client can't (and shouldn't) reach. Comma-separated names in SDR_MDNS_EXCLUDE_IFACES.
+# Empty by default (the Pi units are unaffected); the X410 sets this to "int0" so its
+# internal RFSoC management address (169.254.0.1) is never announced as a unit address.
+def _excluded_ifaces() -> set:
+    raw = os.environ.get("SDR_MDNS_EXCLUDE_IFACES", "")
+    return {n.strip() for n in raw.split(",") if n.strip()}
 
 # How often to re-check the host's addresses (seconds). A change triggers a
 # re-advertise; steady state is just a cheap interface enumeration.
@@ -54,6 +63,21 @@ class MdnsAdvertiser:
         our hostname (or a fragile default-route probe with no internet) yields a
         loopback the client can't use. We enumerate interfaces instead (psutil), so
         the wifi and/or ethernet IP is advertised regardless of internet access."""
+        excluded_ifaces = _excluded_ifaces()
+
+        # Addresses that belong to an excluded interface — filtered from EVERY path
+        # (even the default-route probe), so an internal NIC's address can't slip in.
+        excluded_addrs = set()
+        try:
+            import psutil
+            for name, addrs in psutil.net_if_addrs().items():
+                if name in excluded_ifaces:
+                    for a in addrs:
+                        if a.family == socket.AF_INET and a.address:
+                            excluded_addrs.add(a.address)
+        except Exception:  # noqa: BLE001 — psutil missing or odd platform
+            pass
+
         ips = []
 
         # The primary outbound interface, when there IS a route (put first).
@@ -62,20 +86,23 @@ class MdnsAdvertiser:
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
             s.close()
-            if not ip.startswith("127.") and ip not in ips:
+            if not ip.startswith("127.") and ip not in ips and ip not in excluded_addrs:
                 ips.append(ip)
         except OSError:
             pass
 
         # Every non-loopback IPv4 on any interface (works with no default route,
-        # e.g. a direct ethernet link).
+        # e.g. a direct ethernet link), skipping excluded/internal interfaces.
         try:
             import psutil
-            for addrs in psutil.net_if_addrs().values():
+            for name, addrs in psutil.net_if_addrs().items():
+                if name in excluded_ifaces:
+                    continue
                 for a in addrs:
                     if (a.family == socket.AF_INET and a.address
                             and not a.address.startswith("127.")
-                            and a.address not in ips):
+                            and a.address not in ips
+                            and a.address not in excluded_addrs):
                         ips.append(a.address)
         except Exception:  # noqa: BLE001 — psutil missing or odd platform
             pass

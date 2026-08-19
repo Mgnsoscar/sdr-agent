@@ -79,6 +79,12 @@ AGENT_HOST    = os.environ.get("SDR_AGENT_HOST", "0.0.0.0")
 AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 AGENT_VERSION = "1.0.0"
 
+# The interpreter tasks should launch with, reported to the client so it pre-fills
+# task defaults. "python3" (the default) resolves via PATH at launch — on the X410
+# that's the system python3 with UHD, distinct from the agent's own bundled python.
+# Override with SDR_TASK_INTERPRETER only if tasks need a specific interpreter path.
+TASK_INTERPRETER = os.environ.get("SDR_TASK_INTERPRETER", "python3")
+
 # ── Auth (optional shared secret) ────────────────────────────────────────────
 # Set SDR_API_KEY on both the Pi and your client.  Leave empty to disable auth.
 
