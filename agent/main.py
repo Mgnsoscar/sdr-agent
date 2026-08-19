@@ -683,6 +683,9 @@ def _spec_to_entry(spec: TaskConfig) -> dict:
         "env": _yaml_env(spec.env),
         "autostart": spec.autostart,
         "restart_on_crash": spec.restart_on_crash,
+        # Round-trip the client's library-scope tag; omit when shared (empty) to
+        # keep tasks.yaml clean for the common case.
+        **({"types": list(spec.types)} if spec.types else {}),
     }
 
 
