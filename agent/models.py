@@ -92,8 +92,10 @@ class AgentInfo(BaseModel):
     tasks: list[str]
     previous_version: Optional[str] = None   # rollback target, if a release is installed
     # Where this agent keeps scripts, and the interpreter its tasks should launch
-    # with — so the client can pre-fill task defaults per unit instead of assuming
-    # the Pi layout (X410: /data/sdr-agent/scripts + system python3 for UHD).
+    # with — so the client can pre-fill task defaults per unit. Both the Pi and the
+    # X410 report /opt/sdr-agent/scripts (on the X410 that's a symlink onto its
+    # persistent /data partition), so a task command is portable across unit types;
+    # the interpreter is system python3 (with UHD) on both.
     scripts_dir: str = ""
     task_interpreter: str = "python3"
 

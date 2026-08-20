@@ -40,9 +40,11 @@ cd /data && tar -xzf sdr-x410-bundle.tar.gz
 SDR_UNIT_ID=x410-1 deploy/x410/install.sh
 ```
 `install.sh` extracts the Python to `/data/python`, lays the agent in
-`/data/sdr-agent`, installs the wheels offline into the bundle, writes the systemd
-service (bundled Python + persistent paths + `HOME=/root` for UHD + `int0`
-excluded from mDNS), enables it, and prints `/health`.
+`/data/sdr-agent`, symlinks `/opt/sdr-agent → /data/sdr-agent` so the agent
+presents the **same `/opt/sdr-agent/scripts` path as a Pi** (the real bytes stay
+on the update-surviving `/data`), installs the wheels offline into the bundle,
+writes the systemd service (bundled Python + persistent paths + `HOME=/root` for
+UHD + `int0` excluded from mDNS), enables it, and prints `/health`.
 
 ## Networking (on the X410, as root)
 
@@ -58,8 +60,10 @@ snapshots the original config to `/data/sdr-netsnapshot` first.
 
 ## In FleetView
 Add the unit at its eth0 address (e.g. `169.254.1.1`). New tasks auto-fill the
-right script dir + interpreter from the unit (needs the client's matching build),
-so you don't re-type `/data/sdr-agent/scripts` or the system `python3`.
+script dir + interpreter from the unit (needs the client's matching build), so you
+don't re-type them. The reported script dir is `/opt/sdr-agent/scripts` — identical
+to a Pi — so a **shared** library task (one scoped to both unit types) runs on a
+Pi and an X410 unchanged, even though the X410 keeps the real files on `/data`.
 
 ## Revert (hand-back)
 ```sh
@@ -77,8 +81,10 @@ Footprint is only: the `/data` dirs, one systemd unit, and one networkd file.
 
 ## Caveats
 - A full NI OS *image* update (Mender A/B) replaces the rootfs, wiping
-  `/etc/systemd/system` and the networkd file — re-run `install.sh` +
-  `provision_network.sh` after such an update. Everything under `/data` persists.
+  `/etc/systemd/system`, the networkd file, and the `/opt/sdr-agent` symlink —
+  re-run `install.sh` + `provision_network.sh` after such an update. Everything
+  under `/data` persists (code, scripts, state), so the re-run just re-establishes
+  the rootfs bits and points the service back at them.
 - SDR tasks run under the **system** `python3` (has `uhd`/`numpy`); the agent runs
   under the bundled `/data/python`. The client leaves the task interpreter as
   `python3`, which resolves via PATH to the system one.
