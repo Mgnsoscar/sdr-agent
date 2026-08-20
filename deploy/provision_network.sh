@@ -94,9 +94,13 @@ if [ "$PROV_STATIC" != "1" ]; then
             connection.autoconnect-retries 2 2>/dev/null \
             || echo "    !! could not modify eth0 profile '$ETHCON'"
         # Fallback static link-local profile (create, or update if re-provisioning).
+        # On update, re-assert the FULL intended state — not just the address — so a
+        # profile that ended up as ipv4.method=auto (which chases DHCP and never gives
+        # a stable link-local) converges back to manual on the next provision.
         if nmcli -t -f NAME connection show | grep -qx "eth0-linklocal"; then
             nmcli connection modify eth0-linklocal \
-                ipv4.addresses "$LL" connection.autoconnect-priority 5 2>/dev/null || true
+                ipv4.method manual ipv4.addresses "$LL" ipv6.method link-local \
+                connection.autoconnect yes connection.autoconnect-priority 5 2>/dev/null || true
         else
             nmcli connection add type ethernet ifname eth0 con-name eth0-linklocal \
                 ipv4.method manual ipv4.addresses "$LL" ipv6.method link-local \
