@@ -179,6 +179,14 @@ session, not written to disk in plaintext).
    - Else if `/etc/dhcpcd.conf` is in use → append `interface eth0 / static ip_address=…`
      blocks (and the wlan0 equivalent), keep a backup.
    - Detection is a probe run at the start of provisioning; both writers are small.
+   - **eth0 direct-cable fallback (NetworkManager).** In DHCP mode the provisioner
+     keeps two eth0 profiles: the DHCP profile (`ipv4.method=auto`, higher priority,
+     wins on a router) and `eth0-linklocal` (`ipv4.method=manual`, `169.254.1.N/16`,
+     lower priority) that NM activates when DHCP fails, giving a stable direct-cable
+     address. The link-local profile **must be `ipv4.method=manual`** — `auto` makes
+     it chase DHCP and never hold the address ("holds a while then drops"). Every
+     re-provision re-asserts `method=manual` so a profile that drifted to `auto`
+     converges back.
 6. **Apply last + reboot:** network changes go **last**, then `reboot`. See §4.4.
 7. **Verify:** after the reboot window, the client reconnects at the **new** static
    IP, polls `/info`, and registers the unit (its `unit_id`/`label`).
