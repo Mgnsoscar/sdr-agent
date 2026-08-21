@@ -152,7 +152,8 @@ class SystemHealth(BaseModel):
     load_avg: list[float]              # 1, 5, 15-minute load averages
     utc_now: str = ""                  # Agent's current UTC time (ISO-8601) for clock comparison
     clock_synced: Optional[bool] = None  # True if NTP reports the clock is synchronized
-    clock_source: str = ""             # e.g. "systemd-timesyncd", "chrony", or "" if unknown
+    clock_source: str = ""             # "chrony"/"systemd-timesyncd" (NTP), "manual"
+                                       # (hand-set to the PC clock), or "" if unknown
 
 
 class SdrDevice(BaseModel):
