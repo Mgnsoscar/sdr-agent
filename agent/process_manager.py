@@ -26,6 +26,7 @@ from time import monotonic as _monotonic
 from typing import Deque, Dict, List, Optional
 
 from . import config as _agentcfg   # module import; container methods use a local `cfg`
+from . import calibration as _calib
 from .log_manager import LogManager
 from .models import (
     CrashEvent, ExitRecord, ProcessState, ProcessStatus,
@@ -45,6 +46,39 @@ def _ctrl_sock_path(name: str) -> str:
     and length-capped so it stays under the AF_UNIX ~108-byte limit."""
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:60] or "task"
     return str(_agentcfg.CTRL_DIR / f"{safe}.sock")
+
+
+def _inject_calibration(env: dict, task_name: str) -> None:
+    """If a task opted into power calibration — its env sets SDR_CAL_SIGNAL_ID to
+    the script's CAL_SIGNAL_ID — resolve the unit's calibration for that signal and
+    point the task at a per-run resolved artifact via SDR_CALIBRATION_FILE. Mutates
+    ``env`` in place.
+
+    Fail-safe (docs/calibration.md §8): a task that didn't opt in, or a unit with no
+    calibration document, is a no-op (the script uses its baked defaults). A document
+    that lacks THIS signal is a soft miss — logged, then fall back. A broken or unsafe
+    document raises CalibrationError, which the caller turns into an aborted start
+    ('refuse to transmit')."""
+    signal_id = env.get(_agentcfg.CAL_SIGNAL_ID_ENV)
+    if not signal_id:
+        return                                       # task didn't opt in
+    try:
+        artifact = _calib.resolve_public(
+            _agentcfg.CALIBRATION_DOC, _agentcfg.CALIBRATION_DEFAULTS,
+            signal_id, unit_type=_agentcfg.UNIT_TYPE)
+    except _calib.SignalNotCalibrated as exc:
+        logger.warning("Task '%s': %s — using the script's baked-in calibration "
+                       "defaults", task_name, exc)
+        return
+    if artifact is None:
+        return                                       # no per-unit calibration doc
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", task_name)[:60] or "task"
+    _agentcfg.CAL_RUN_DIR.mkdir(parents=True, exist_ok=True)
+    path = _agentcfg.CAL_RUN_DIR / f"{safe}.json"
+    path.write_text(json.dumps(artifact), encoding="utf-8")
+    env[_agentcfg.CALIBRATION_FILE_ENV] = str(path)
+    logger.info("Task '%s': resolved calibration for signal '%s' → %s",
+                task_name, signal_id, path)
 
 
 def _ctrl_rpc(path: str, req: dict, timeout: float) -> dict:
@@ -228,6 +262,17 @@ class ManagedProcess:
         # Force unbuffered output so both streams flush live. A task that really
         # wants buffering can still override this in its env.
         env.setdefault("PYTHONUNBUFFERED", "1")
+
+        # Resolve per-unit power calibration for this task (if it opted in). A hard,
+        # unsafe calibration error aborts the start — refuse to transmit rather than
+        # risk over-driving; a soft miss falls back to the script's baked defaults.
+        try:
+            _inject_calibration(env, self.config.name)
+        except _calib.CalibrationError as exc:
+            self.state = ProcessState.STOPPED
+            raise RuntimeError(
+                f"Refusing to start '{self.config.name}': calibration error: {exc}"
+            ) from exc
 
         # Provision a control socket for live-parameter tuning. paramkit.live binds
         # it iff the script declares live params and calls script.live_control();

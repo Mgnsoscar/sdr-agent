@@ -113,6 +113,35 @@ class ResolvedCalibration:
         q = self.operating_quantity or "power"
         return f"{q}, at {self.operating_plane}"
 
+    def operating_curve(self) -> list[list[float]]:
+        """The operating-plane transfer as a flat, gain-sorted ``[[gain, power], …]``
+        table at the anchor's measured breakpoints (derived hops folded in). This is
+        the whole mapping a script needs to convert --power ↔ gain at runtime — it
+        can linearly interpolate/invert this directly, no plane model required."""
+        _, anchor = _anchor(self.operating_plane, self._planes)
+        return [[g, _power_on(self.operating_plane, g, self._planes)]
+                for g in anchor.gains]
+
+    def to_public_dict(self) -> dict:
+        """The resolved artifact the agent writes for a task to consume. Everything
+        a script needs and nothing about planes: the flattened operating curve, the
+        gain clamps, the amplitude the curves were measured at, and the quantity
+        label for the banner. A single-point curve here means the reader applies the
+        same slope-1 fallback the resolver does."""
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "signal_id": self.signal_id,
+            "unit_type": self.unit_type,
+            "operating_plane": self.operating_plane,
+            "quantity": self.operating_quantity,
+            "amplitude": self.amplitude,
+            "min_gain_db": self.min_gain_db,
+            "max_gain_db": self.max_gain_db,
+            "min_power_dbm": self.min_power_dbm,
+            "max_power_dbm": self.max_power_dbm,
+            "curve": self.operating_curve(),
+        }
+
 
 # ── Linear interpolation (pure python — the agent has no numpy dependency) ───────
 
@@ -432,3 +461,22 @@ def resolve_from_files(unit_path, defaults_path, signal_id: str) -> Optional[Res
     unit_type = unit_doc.get("unit_type", "")
     type_defaults = load_type_defaults(defaults_path, unit_type) if unit_type else None
     return resolve(unit_doc, type_defaults, signal_id)
+
+
+def resolve_public(unit_path, defaults_path, signal_id: str,
+                   unit_type: str = "") -> Optional[dict]:
+    """Resolve to the flat public artifact (:meth:`ResolvedCalibration.to_public_dict`)
+    the agent injects into a task, or None if there's no per-unit document at all.
+
+    ``unit_type`` (the agent's runtime identity) takes precedence over the doc's own
+    ``unit_type`` for selecting the type-defaults layer; if empty the doc's value is
+    used. Propagates SignalNotCalibrated / CalibrationError so the caller can tell
+    'fall back' from 'refuse'."""
+    unit_doc = load_unit_doc(unit_path)
+    if unit_doc is None:
+        return None
+    ut = unit_type or unit_doc.get("unit_type", "")
+    if ut and not unit_doc.get("unit_type"):
+        unit_doc = {**unit_doc, "unit_type": ut}      # so the artifact reports it
+    type_defaults = load_type_defaults(defaults_path, ut) if ut else None
+    return resolve(unit_doc, type_defaults, signal_id).to_public_dict()

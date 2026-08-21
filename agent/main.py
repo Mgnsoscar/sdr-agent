@@ -233,6 +233,7 @@ async def info(manager: ProcessManager = Depends(get_manager)):
         hostname       = cfg.HOSTNAME,
         unit_id        = cfg.UNIT_ID,
         machine_id     = cfg.MACHINE_ID,
+        unit_type      = cfg.UNIT_TYPE,
         agent_version  = cfg.AGENT_VERSION,
         python_version = platform.python_version(),
         tasks          = manager.task_names(),

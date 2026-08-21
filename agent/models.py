@@ -87,6 +87,8 @@ class AgentInfo(BaseModel):
     hostname: str
     unit_id: str                       # From config or hostname fallback
     machine_id: str = ""               # stable per-machine id (/etc/machine-id)
+    unit_type: str = ""                # this unit's kind (e.g. "broadcaster"); selects
+                                       # the calibration type-defaults layer
     agent_version: str
     python_version: str
     tasks: list[str]

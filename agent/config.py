@@ -33,6 +33,22 @@ SCHEDULE_FILE = Path(os.environ.get("SDR_SCHEDULE_FILE", STATE_DIR / "configs" /
 # ephemeral runtime state, not saved config.
 CTRL_DIR   = Path(os.environ.get("SDR_CTRL_DIR", STATE_DIR / "run" / "ctl"))
 
+# ── Power calibration (see docs/calibration.md) ───────────────────────────────
+# The per-unit calibration document (this box's measured curves) and the shared,
+# type-keyed defaults it merges over. Both live in configs/ with the other state.
+# CAL_RUN_DIR holds the ephemeral per-task RESOLVED artifact the agent injects.
+CALIBRATION_DOC      = Path(os.environ.get("SDR_CALIBRATION_DOC",
+                                           STATE_DIR / "configs" / "calibration.json"))
+CALIBRATION_DEFAULTS = Path(os.environ.get("SDR_CALIBRATION_DEFAULTS",
+                                           STATE_DIR / "configs" / "calibration_defaults.yaml"))
+CAL_RUN_DIR          = Path(os.environ.get("SDR_CAL_RUN_DIR", STATE_DIR / "run" / "cal"))
+# A task opts into calibration by setting this env to its script's CAL_SIGNAL_ID.
+# When present (and a calibration doc exists) the agent resolves it and points the
+# task at the resolved artifact via CALIBRATION_FILE_ENV; the script reads that and
+# maps --power (dBm) → gain, falling back to its baked defaults if the var is absent.
+CAL_SIGNAL_ID_ENV    = "SDR_CAL_SIGNAL_ID"
+CALIBRATION_FILE_ENV = "SDR_CALIBRATION_FILE"
+
 # ── OTA update layout ─────────────────────────────────────────────────────────
 # Release dirs live under RELEASES_DIR as <version>/ (the code), and BASE_DIR is a
 # symlink to the active one that the updater flips atomically. OTA markers live in
@@ -54,6 +70,10 @@ UPDATE_HEALTH_GRACE_S = float(os.environ.get("SDR_UPDATE_HEALTH_GRACE_S", "90"))
 import socket
 HOSTNAME   = socket.gethostname()
 UNIT_ID    = os.environ.get("SDR_UNIT_ID", HOSTNAME)
+# This unit's kind (e.g. "broadcaster"). Selects the calibration type-defaults
+# layer (docs/calibration.md §7.1). Empty = no type layer; the per-unit doc stands
+# alone. The agent itself is type-agnostic — this is just data it reads.
+UNIT_TYPE  = os.environ.get("SDR_UNIT_TYPE", "")
 
 
 def machine_id() -> str:

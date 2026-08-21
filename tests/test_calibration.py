@@ -300,6 +300,22 @@ def test_single_point_curve_uses_slope_one_fallback():
     assert r.max_gain_db == pytest.approx(73.5)
 
 
+# ── Public artifact (what the agent injects) ─────────────────────────────────────
+
+def test_to_public_dict_flattens_operating_curve():
+    r = _resolve()
+    d = r.to_public_dict()
+    assert d["operating_plane"] == "antenna_eirp"
+    assert d["quantity"] == "EIRP"
+    assert d["max_gain_db"] == pytest.approx(74.0)
+    # curve is the operating-plane transfer at the anchor breakpoints, derived
+    # offset (+4.2) folded in: gains from AMP_POINTS, powers shifted.
+    gains = [g for g, _ in d["curve"]]
+    assert gains == [40.0, 50.0, 60.0, 70.0, 74.0]
+    assert d["curve"][2] == [60.0, pytest.approx(14.0 + NET_ANTENNA_OFFSET)]
+    assert d["max_power_dbm"] == pytest.approx(24.0 + NET_ANTENNA_OFFSET)
+
+
 # ── File loaders ─────────────────────────────────────────────────────────────────
 
 def test_resolve_from_files_json_unit_and_yaml_defaults(tmp_path):
