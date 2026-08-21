@@ -536,7 +536,9 @@ resolver duplicated across repos.
 - The artifact is the operating-plane curve pre-flattened (derived hops folded in):
   `{ curve: [[gain, power], …], min_gain_db, max_gain_db, amplitude, quantity,
   operating_plane, … }`.
-- The script uses `calkit.PowerMap` (shared, in the sdr-scripts repo):
+- The script uses `PowerMap` from **paramkit** (`from paramkit import PowerMap`;
+  the calibration consumer lives in `paramkit/calkit.py` so it ships with paramkit on
+  `PYTHONPATH=/opt/sdr-agent` and is importable on every unit, no extra deploy step):
   `PowerMap.load(baked)` returns the artifact-backed map when `SDR_CALIBRATION_FILE`
   is set, else a `from_linear` map built from the baked constants that is byte-
   identical to the old single-anchor behaviour. `--power` ↔ gain both route through
