@@ -136,12 +136,31 @@ tightest wins.
 
 ## 5. The format (annotated)
 
-One document per unit, e.g. `calibration.json` in the unit's data area (§9).
+The calibration is split into two parts that live at different scopes, because they
+change at different rates:
+
+- **`chain`** — the RF cascade: plane topology, derived planes (cable loss, antenna
+  gain), quantities, `operating_plane`, gain limits, and the limit *thresholds*.
+  These are **unit hardware**, so they're stated **once per unit** (merged over the
+  unit-type defaults, §7.1). The amplifier/cable/antenna are never restated per
+  signal.
+- **`signals[…].curves`** — the measured `points` that populate the measured planes,
+  plus `amplitude` and `occupied_bw_hz`. These are the only genuinely per-signal
+  facts (the curve shape depends on the signal's spectrum, crest factor, and
+  amplitude).
+
+The per-signal ceiling is *derived*, not stated: a unit-level limit like "SDR-port
+total-in-band ≤ −2.5 dBm" (the amp's P1dB input, constant across signals) resolves
+to a different gain cap for each signal by inverting *that signal's* `sdr_output`
+curve against the shared threshold.
+
+### 5.1 Per-unit document (`calibration.json`)
 
 ```jsonc
 {
   "schema_version": 1,
   "unit_id": "unit_9841f459",              // detects a misplaced file
+  "unit_type": "broadcaster",              // selects the type-defaults layer (§7.1)
   "meta": {
     "measured_by": "magnus",
     "measured_at": "2026-08-21T14:00:00Z",
@@ -149,29 +168,43 @@ One document per unit, e.g. `calibration.json` in the unit's data area (§9).
     "notes": "B206-mini + ZVE-8G amp"
   },
 
-  "defaults": {                            // unit-wide, per-signal may override
-    "hw_gain_limits": { "min_gain_db": 0.0, "max_gain_db": 89.75 }
+  // ── RF chain: this unit's HARDWARE, stated once (merges over type defaults) ──
+  "chain": {
+    "gain_limits": { "min_gain_db": 0.0, "max_gain_db": 89.75 },
+    "operating_plane": "antenna_eirp",     // what --power means; "sdr_output" pre-amp-pass
+    "limits": [
+      { "plane": "sdr_output", "max_dbm": -2.5, "reason": "amp P1dB input" }
+    ],
+    "planes": {
+      "sdr_output": {
+        "type": "measured", "quantity": "total in-band power",
+        "description": "Amp DISCONNECTED; integrated at the SDR port."
+        // NOTE: no points here — the curve is per-signal (§5.2)
+      },
+      "amplifier_output": {
+        "type": "measured", "quantity": "main-lobe power",
+        "description": "Amp CONNECTED; at the amplifier output."
+      },
+      "cable_output": {
+        "type": "derived", "from": "amplifier_output", "delta_db": -1.8,
+        "description": "3 m LMR-240 to the antenna"
+      },
+      "antenna_eirp": {
+        "type": "derived", "from": "cable_output", "delta_db": 6.0,
+        "quantity": "EIRP", "description": "6 dBi patch"
+      }
+    }
   },
 
+  // ── per-signal: ONLY the measurements that fill the measured planes ──
+  "defaults": { "amplitude": 0.8 },        // unit-wide; a signal may override
   "signals": {
     "gps_l1_mcode": {
-      "amplitude": 0.8,                    // baseband amplitude the curves were measured at
+      "amplitude": 0.8,                    // amplitude the curves were measured at
       "occupied_bw_hz": 40920000,          // integration BW (metadata)
-      "gain_limits": { "min_gain_db": 0.0, "max_gain_db": 89.75 },
-
-      "limits": [
-        { "plane": "sdr_output", "max_dbm": -2.5, "reason": "amp P1dB input" }
-      ],
-
-      "operating_plane": "antenna_eirp",   // what --power means; use "sdr_output" pre-amp-pass
-
-      "planes": {
+      "curves": {
         "sdr_output": {
-          "type": "measured",
-          "quantity": "total in-band power",
-          "description": "Amp DISCONNECTED. Integrated over the 40.92 MHz band at the SDR port.",
-          "interp": "linear",
-          "offset_db": 0.0,
+          "interp": "linear", "offset_db": 0.0,
           "points": [
             { "gain_db": 74.0, "power_dbm":  -2.5 },
             { "gain_db": 70.0, "power_dbm":  -6.3 },
@@ -181,25 +214,8 @@ One document per unit, e.g. `calibration.json` in the unit's data area (§9).
           ]
         },
         "amplifier_output": {
-          "type": "measured",
-          "quantity": "main-lobe power",
-          "description": "Amp CONNECTED. Peak main-lobe power at the amplifier output.",
-          "interp": "linear",
-          "offset_db": 0.0,
-          "points": []                     // filled by the operation pass
-        },
-        "cable_output": {
-          "type": "derived",
-          "from": "amplifier_output",
-          "delta_db": -1.8,
-          "description": "3 m LMR-240 to the antenna"
-        },
-        "antenna_eirp": {
-          "type": "derived",
-          "from": "cable_output",
-          "delta_db": 6.0,
-          "quantity": "EIRP",
-          "description": "6 dBi patch"
+          "interp": "linear", "offset_db": 0.0,
+          "points": []                     // filled by the amp-connected pass
         }
       }
     }
@@ -207,30 +223,65 @@ One document per unit, e.g. `calibration.json` in the unit's data area (§9).
 }
 ```
 
-A single-point measured curve is legal: with one point the reader falls back to a
-slope-1 assumption, so this is a strict superset of today's constants and migration
-never breaks.
+`curves` keys must name **measured** planes from `chain.planes`; derived planes take
+no curve. A single-point measured curve is legal — with one point the reader falls
+back to a slope-1 assumption, so this is a strict superset of today's constants and
+migration never breaks.
+
+### 5.2 Shared unit-type defaults (`calibration_defaults.yaml`, keyed by type)
+
+Lives in the shared configs dir beside `tasks.yaml`; every unit reads it and picks
+its own type. Adding a type is a **data** change — no agent code (§7.1).
+
+```jsonc
+{
+  "schema_version": 1,
+  "types": {
+    "broadcaster": {
+      "chain": {
+        "gain_limits": { "min_gain_db": 0.0, "max_gain_db": 89.75 },
+        "operating_plane": "sdr_output",   // conservative until the amp pass is done
+        "limits": [
+          { "plane": "sdr_output", "max_dbm": -2.5, "reason": "amp P1dB input (nominal)" }
+        ],
+        "planes": {
+          "sdr_output":       { "type": "measured", "quantity": "total in-band power" },
+          "amplifier_output": { "type": "measured", "quantity": "main-lobe power" }
+        }
+      },
+      "defaults": { "amplitude": 0.8 }
+    }
+    // "sensor": { ... }   ← added later; the agent code never changes
+  }
+}
+```
+
+A unit inherits this skeleton and overrides only what differs — its real cable/
+antenna planes, its measured limit, its `operating_plane` once the amp is measured.
 
 ---
 
 ## 6. Formal schema (JSON Schema, draft 2020-12, trimmed)
 
+This is the schema for a **per-unit document**; the shared type-defaults file is the
+same `chain` / `defaults` shapes wrapped in `{ "types": { <type>: {…} } }`, all
+fields optional (it only supplies defaults). Note that in the per-unit file the
+`chain` planes carry **no** `points` — the curve is supplied per signal under
+`signals[…].curves` and merged into the measured planes at resolve time (§7).
+
 ```jsonc
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["schema_version", "signals"],
+  "required": ["schema_version", "chain", "signals"],
   "additionalProperties": false,
   "properties": {
     "schema_version": { "const": 1 },
-    "unit_id": { "type": "string" },
-    "meta": { "type": "object" },
-    "defaults": {
-      "type": "object",
-      "properties": {
-        "hw_gain_limits": { "$ref": "#/$defs/gain_limits" }
-      }
-    },
+    "unit_id":   { "type": "string" },
+    "unit_type": { "type": "string" },
+    "meta":      { "type": "object" },
+    "defaults":  { "type": "object", "properties": { "amplitude": { "$ref": "#/$defs/amplitude" } } },
+    "chain":     { "$ref": "#/$defs/chain" },
     "signals": {
       "type": "object",
       "minProperties": 1,
@@ -239,6 +290,7 @@ never breaks.
   },
 
   "$defs": {
+    "amplitude":   { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
     "gain_limits": {
       "type": "object",
       "properties": {
@@ -255,19 +307,27 @@ never breaks.
         "power_dbm": { "type": "number" }
       }
     },
-    "plane": {
+    "limit": {
+      "type": "object",
+      "required": ["plane", "max_dbm"],
+      "additionalProperties": false,
+      "properties": {
+        "plane":   { "type": "string" },
+        "max_dbm": { "type": "number" },
+        "reason":  { "type": "string" }
+      }
+    },
+
+    "plane": {                                   // chain topology — no points here
       "oneOf": [
         {
           "type": "object",
-          "required": ["type", "points"],
+          "required": ["type"],
           "additionalProperties": false,
           "properties": {
             "type":        { "const": "measured" },
             "quantity":    { "type": "string" },
-            "description": { "type": "string" },
-            "interp":      { "enum": ["linear"] },
-            "offset_db":   { "type": "number" },
-            "points":      { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/point" } }
+            "description": { "type": "string" }
           }
         },
         {
@@ -284,30 +344,43 @@ never breaks.
         }
       ]
     },
-    "limit": {
+    "chain": {
       "type": "object",
-      "required": ["plane", "max_dbm"],
+      "required": ["planes", "operating_plane"],
       "additionalProperties": false,
       "properties": {
-        "plane":   { "type": "string" },
-        "max_dbm": { "type": "number" },
-        "reason":  { "type": "string" }
-      }
-    },
-    "signal": {
-      "type": "object",
-      "required": ["amplitude", "operating_plane", "planes"],
-      "additionalProperties": false,
-      "properties": {
-        "amplitude":       { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
-        "occupied_bw_hz":  { "type": "number", "exclusiveMinimum": 0 },
         "gain_limits":     { "$ref": "#/$defs/gain_limits" },
-        "limits":          { "type": "array", "items": { "$ref": "#/$defs/limit" } },
         "operating_plane": { "type": "string" },
+        "limits":          { "type": "array", "items": { "$ref": "#/$defs/limit" } },
         "planes": {
           "type": "object",
           "minProperties": 1,
           "additionalProperties": { "$ref": "#/$defs/plane" }
+        }
+      }
+    },
+
+    "curve": {                                   // per-signal measurement for one measured plane
+      "type": "object",
+      "required": ["points"],
+      "additionalProperties": false,
+      "properties": {
+        "interp":    { "enum": ["linear"] },
+        "offset_db": { "type": "number" },
+        "points":    { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/point" } }
+      }
+    },
+    "signal": {
+      "type": "object",
+      "required": ["curves"],
+      "additionalProperties": false,
+      "properties": {
+        "amplitude":      { "$ref": "#/$defs/amplitude" },
+        "occupied_bw_hz": { "type": "number", "exclusiveMinimum": 0 },
+        "curves": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/$defs/curve" }   // key = a measured plane name
         }
       }
     }
@@ -315,17 +388,20 @@ never breaks.
 }
 ```
 
-**Load-time validations JSON Schema can't express (all hard errors):**
+**Load-time validations JSON Schema can't express (all hard errors), checked on the
+*assembled* `(chain ⊕ curves)` doc:**
 
-- every measured plane's `points` are strictly increasing in **both** `gain_db` and
-  `power_dbm` (monotonic → invertible);
+- every `curves` key names a **measured** plane declared in `chain.planes`;
+- every measured plane's supplied `points` are strictly increasing in **both**
+  `gain_db` and `power_dbm` (monotonic → invertible);
 - every `from` and every `limits[].plane` / `operating_plane` names a plane that
   exists; the `from` graph is acyclic and every derived chain ends at a measured
   plane;
-- at least one ceiling is derivable (`limits` non-empty **or** an explicit
+- at least one ceiling is derivable (`chain.limits` non-empty **or** an explicit
   `max_gain_db`);
-- `operating_plane` resolves to a plane with a usable transfer (a measured plane, or
-  a derived chain ending in one with ≥1 point).
+- `operating_plane` resolves to a plane with a usable transfer for this signal (a
+  measured plane the signal supplied ≥1 point for, or a derived chain ending in
+  one).
 
 ---
 
@@ -333,30 +409,51 @@ never breaks.
 
 ### 7.1 Layered merge (most specific wins)
 
-The document the resolver evaluates is the merge of, in increasing precedence:
+Resolution has two axes. First the **chain** is merged across scopes; then the
+signal's **curves** are attached to the merged chain's measured planes.
+
+**Chain merge**, in increasing precedence:
 
 ```
-script baked-in defaults      (safe, conservative — today's constants)
-  └─ unit-type defaults        (all Broadcasters share amp model X)
-       └─ per-unit overrides    (this box's measured curves)
-            └─ per-(unit×signal) (the empirical measurement)
+script baked-in defaults          (safe, conservative — today's constants)
+  └─ unit-type defaults            (calibration_defaults.yaml → types[unit_type].chain)
+       └─ per-unit chain           (this box's real cable/antenna/limits/operating_plane)
 ```
 
-Merge is per-key deep-merge; a more specific layer replaces scalars and whole
-`points` arrays (curves are never element-wise merged).
+- The **unit-type layer is data, not code.** The agent reads the shared
+  `calibration_defaults.yaml`, selects `types[self.unit_type]`, and merges the
+  per-unit file's `chain` on top. A new unit type is a new section in that file —
+  **the agent binary is identical for every type**, so there's never a per-type PR.
+- Merge is per-key deep-merge; a more specific layer replaces scalars and whole
+  arrays (a `points` array or a `limits` list is never element-wise merged).
+
+**Curve attachment (per signal):** for the requested `signal`, each entry in
+`signals[sig].curves` is written into the matching measured plane of the merged
+chain, producing the fully-assembled doc the runtime evaluates. `amplitude` resolves
+as `signals[sig].amplitude` ?? `defaults.amplitude`. The passive planes
+(amp/cable/antenna topology) are stated once in `chain` and reused by every signal;
+only the measured curves vary — so adding a signal never restates hardware.
+
+A measured plane with no curve for this signal stays *latent*: fine unless the
+`operating_plane` or a `limits[].plane` needs it, in which case resolution refuses
+(§8).
 
 ### 7.2 Ceiling
 
+`chain`, `planes`, and the signal's populated curves come from the assembled doc
+(§7.1). Limits and gain bounds live on the **chain** (unit hardware), but each
+limit's gain cap is computed against *this signal's* curves:
+
 ```python
-def resolve_max_gain(sig, planes, hw):
+def resolve_max_gain(chain, planes):
     candidates = []
-    if sig.gain_limits.max_gain_db is not None:
-        candidates.append(sig.gain_limits.max_gain_db)
-    for lim in sig.limits:                       # each limit -> a gain
+    if chain.gain_limits.max_gain_db is not None:
+        candidates.append(chain.gain_limits.max_gain_db)
+    for lim in chain.limits:                      # each limit -> a gain, via this signal's curve
         candidates.append(gain_for_power_on(lim.max_dbm, lim.plane, planes))
     if not candidates:
         refuse("no safety ceiling — refusing to transmit")   # MANDATORY
-    return min(min(candidates), hw.max_gain_db)
+    return min(candidates)                         # hardware max already folded into gain_limits
 ```
 
 ### 7.3 Plane power & inversion
@@ -385,9 +482,9 @@ def gain_for_power_on(power, plane_name, planes):
 ### 7.4 The two script-facing functions
 
 ```python
-gmin = sig.gain_limits.min_gain_db          # can't command below this
-gmax = resolve_max_gain(sig, planes, hw)    # safety ceiling
-op   = sig.operating_plane
+gmin = chain.gain_limits.min_gain_db        # can't command below this
+gmax = resolve_max_gain(chain, planes)      # safety ceiling (uses this signal's curves)
+op   = chain.operating_plane
 
 def power_for_gain(g):                       # readout for the banner/report
     return power_on(op, min(max(g, gmin), gmax), planes)
@@ -458,8 +555,9 @@ not the only one. Proposed shape:
 
 - **Curve interpolation** is `linear` only for now; the `interp` enum leaves room
   for a monotone spline later if linear segments prove too coarse between points.
-- **Unit-type layer** (§7.1) needs a home — likely a shared config keyed by unit
-  type, merged under the per-unit file.
+- **`broadcaster` type defaults** (§5.2) are the only section defined initially;
+  other unit types are added to `calibration_defaults.yaml` as they're calibrated —
+  no agent change (§7.1).
 - **EIRP quantity/units** — `power_dbm` assumes dBm throughout; if EIRP is ever
   wanted in dBW or as ERP, that's a per-plane unit tag, not a structural change.
 - **FleetView editor** — the file/upload store (§9.2) is the foundation; a
