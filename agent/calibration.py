@@ -285,6 +285,46 @@ def resolve(unit_doc: dict,
         _planes=planes)
 
 
+def validate_document(unit_doc: dict, type_defaults: Optional[dict] = None) -> dict:
+    """Structural validation of a WHOLE calibration document, as it would resolve at
+    runtime — for validate-on-upload (docs/calibration.md §9.2).
+
+    Runs :func:`resolve` for every signal in the document (so every measured curve,
+    every plane reference, the ceiling, and the operating plane are checked exactly
+    as at transmit time) and raises :class:`CalibrationError` on any document-level
+    defect or any invalid signal. On success returns a per-signal summary dict:
+    ``{signal_id: {operating_plane, quantity, min/max gain & power}}`` — handy for a
+    UI to show what each signal resolved to.
+    """
+    if not isinstance(unit_doc, dict):
+        raise CalibrationError("calibration document is not an object")
+    if unit_doc.get("schema_version") != SCHEMA_VERSION:
+        raise CalibrationError(
+            f"unsupported schema_version {unit_doc.get('schema_version')!r} "
+            f"(expected {SCHEMA_VERSION})")
+    signals = unit_doc.get("signals")
+    if not isinstance(signals, dict) or not signals:
+        raise CalibrationError("document has no signals")
+
+    summary, bad = {}, {}
+    for sig_id in signals:
+        try:
+            r = resolve(unit_doc, type_defaults, sig_id)
+            summary[sig_id] = {
+                "operating_plane": r.operating_plane,
+                "quantity": r.operating_quantity,
+                "amplitude": r.amplitude,
+                "min_gain_db": r.min_gain_db, "max_gain_db": r.max_gain_db,
+                "min_power_dbm": r.min_power_dbm, "max_power_dbm": r.max_power_dbm,
+            }
+        except CalibrationError as exc:
+            bad[sig_id] = str(exc)
+    if bad:
+        raise CalibrationError(
+            "invalid signal(s): " + "; ".join(f"{k} ({v})" for k, v in bad.items()))
+    return summary
+
+
 def _build_planes(planes_spec: dict, curves: dict, signal_id: str) -> dict:
     """Turn the chain's plane specs (topology, no points) plus the signal's curves
     into resolved _Measured / _Derived objects."""

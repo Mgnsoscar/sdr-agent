@@ -33,12 +33,20 @@ SCHEDULE_FILE = Path(os.environ.get("SDR_SCHEDULE_FILE", STATE_DIR / "configs" /
 # ephemeral runtime state, not saved config.
 CTRL_DIR   = Path(os.environ.get("SDR_CTRL_DIR", STATE_DIR / "run" / "ctl"))
 
+# ── Per-unit data store ───────────────────────────────────────────────────────
+# A per-unit area for arbitrary unit-specific files (calibration is the first
+# tenant; see docs/calibration.md §9.2). Distinct from configs/ (fleet-managed
+# state) and scripts/ (code). Uploaded via the /files API, validated per known kind.
+DATA_DIR   = Path(os.environ.get("SDR_DATA_DIR", STATE_DIR / "data"))
+
 # ── Power calibration (see docs/calibration.md) ───────────────────────────────
-# The per-unit calibration document (this box's measured curves) and the shared,
-# type-keyed defaults it merges over. Both live in configs/ with the other state.
-# CAL_RUN_DIR holds the ephemeral per-task RESOLVED artifact the agent injects.
+# The per-unit calibration document (this box's measured curves) lives in the data
+# store; the shared, type-keyed defaults it merges over live in configs/ (they're
+# fleet state, not per-unit). CAL_RUN_DIR holds the ephemeral per-task RESOLVED
+# artifact the agent injects.
+CALIBRATION_NAME     = "calibration.json"      # reserved, validated name in DATA_DIR
 CALIBRATION_DOC      = Path(os.environ.get("SDR_CALIBRATION_DOC",
-                                           STATE_DIR / "configs" / "calibration.json"))
+                                           DATA_DIR / CALIBRATION_NAME))
 CALIBRATION_DEFAULTS = Path(os.environ.get("SDR_CALIBRATION_DEFAULTS",
                                            STATE_DIR / "configs" / "calibration_defaults.yaml"))
 CAL_RUN_DIR          = Path(os.environ.get("SDR_CAL_RUN_DIR", STATE_DIR / "run" / "cal"))

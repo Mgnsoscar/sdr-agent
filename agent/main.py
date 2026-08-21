@@ -81,6 +81,7 @@ from .models import (
     TaskConfig, UpdateResult,
 )
 from .updater import Updater, UpdateError
+from . import calibration as _calib
 from .client_state import ClientStateStore
 from .argspec import extract_params
 from .process_manager import ProcessManager
@@ -575,6 +576,140 @@ async def delete_script(name: str):
         raise HTTPException(status_code=500, detail=f"Failed to delete file: {exc}")
     logger.info("Script deleted: %s", name)
     return {"deleted": name}
+
+
+# ── Per-unit data store (docs/calibration.md §9.2) ────────────────────────────
+# A per-unit area for arbitrary unit-specific files. Calibration is the first
+# validated tenant: uploading calibration.json runs the full resolver checks so a
+# broken document is rejected here, not at transmit. Other files are stored as-is
+# (data only — executable kinds are refused; nothing here is ever executed).
+
+_MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+_DENY_EXT = {".py", ".pyc", ".pyo", ".sh", ".bash", ".zsh", ".exe", ".so",
+             ".dll", ".dylib", ".bat", ".cmd", ".ps1", ".rb", ".pl", ".php"}
+
+
+def _safe_data_path(name: str):
+    """Resolve a data-store filename to a path inside DATA_DIR, rejecting traversal."""
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return cfg.DATA_DIR / name
+
+
+def _validate_calibration_upload(content: bytes) -> dict:
+    """Full validate-on-upload for calibration.json: parse, merge the unit's type
+    defaults, and run the resolver's checks for every signal. Raises HTTPException
+    400 with a specific reason on any defect. Returns the per-signal summary."""
+    import json
+    try:
+        doc = json.loads(content.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400,
+                            detail=f"{cfg.CALIBRATION_NAME} is not valid JSON: {exc}")
+    try:
+        td = (_calib.load_type_defaults(cfg.CALIBRATION_DEFAULTS, cfg.UNIT_TYPE)
+              if cfg.UNIT_TYPE else None)
+        return _calib.validate_document(doc, td)
+    except _calib.CalibrationError as exc:
+        raise HTTPException(status_code=400,
+                            detail=f"{cfg.CALIBRATION_NAME} is invalid: {exc}")
+
+
+@app.post("/files", tags=["files"], dependencies=[Depends(verify_key)])
+async def upload_file(file: UploadFile = File(...)):
+    """Upload a unit-specific data file into the per-unit store. `calibration.json`
+    is validated before it is saved (a broken document is rejected, not persisted)."""
+    name = file.filename or ""
+    _safe_data_path(name)                                    # reject traversal
+    ext = os.path.splitext(name)[1].lower()
+    if ext in _DENY_EXT:
+        raise HTTPException(status_code=400,
+                            detail=f"Executable files are not accepted ({ext})")
+    content = await file.read()
+    if len(content) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File too large (max 5 MiB)")
+
+    # Validate known kinds BEFORE writing, so a bad calibration never lands on disk.
+    summary = _validate_calibration_upload(content) if name == cfg.CALIBRATION_NAME else None
+
+    try:
+        cfg.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        (cfg.DATA_DIR / name).write_bytes(content)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {exc}")
+
+    logger.info("Data file uploaded: %s (%d bytes)", name, len(content))
+    resp = {"saved": name, "size": len(content)}
+    if summary is not None:
+        resp["calibration"] = summary                        # per-signal resolved bounds
+    return resp
+
+
+@app.get("/files", tags=["files"], dependencies=[Depends(verify_key)])
+async def list_files():
+    """List files in the per-unit data store (name, size, modified time)."""
+    from datetime import datetime, timezone
+    d = cfg.DATA_DIR
+    if not d.is_dir():
+        return []
+    out = []
+    for p in sorted(d.iterdir()):
+        if p.is_file():
+            st = p.stat()
+            out.append({"name": p.name, "size": st.st_size,
+                        "modified": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()})
+    return out
+
+
+@app.get("/files/{name}", tags=["files"], dependencies=[Depends(verify_key)])
+async def get_file(name: str):
+    """Return the contents of a file in the per-unit data store."""
+    path = _safe_data_path(name)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"No such file: {name}")
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read file: {exc}")
+    return {"name": name, "content": content, "size": path.stat().st_size}
+
+
+@app.delete("/files/{name}", tags=["files"], dependencies=[Depends(verify_key)])
+async def delete_file(name: str):
+    """Delete a file from the per-unit data store."""
+    path = _safe_data_path(name)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"No such file: {name}")
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to delete file: {exc}")
+    logger.info("Data file deleted: %s", name)
+    return {"deleted": name}
+
+
+@app.get("/calibration", tags=["files"], dependencies=[Depends(verify_key)])
+async def get_calibration():
+    """Convenience view of this unit's calibration: the stored document plus what it
+    resolves to per signal (for a FleetView panel). 404 if the unit isn't calibrated."""
+    import json
+    path = cfg.CALIBRATION_DOC
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="No calibration document for this unit")
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        return {"unit_type": cfg.UNIT_TYPE, "valid": False,
+                "error": f"stored calibration.json is not valid JSON: {exc}"}
+    try:
+        td = (_calib.load_type_defaults(cfg.CALIBRATION_DEFAULTS, cfg.UNIT_TYPE)
+              if cfg.UNIT_TYPE else None)
+        summary = _calib.validate_document(doc, td)
+    except _calib.CalibrationError as exc:
+        return {"unit_type": cfg.UNIT_TYPE, "document": doc, "valid": False,
+                "error": str(exc)}
+    return {"unit_type": cfg.UNIT_TYPE, "document": doc, "valid": True,
+            "signals": summary}
 
 
 @app.get("/scripts/{name}/params", tags=["scripts"], dependencies=[Depends(verify_key)])

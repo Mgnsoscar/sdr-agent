@@ -316,6 +316,49 @@ def test_to_public_dict_flattens_operating_curve():
     assert d["max_power_dbm"] == pytest.approx(24.0 + NET_ANTENNA_OFFSET)
 
 
+# ── Whole-document validation (validate-on-upload) ───────────────────────────────
+
+def test_validate_document_reports_all_signals():
+    from agent.calibration import validate_document
+    doc = _doc()
+    doc["signals"]["cw"] = {"occupied_bw_hz": 1000, "curves": {
+        "sdr_output": {"points": _pts(SDR_POINTS)},
+        "amplifier_output": {"points": _pts(AMP_POINTS)},
+    }}
+    summary = validate_document(doc, None)
+    assert set(summary) == {"gps_l1_mcode", "cw"}
+    assert summary["gps_l1_mcode"]["operating_plane"] == "antenna_eirp"
+    assert summary["gps_l1_mcode"]["max_gain_db"] == pytest.approx(74.0)
+
+
+def test_validate_document_rejects_a_bad_signal():
+    from agent.calibration import validate_document
+    doc = _doc()
+    # add a second, broken signal → whole upload should be rejected, naming it
+    doc["signals"]["cw"] = {"curves": {
+        "sdr_output": {"points": _pts([(40, -36.0), (50, -36.0)])},   # not invertible
+    }}
+    with pytest.raises(CalibrationError) as exc:
+        validate_document(doc, None)
+    assert "cw" in str(exc.value)
+
+
+def test_validate_document_requires_signals():
+    from agent.calibration import validate_document
+    doc = _doc()
+    doc["signals"] = {}
+    with pytest.raises(CalibrationError):
+        validate_document(doc, None)
+
+
+def test_validate_document_rejects_bad_schema_version():
+    from agent.calibration import validate_document
+    doc = _doc()
+    doc["schema_version"] = 2
+    with pytest.raises(CalibrationError):
+        validate_document(doc, None)
+
+
 # ── File loaders ─────────────────────────────────────────────────────────────────
 
 def test_resolve_from_files_json_unit_and_yaml_defaults(tmp_path):

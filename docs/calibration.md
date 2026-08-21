@@ -552,22 +552,34 @@ Not yet done: the client auto-populating `SDR_CAL_SIGNAL_ID` on task creation fr
 the script's `--describe-params` (today it's set by hand), and porting the remaining
 scripts beyond M-code.
 
-### 9.2 The store (stub — to design next)
+### 9.2 The store *(implemented)*
 
 The per-unit data area is deliberately general — calibration is the first tenant,
-not the only one. Proposed shape:
+not the only one.
 
-- A per-unit directory the agent owns (sits beside the unit's other state, distinct
-  from the shared scripts/config), e.g. `<unit-data>/calibration.json` plus room for
-  future files.
-- An agent endpoint to **upload / fetch / list** files in that area, surfaced in
-  FleetView as a per-unit "Files / calibration" panel.
-- **Discipline that keeps it from rotting:** the area accepts arbitrary files, but
-  every *kind* of data earns a small schema when it's introduced (calibration is the
-  first). No executable uploads — data only; a computed calibration is expressed as
-  a table, never as code.
-- Validation on upload for known kinds (run the §6 schema + §6 hard-checks against
-  `calibration.json`) so a broken file is rejected at upload, not at transmit.
+- A per-unit directory the agent owns — `config.DATA_DIR` (`$SDR_DATA_DIR`, default
+  `STATE_DIR/data`), distinct from `configs/` (fleet state) and `scripts/` (code).
+  `calibration.json` is the reserved, validated name in it; other files sit beside it.
+- Agent endpoints (all behind the API key):
+  - `POST /files` (multipart) — upload a file. Validated per known kind *before* it
+    is written; **executable kinds are refused** and nothing in the store is ever
+    executed; 5 MiB cap.
+  - `GET /files` — list (name, size, modified); `GET /files/{name}` — fetch;
+    `DELETE /files/{name}` — remove. All reject path traversal.
+  - `GET /calibration` — convenience view for a FleetView panel: the stored document
+    plus what it resolves to per signal (operating plane, quantity, gain/power
+    bounds), or `{valid:false, error}` if the stored doc is broken.
+- **Validate-on-upload:** uploading `calibration.json` runs
+  `calibration.validate_document` — the full §6 hard-checks for **every signal**, as
+  it would resolve at runtime (merged with this unit's type defaults) — so a broken
+  or unsafe document is rejected at upload with a specific reason, never at transmit.
+  The success response returns the per-signal resolved summary.
+- **Discipline that keeps it from rotting:** the area accepts arbitrary *data* files,
+  but every *kind* earns a small schema/validator when it's introduced (calibration
+  is the first). No executable uploads; a computed calibration is expressed as a
+  table, never as code.
+
+Not yet done: the FleetView panel itself (the endpoints are ready for it).
 
 ---
 
