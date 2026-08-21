@@ -676,18 +676,26 @@ def _yaml_env(env: dict) -> dict:
 
 
 def _spec_to_entry(spec: TaskConfig) -> dict:
-    """A clean tasks.yaml entry — the commonly-edited fields only."""
+    """A clean tasks.yaml entry — the commonly-edited fields only.
+
+    Every string value is single-quoted so it survives the ruamel (YAML 1.2) →
+    PyYAML (YAML 1.1, config.load_tasks) round-trip. Without quoting, a bare command
+    arg like `on`/`off`/`yes`/`no` reads back as a BOOLEAN in YAML 1.1 (e.g. a
+    `--rf on` argument), which fails TaskConfig's list[str] and silently drops the
+    whole task. This is the same fix _yaml_env applies to env — extended to the
+    command and the other string fields."""
+    sq = SingleQuotedScalarString
     return {
-        "name": spec.name,
-        "description": spec.description,
-        "command": list(spec.command),
-        "working_dir": spec.working_dir or str(SCRIPTS_DIR),
+        "name": sq(spec.name),
+        "description": sq(spec.description),
+        "command": [sq(str(c)) for c in spec.command],
+        "working_dir": sq(spec.working_dir or str(SCRIPTS_DIR)),
         "env": _yaml_env(spec.env),
         "autostart": spec.autostart,
         "restart_on_crash": spec.restart_on_crash,
         # Round-trip the client's library-scope tag; omit when shared (empty) to
         # keep tasks.yaml clean for the common case.
-        **({"types": list(spec.types)} if spec.types else {}),
+        **({"types": [sq(str(t)) for t in spec.types]} if spec.types else {}),
     }
 
 
