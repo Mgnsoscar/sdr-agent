@@ -276,8 +276,12 @@ class RampSpec(BaseModel):
     stop: float
     steps: Optional[int] = None         # number of equal increments (divides evenly)
     step: Optional[float] = None        # OR a fixed value increment per point
-    hold_s: Optional[float] = None      # dwell between points
-    duration_s: Optional[float] = None  # first point → last point (single-anchor)
+    hold_s: Optional[float] = None      # dwell each level is held
+    duration_s: Optional[float] = None  # total held time = levels × hold (single-anchor)
+    # Every emitted level is held for `hold`, incl. the last; drop the start/stop
+    # level (and its hold) to chain ramps without a doubled seam. Single-anchor only.
+    include_first: bool = True
+    include_last: bool = True
     mode: str = "tune"                  # "tune" (live set_params) | "run" (task per point)
     flag: Optional[str] = None          # run mode: CLI flag for the ramped param
     integer: bool = False               # run mode: round each value to an int

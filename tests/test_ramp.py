@@ -10,26 +10,30 @@ from agent import ramp
 # ── Timing modes ──────────────────────────────────────────────────────────────
 
 def test_step_and_hold_gives_duration():
+    # 9 held levels (0..40), each held 2s → duration 18s (every level held, incl. last).
     r = ramp.resolve_ramp(0, 40, step=5, hold_s=2)
     assert r.values == [0, 5, 10, 15, 20, 25, 30, 35, 40]
     assert r.n_intervals == 8
     assert r.hold_s == 2
-    assert r.duration_s == 16
+    assert r.duration_s == 18
 
 
 def test_step_and_duration_gives_hold():
+    # duration is the TOTAL held time spread over all 9 levels → hold = 16/9.
     r = ramp.resolve_ramp(0, 40, step=5, duration_s=16)
     assert r.n_intervals == 8
+    assert r.hold_s == pytest.approx(16 / 9)
+    assert r.duration_s == pytest.approx(16)
+
+
+def test_duration_and_hold_gives_level_count():
+    # 16s total, 2s per level → 8 held levels spanning 0..40 (7 even intervals).
+    r = ramp.resolve_ramp(0, 40, duration_s=16, hold_s=2)
+    assert r.n_intervals == 7
+    assert len(r.values) == 8
+    assert r.values[0] == 0 and r.values[-1] == 40
     assert r.hold_s == 2
     assert r.duration_s == 16
-
-
-def test_duration_and_hold_gives_even_step():
-    r = ramp.resolve_ramp(0, 40, duration_s=16, hold_s=2)
-    assert r.n_intervals == 8
-    assert r.values[0] == 0 and r.values[-1] == 40
-    # even spacing → 5 per interval
-    assert r.values == [0, 5, 10, 15, 20, 25, 30, 35, 40]
 
 
 def test_step_not_dividing_clamps_last_to_stop():
@@ -66,6 +70,43 @@ def test_explosion_guarded():
         ramp.resolve_ramp(0, 1e9, step=1, hold_s=1)
 
 
+# ── include_first / include_last ──────────────────────────────────────────────
+
+def test_exclude_last_drops_stop_level_and_its_hold():
+    full = ramp.resolve_ramp(0, 10, step=2, hold_s=1)
+    assert full.values == [0, 2, 4, 6, 8, 10] and full.duration_s == 6
+    r = ramp.resolve_ramp(0, 10, step=2, hold_s=1, include_last=False)
+    assert r.values == [0, 2, 4, 6, 8]          # 10 dropped
+    assert r.duration_s == 5                     # one hold shorter
+
+
+def test_exclude_first_drops_start_level_and_shifts_forward():
+    r = ramp.resolve_ramp(0, 10, step=2, hold_s=1, include_first=False)
+    assert r.values == [2, 4, 6, 8, 10]
+    pts = ramp.place_ramp("start", 0.0, r)
+    assert [o for _, o, _ in pts] == [0, 1, 2, 3, 4]   # first emitted starts at offset 0
+    assert r.duration_s == 5
+
+
+def test_two_ramps_chain_without_doubled_seam():
+    # A 0→10 ramp excluding its last level, then a 10→20 ramp: 10 appears once and
+    # the two durations add, so B starts exactly where A ends.
+    a = ramp.resolve_ramp(0, 10, step=2, hold_s=1, include_last=False)
+    b = ramp.resolve_ramp(10, 20, step=2, hold_s=1)
+    a_pts = ramp.place_ramp("start", 0.0, a)
+    b_pts = ramp.place_ramp("start", a.duration_s, b)   # place B after A
+    values = [v for _, _, v in a_pts] + [v for _, _, v in b_pts]
+    offsets = [o for _, o, _ in a_pts] + [o for _, o, _ in b_pts]
+    assert values == [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]   # 10 exactly once
+    assert offsets == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]       # contiguous, no gap
+
+
+def test_exclude_both_empty_raises():
+    with pytest.raises(ValueError):
+        ramp.resolve_ramp(0, 2, steps=1, hold_s=1,
+                          include_first=False, include_last=False)
+
+
 # ── Placement ─────────────────────────────────────────────────────────────────
 
 def test_place_start_anchored():
@@ -75,10 +116,13 @@ def test_place_start_anchored():
     assert [v for _, _, v in pts] == [0, 10, 20]
 
 
-def test_place_stop_anchored_ends_at_offset():
+def test_place_stop_anchored_reserves_final_hold():
     r = ramp.resolve_ramp(20, 0, step=10, hold_s=5)   # values 20,10,0; hold 5
-    pts = ramp.place_ramp("stop", 0.0, r)             # last point at off-air (0)
-    assert [(a, o) for a, o, _ in pts] == [("stop", -10), ("stop", -5), ("stop", 0)]
+    pts = ramp.place_ramp("stop", 0.0, r)
+    # Every level is held; the last (0) is held over the slot ending at the anchor,
+    # so it fires one hold (5s) before off-air, not exactly at it.
+    assert [(a, o) for a, o, _ in pts] == [("stop", -15), ("stop", -10), ("stop", -5)]
+    assert r.duration_s == 15
 
 
 def test_place_both_fills_from_zero():

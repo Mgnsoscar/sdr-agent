@@ -192,7 +192,9 @@ class SequenceRunner:
                             raise ValueError("a window-filling ramp needs a step count or hold time")
                     else:
                         ramp.resolve_ramp(s.ramp.start, s.ramp.stop, steps=s.ramp.steps, step=s.ramp.step,
-                                          hold_s=s.ramp.hold_s, duration_s=s.ramp.duration_s)
+                                          hold_s=s.ramp.hold_s, duration_s=s.ramp.duration_s,
+                                          include_first=s.ramp.include_first,
+                                          include_last=s.ramp.include_last)
                 except ValueError as exc:
                     raise ValueError(f"ramp step for '{s.task_name}': {exc}")
         # Must have an on-air start (a start-anchored action at offset 0 is the
@@ -397,7 +399,8 @@ class SequenceRunner:
             window_s = (on_air_end - on_air_at).total_seconds() - (s.offset_s or 0.0) + end_inset
         try:
             resolved = ramp.resolve_ramp(r.start, r.stop, steps=r.steps, step=r.step, hold_s=r.hold_s,
-                                         duration_s=r.duration_s, window_s=window_s)
+                                         duration_s=r.duration_s, window_s=window_s,
+                                         include_first=r.include_first, include_last=r.include_last)
             points = ramp.place_ramp(s.anchor, s.offset_s, resolved)
         except ValueError as exc:
             logger.error("Ramp step for '%s' could not be resolved: %s", s.task_name, exc)
