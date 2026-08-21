@@ -519,18 +519,38 @@ fallback could over- or under-drive.
 
 ## 9. Delivery to the script & the per-unit store
 
-### 9.1 Script side
+### 9.1 Script side *(implemented)*
+
+The agent is the single source of truth for resolution; the script consumes a
+**flat artifact** and does trivial interpolation — no plane model script-side, no
+resolver duplicated across repos.
 
 - Each script declares `CAL_SIGNAL_ID = "gps_l1_mcode"` — a stable slug, independent
   of filename or task name.
-- The agent resolves the merged calibration for `(this unit, this signal)` and
-  injects it, e.g. `SDR_CALIBRATION_FILE=/…/resolved.json` in the task env (the
-  agent already injects env into tasks).
-- The calibration block becomes: read that file → validate → build interpolators;
-  if absent, fall back to the baked constants.
-- The banner echoes the **operating plane's `quantity`** so the number is never
-  ambiguous, e.g. `power: -12.0 dBm (EIRP, at antenna_eirp)`; a nonzero `offset_db`
-  on any active plane is flagged.
+- A task **opts in** by setting `SDR_CAL_SIGNAL_ID` to that slug. At task start the
+  agent (`process_manager._inject_calibration`) resolves `(this unit, this signal)`,
+  writes the flattened artifact (`ResolvedCalibration.to_public_dict`) to
+  `CAL_RUN_DIR/<task>.json`, and points the task at it via `SDR_CALIBRATION_FILE`.
+  A hard/unsafe calibration error **aborts the start**; a soft miss (no doc, signal
+  absent) falls back to the script's baked constants.
+- The artifact is the operating-plane curve pre-flattened (derived hops folded in):
+  `{ curve: [[gain, power], …], min_gain_db, max_gain_db, amplitude, quantity,
+  operating_plane, … }`.
+- The script uses `calkit.PowerMap` (shared, in the sdr-scripts repo):
+  `PowerMap.load(baked)` returns the artifact-backed map when `SDR_CALIBRATION_FILE`
+  is set, else a `from_linear` map built from the baked constants that is byte-
+  identical to the old single-anchor behaviour. `--power` ↔ gain both route through
+  it, as does the flowgraph amplitude (taken from the artifact so it matches what the
+  curve was measured at).
+- The banner echoes the map's **source** and the operating plane's `quantity`, so the
+  number is never ambiguous, e.g. `power: -12.0 dBm (EIRP, at antenna_eirp)` +
+  `calibration: calibration file`.
+- Cross-repo consistency is covered by construction: the agent resolver and
+  `calkit.PowerMap` produce identical gain↔power over the whole chain.
+
+Not yet done: the client auto-populating `SDR_CAL_SIGNAL_ID` on task creation from
+the script's `--describe-params` (today it's set by hand), and porting the remaining
+scripts beyond M-code.
 
 ### 9.2 The store (stub — to design next)
 
