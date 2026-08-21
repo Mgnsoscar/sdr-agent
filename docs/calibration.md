@@ -581,7 +581,12 @@ not the only one.
   is the first). No executable uploads; a computed calibration is expressed as a
   table, never as code.
 
-Not yet done: the FleetView panel itself (the endpoints are ready for it).
+FleetView has a Calibration sub-tab over these endpoints: a resolved per-signal
+summary plus a two-view editor — an **Editor** tab (forms for gain limits, the
+limits list, and per-(signal × measured-plane) curve grids) and a **JSON** tab (the
+raw document, source of truth for plane topology). Save validates through the agent
+and surfaces any rejection reason. Still form-only for values — editing the plane
+chain (adding measured/derived planes) is done in the JSON view.
 
 ---
 
