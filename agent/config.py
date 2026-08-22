@@ -105,7 +105,10 @@ MACHINE_ID = machine_id()
 
 AGENT_HOST    = os.environ.get("SDR_AGENT_HOST", "0.0.0.0")
 AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
-AGENT_VERSION = "1.0.0"
+# Bump on any change that alters the agent's HTTP surface, so the OTA updater and the
+# client's "Update agent…" flow (which compare version strings) can tell builds apart
+# and actually install the new code. 1.1.0 adds the per-unit file store + /calibration.
+AGENT_VERSION = "1.1.0"
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
 # task defaults. "python3" (the default) resolves via PATH at launch — on the X410
