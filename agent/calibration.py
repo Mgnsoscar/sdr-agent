@@ -320,6 +320,12 @@ def validate_document(unit_doc: dict, type_defaults: Optional[dict] = None) -> d
         except CalibrationError as exc:
             bad[sig_id] = str(exc)
     if bad:
+        # If every signal failed with the SAME message, the defect is document-level
+        # (a bad chain/plane the per-signal resolve surfaces each time) — report it
+        # once, plainly, instead of blaming each signal for one structural problem.
+        msgs = set(bad.values())
+        if len(msgs) == 1 and len(bad) == len(signals):
+            raise CalibrationError(next(iter(msgs)))
         raise CalibrationError(
             "invalid signal(s): " + "; ".join(f"{k} ({v})" for k, v in bad.items()))
     return summary

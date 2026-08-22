@@ -343,6 +343,19 @@ def test_validate_document_rejects_a_bad_signal():
     assert "cw" in str(exc.value)
 
 
+def test_validate_document_reports_doc_level_defect_once():
+    from agent.calibration import validate_document
+    # No safety ceiling (chain-level defect) with TWO signals present.
+    doc = _doc(operating="sdr_output", limits=[], gain_limits={"min_gain_db": 0.0})
+    doc["signals"]["cw"] = {"curves": {"sdr_output": {"points": _pts(SDR_POINTS)}}}
+    with pytest.raises(CalibrationError) as exc:
+        validate_document(doc, None)
+    msg = str(exc.value)
+    # A single structural defect must not be reported as N per-signal failures.
+    assert "invalid signal(s)" not in msg
+    assert "ceiling" in msg
+
+
 def test_validate_document_requires_signals():
     from agent.calibration import validate_document
     doc = _doc()

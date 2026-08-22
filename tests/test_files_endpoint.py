@@ -105,6 +105,34 @@ def test_get_calibration_summary(tmp_path, monkeypatch):
     assert "gps_l1_mcode" in view["signals"]
 
 
+def test_upload_uses_docs_own_unit_type_for_defaults(tmp_path, monkeypatch):
+    # Agent runtime type unset (the default), but the doc declares its own unit_type.
+    # Upload validation must merge THAT type's defaults, matching transmit-time
+    # resolution — otherwise a doc that relies on the type-defaults ceiling is wrongly
+    # rejected here yet would resolve (and transmit) fine.
+    _wire(tmp_path, monkeypatch, unit_type="")               # SDR_UNIT_TYPE unset
+    defaults = tmp_path / "configs" / "calibration_defaults.yaml"
+    defaults.parent.mkdir(parents=True, exist_ok=True)
+    defaults.write_text(
+        "types:\n"
+        "  broadcaster:\n"
+        "    chain:\n"
+        "      limits: [{ plane: sdr_output, max_dbm: -2.5 }]\n")
+    doc = {
+        "schema_version": 1, "unit_type": "broadcaster",
+        "chain": {
+            "gain_limits": {"min_gain_db": 0.0, "max_gain_db": 89.75},
+            "operating_plane": "sdr_output",
+            "planes": {"sdr_output": {"type": "measured", "quantity": "total in-band power"}},
+            # no limits here — the safety ceiling comes from the type defaults
+        },
+        "signals": {"gps_l1_mcode": {"amplitude": 0.8, "curves": {
+            "sdr_output": {"points": _pts(SDR_POINTS)}}}},
+    }
+    resp = _upload("calibration.json", json.dumps(doc).encode())
+    assert "gps_l1_mcode" in resp["calibration"]             # accepted via doc's type
+
+
 def test_get_calibration_absent_is_404(tmp_path, monkeypatch):
     _wire(tmp_path, monkeypatch)
     with pytest.raises(HTTPException) as exc:

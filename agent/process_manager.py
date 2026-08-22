@@ -72,9 +72,14 @@ def _inject_calibration(env: dict, task_name: str) -> None:
         return
     if artifact is None:
         return                                       # no per-unit calibration doc
+    # Sanitised, length-capped name for readability, plus a short hash of the FULL
+    # task name so two tasks that sanitise/truncate to the same string never share one
+    # artifact file (which would point a task at another task's resolved curve).
+    import hashlib
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", task_name)[:60] or "task"
+    digest = hashlib.sha1(task_name.encode("utf-8")).hexdigest()[:8]
     _agentcfg.CAL_RUN_DIR.mkdir(parents=True, exist_ok=True)
-    path = _agentcfg.CAL_RUN_DIR / f"{safe}.json"
+    path = _agentcfg.CAL_RUN_DIR / f"{safe}-{digest}.json"
     path.write_text(json.dumps(artifact), encoding="utf-8")
     env[_agentcfg.CALIBRATION_FILE_ENV] = str(path)
     logger.info("Task '%s': resolved calibration for signal '%s' → %s",

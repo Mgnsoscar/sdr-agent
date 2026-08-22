@@ -596,6 +596,17 @@ def _safe_data_path(name: str):
     return cfg.DATA_DIR / name
 
 
+def _effective_type_defaults(doc: dict):
+    """The type-defaults layer to validate/preview a document against, using the SAME
+    precedence as transmit-time resolution (calibration.resolve_public): the agent's
+    runtime SDR_UNIT_TYPE wins, else the document's own ``unit_type``. Keeping these in
+    lock-step is what makes validate-on-upload and the /calibration view resolve
+    exactly what a transmit will — otherwise a type-defaults limit could tighten the
+    ceiling at transmit that the upload gate never checked."""
+    ut = cfg.UNIT_TYPE or (doc.get("unit_type") if isinstance(doc, dict) else "") or ""
+    return _calib.load_type_defaults(cfg.CALIBRATION_DEFAULTS, ut) if ut else None
+
+
 def _validate_calibration_upload(content: bytes) -> dict:
     """Full validate-on-upload for calibration.json: parse, merge the unit's type
     defaults, and run the resolver's checks for every signal. Raises HTTPException
@@ -607,9 +618,7 @@ def _validate_calibration_upload(content: bytes) -> dict:
         raise HTTPException(status_code=400,
                             detail=f"{cfg.CALIBRATION_NAME} is not valid JSON: {exc}")
     try:
-        td = (_calib.load_type_defaults(cfg.CALIBRATION_DEFAULTS, cfg.UNIT_TYPE)
-              if cfg.UNIT_TYPE else None)
-        return _calib.validate_document(doc, td)
+        return _calib.validate_document(doc, _effective_type_defaults(doc))
     except _calib.CalibrationError as exc:
         raise HTTPException(status_code=400,
                             detail=f"{cfg.CALIBRATION_NAME} is invalid: {exc}")
@@ -625,9 +634,18 @@ async def upload_file(file: UploadFile = File(...)):
     if ext in _DENY_EXT:
         raise HTTPException(status_code=400,
                             detail=f"Executable files are not accepted ({ext})")
-    content = await file.read()
-    if len(content) > _MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="File too large (max 5 MiB)")
+    # Read in bounded chunks and stop the moment the cap is exceeded, so an oversized
+    # body can't buffer gigabytes into memory before the size check runs.
+    chunks, total = [], 0
+    while True:
+        chunk = await file.read(1 << 20)                     # 1 MiB at a time
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > _MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="File too large (max 5 MiB)")
+        chunks.append(chunk)
+    content = b"".join(chunks)
 
     # Validate known kinds BEFORE writing, so a bad calibration never lands on disk.
     summary = _validate_calibration_upload(content) if name == cfg.CALIBRATION_NAME else None
@@ -702,9 +720,7 @@ async def get_calibration():
         return {"unit_type": cfg.UNIT_TYPE, "valid": False,
                 "error": f"stored calibration.json is not valid JSON: {exc}"}
     try:
-        td = (_calib.load_type_defaults(cfg.CALIBRATION_DEFAULTS, cfg.UNIT_TYPE)
-              if cfg.UNIT_TYPE else None)
-        summary = _calib.validate_document(doc, td)
+        summary = _calib.validate_document(doc, _effective_type_defaults(doc))
     except _calib.CalibrationError as exc:
         return {"unit_type": cfg.UNIT_TYPE, "document": doc, "valid": False,
                 "error": str(exc)}
