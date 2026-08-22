@@ -112,8 +112,10 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # calibration upload-validation and the /calibration view with transmit-time
 # unit_type resolution, and hardens the upload size cap; 1.1.3 rejects a
 # duration+hold ramp too short to hold two levels (a single step, not a ramp);
-# 1.1.4 advertises capabilities in /info so the client can feature-gate explicitly.
-AGENT_VERSION = "1.1.4"
+# 1.1.4 advertises capabilities in /info so the client can feature-gate explicitly;
+# 1.1.5 confirms a freshly-activated OTA release before the slow startup steps (so a
+# slow boot can't get a good update rolled back) and exposes /admin/update-status.
+AGENT_VERSION = "1.1.5"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -122,6 +124,7 @@ AGENT_VERSION = "1.1.4"
 AGENT_CAPABILITIES = [
     "calibration",        # per-unit power calibration: /files store + /calibration view
     "script-cal-signal",  # /scripts/{name}/params reports a script's CAL_SIGNAL_ID
+    "ota-status",         # /admin/update-status reports the OTA confirm/rollback state
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

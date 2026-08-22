@@ -177,6 +177,10 @@ class Updater:
         except OSError:
             return None
 
+    def is_confirmed(self, version: str) -> bool:
+        """True if `version` has been marked healthy (its .ok marker exists)."""
+        return bool(version) and self._ok_marker(version).exists()
+
     # ── Stage ─────────────────────────────────────────────────────────────────
 
     def stage(self, bundle_path: Path) -> str:

@@ -112,6 +112,14 @@ _client_state: ClientStateStore | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _manager, _scheduler, _runner, _mdns, _client_state
+
+    # OTA: if we just booted a freshly-activated release, confirm it healthy after the
+    # grace period (the external confirm timer rolls back if we never do). Scheduled
+    # FIRST — before the slow manager/scheduler/runner startup below — so a slow boot
+    # can't push confirmation past the rollback window and get a good update reverted.
+    # It only touches the OTA markers, so it has no dependency on that startup.
+    asyncio.create_task(_confirm_release_after_grace(), name="ota-confirm")
+
     tasks = cfg.load_tasks()
     _manager = ProcessManager(tasks, cfg.LOG_DIR, cfg.UNIT_ID)
     await _manager.startup()
@@ -131,10 +139,6 @@ async def lifespan(app: FastAPI):
     _mdns = MdnsAdvertiser(cfg.UNIT_ID, cfg.AGENT_PORT, cfg.AGENT_VERSION,
                            machine_id=cfg.MACHINE_ID)
     _mdns.start()
-
-    # OTA: if we just booted a freshly-activated release, confirm it healthy after
-    # the grace period (the external confirm timer rolls back if we never do).
-    asyncio.create_task(_confirm_release_after_grace(), name="ota-confirm")
 
     yield
 
@@ -256,6 +260,28 @@ async def admin_releases():
     """The agent releases installed on this unit and which one is active/healthy."""
     return [AgentRelease(version=r.version, active=r.active, healthy=r.healthy, path=r.path)
             for r in _make_updater().list_releases()]
+
+
+@app.get("/admin/update-status", tags=["admin"], dependencies=[Depends(verify_key)])
+async def admin_update_status():
+    """The live OTA lifecycle state, so the client can show real progress after an
+    update instead of only watching the version flip:
+
+      pending_version   a freshly-activated release still awaiting its health check
+                        (None once confirmed or rolled back)
+      pending_confirmed the running agent has marked that release healthy
+      current/previous  the active version and the rollback target
+
+    A pending release that never confirms is auto-reverted to `previous` by the
+    external confirm timer — the client can surface that as a rollback."""
+    up = _make_updater()
+    pending = up.pending_version()
+    return {
+        "current_version": up.current_version() or cfg.AGENT_VERSION,
+        "previous_version": up.previous_version(),
+        "pending_version": pending,
+        "pending_confirmed": up.is_confirmed(pending) if pending else False,
+    }
 
 
 @app.post("/admin/update", response_model=UpdateResult,
