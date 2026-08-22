@@ -114,8 +114,10 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # duration+hold ramp too short to hold two levels (a single step, not a ramp);
 # 1.1.4 advertises capabilities in /info so the client can feature-gate explicitly;
 # 1.1.5 confirms a freshly-activated OTA release before the slow startup steps (so a
-# slow boot can't get a good update rolled back) and exposes /admin/update-status.
-AGENT_VERSION = "1.1.5"
+# slow boot can't get a good update rolled back) and exposes /admin/update-status;
+# 1.1.6 lets a task name contain '/' (routes use {name:path}; log/socket paths are
+# sanitised + hash-disambiguated and can no longer traverse).
+AGENT_VERSION = "1.1.6"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list

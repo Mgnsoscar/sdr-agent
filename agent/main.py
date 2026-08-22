@@ -335,20 +335,9 @@ async def list_tasks(manager: ProcessManager = Depends(get_manager)):
     return manager.all_statuses()
 
 
-# ── Single task status ────────────────────────────────────────────────────────
-
-@app.get("/tasks/{name}", response_model=ProcessStatus, tags=["tasks"],
-         dependencies=[Depends(verify_key)])
-async def task_status(name: str, manager: ProcessManager = Depends(get_manager)):
-    try:
-        return manager.status(name)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-
-
 # ── Start ─────────────────────────────────────────────────────────────────────
 
-@app.post("/tasks/{name}/start", response_model=ProcessStatus, tags=["tasks"],
+@app.post("/tasks/{name:path}/start", response_model=ProcessStatus, tags=["tasks"],
           dependencies=[Depends(verify_key)])
 async def start_task(
     name: str,
@@ -365,7 +354,7 @@ async def start_task(
 
 # ── Stop ──────────────────────────────────────────────────────────────────────
 
-@app.post("/tasks/{name}/stop", response_model=ProcessStatus, tags=["tasks"],
+@app.post("/tasks/{name:path}/stop", response_model=ProcessStatus, tags=["tasks"],
           dependencies=[Depends(verify_key)])
 async def stop_task(name: str, manager: ProcessManager = Depends(get_manager)):
     try:
@@ -376,7 +365,7 @@ async def stop_task(name: str, manager: ProcessManager = Depends(get_manager)):
 
 # ── Restart ───────────────────────────────────────────────────────────────────
 
-@app.post("/tasks/{name}/restart", response_model=ProcessStatus, tags=["tasks"],
+@app.post("/tasks/{name:path}/restart", response_model=ProcessStatus, tags=["tasks"],
           dependencies=[Depends(verify_key)])
 async def restart_task(
     name: str,
@@ -391,7 +380,7 @@ async def restart_task(
 
 # ── Live parameters (retune while running) ─────────────────────────────────────
 
-@app.get("/tasks/{name}/params/live", tags=["tasks"],
+@app.get("/tasks/{name:path}/params/live", tags=["tasks"],
          dependencies=[Depends(verify_key)])
 async def get_live_params(name: str, manager: ProcessManager = Depends(get_manager)):
     """The running task's current + applied live-parameter values (from its
@@ -404,7 +393,7 @@ async def get_live_params(name: str, manager: ProcessManager = Depends(get_manag
         raise HTTPException(status_code=409, detail=str(exc))
 
 
-@app.post("/tasks/{name}/params", tags=["tasks"], dependencies=[Depends(verify_key)])
+@app.post("/tasks/{name:path}/params", tags=["tasks"], dependencies=[Depends(verify_key)])
 async def set_live_params(
     name: str,
     request: SetParamsRequest,
@@ -423,7 +412,7 @@ async def set_live_params(
 
 # ── Log fetch (HTTP) ──────────────────────────────────────────────────────────
 
-@app.get("/tasks/{name}/logs", response_model=list[str], tags=["logs"],
+@app.get("/tasks/{name:path}/logs", response_model=list[str], tags=["logs"],
          dependencies=[Depends(verify_key)])
 async def get_logs(
     name: str,
@@ -439,7 +428,7 @@ async def get_logs(
 
 # ── Task exit history ─────────────────────────────────────────────────────────
 
-@app.get("/tasks/{name}/history", response_model=list[ExitRecord], tags=["tasks"],
+@app.get("/tasks/{name:path}/history", response_model=list[ExitRecord], tags=["tasks"],
          dependencies=[Depends(verify_key)])
 async def task_history(name: str, manager: ProcessManager = Depends(get_manager)):
     """Recent exits for a task (newest last) — useful for spotting crash loops."""
@@ -449,9 +438,23 @@ async def task_history(name: str, manager: ProcessManager = Depends(get_manager)
         raise HTTPException(status_code=404, detail=str(exc))
 
 
+# ── Single task status ────────────────────────────────────────────────────────
+# Defined AFTER the /tasks/{name}/… sub-routes: {name:path} is greedy, so registering
+# this catch-all last lets a name contain '/' (e.g. "GPS/L1") without swallowing the
+# more specific /logs, /history, /params routes.
+
+@app.get("/tasks/{name:path}", response_model=ProcessStatus, tags=["tasks"],
+         dependencies=[Depends(verify_key)])
+async def task_status(name: str, manager: ProcessManager = Depends(get_manager)):
+    try:
+        return manager.status(name)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
 # ── Log stream (WebSocket) ────────────────────────────────────────────────────
 
-@app.websocket("/tasks/{name}/logs/stream")
+@app.websocket("/tasks/{name:path}/logs/stream")
 async def stream_logs(
     name: str,
     websocket: WebSocket,
@@ -894,7 +897,7 @@ async def create_task(spec: TaskConfig, manager: ProcessManager = Depends(get_ma
     return {"created": spec.name, "reload": result}
 
 
-@app.put("/tasks/{name}", tags=["tasks"], dependencies=[Depends(verify_key)])
+@app.put("/tasks/{name:path}", tags=["tasks"], dependencies=[Depends(verify_key)])
 async def update_task(name: str, spec: TaskConfig,
                       manager: ProcessManager = Depends(get_manager)):
     """
@@ -916,7 +919,7 @@ async def update_task(name: str, spec: TaskConfig,
     return {"updated": name, "reload": result}
 
 
-@app.delete("/tasks/{name}", tags=["tasks"], dependencies=[Depends(verify_key)])
+@app.delete("/tasks/{name:path}", tags=["tasks"], dependencies=[Depends(verify_key)])
 async def delete_task(name: str, manager: ProcessManager = Depends(get_manager)):
     """Remove a task from tasks.yaml and reload live. Refuses if it's running."""
     if manager.is_running(name):

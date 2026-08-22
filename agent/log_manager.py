@@ -12,14 +12,30 @@ safe to stream over WebSockets without blocking the event loop.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 
+def _safe_dirname(task_name: str) -> str:
+    """A single, safe path component for a task's log dir. The task name is used as a
+    directory, so a raw '/' would nest it and '..' would traverse OUT of the log root —
+    sanitise both away. Task names MAY contain '/' (e.g. "GPS/L1"); when we have to
+    change any character, append a short hash of the FULL name so two names that
+    sanitise the same ('a/b' vs 'a_b') never share a log dir. A name that's already
+    filesystem-safe keeps its plain, stable dir (so ordinary tasks keep their history)."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", task_name).strip(".")
+    if safe == task_name and safe:
+        return safe
+    digest = hashlib.sha1(task_name.encode("utf-8")).hexdigest()[:8]
+    return f"{safe or 'task'}-{digest}"
+
+
 class LogManager:
     def __init__(self, log_root: Path, task_name: str):
-        self.task_dir   = log_root / task_name
+        self.task_dir   = log_root / _safe_dirname(task_name)
         self.task_dir.mkdir(parents=True, exist_ok=True)
         self.current    = self.task_dir / "current.log"
 

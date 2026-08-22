@@ -42,10 +42,19 @@ logger = logging.getLogger(__name__)
 
 
 def _ctrl_sock_path(name: str) -> str:
-    """A short, per-task Unix-socket path for live-parameter control. Sanitised
-    and length-capped so it stays under the AF_UNIX ~108-byte limit."""
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:60] or "task"
-    return str(_agentcfg.CTRL_DIR / f"{safe}.sock")
+    """A short, per-task Unix-socket path for live-parameter control. The name is
+    sanitised (it may contain '/'), length-capped so the full path stays under the
+    AF_UNIX ~108-byte limit, and — when sanitising or the cap changed anything —
+    suffixed with a short hash of the FULL name so two long or slash-bearing names
+    can't collide onto the same socket (which would cross-wire their live tuning)."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    if safe == name and len(safe) <= 40:
+        stem = safe or "task"
+    else:
+        import hashlib
+        digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+        stem = f"{safe[:40] or 'task'}-{digest}"
+    return str(_agentcfg.CTRL_DIR / f"{stem}.sock")
 
 
 def _inject_calibration(env: dict, task_name: str) -> None:
