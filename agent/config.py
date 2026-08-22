@@ -111,8 +111,18 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # 1.1.1 surfaces a script's CAL_SIGNAL_ID in /scripts/{name}/params; 1.1.2 aligns
 # calibration upload-validation and the /calibration view with transmit-time
 # unit_type resolution, and hardens the upload size cap; 1.1.3 rejects a
-# duration+hold ramp too short to hold two levels (a single step, not a ramp).
-AGENT_VERSION = "1.1.3"
+# duration+hold ramp too short to hold two levels (a single step, not a ramp);
+# 1.1.4 advertises capabilities in /info so the client can feature-gate explicitly.
+AGENT_VERSION = "1.1.4"
+
+# Feature flags this agent's HTTP surface supports, reported by GET /info so the
+# client can light features up (or say "needs a newer agent") from an explicit list
+# instead of probing each endpoint and inferring support from a 404. Add a flag when
+# a new capability ships; never remove or rename one (the client matches by string).
+AGENT_CAPABILITIES = [
+    "calibration",        # per-unit power calibration: /files store + /calibration view
+    "script-cal-signal",  # /scripts/{name}/params reports a script's CAL_SIGNAL_ID
+]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
 # task defaults. "python3" (the default) resolves via PATH at launch — on the X410
@@ -121,7 +131,14 @@ AGENT_VERSION = "1.1.3"
 TASK_INTERPRETER = os.environ.get("SDR_TASK_INTERPRETER", "python3")
 
 # ── Auth (optional shared secret) ────────────────────────────────────────────
-# Set SDR_API_KEY on both the Pi and your client.  Leave empty to disable auth.
+# Set SDR_API_KEY on both the Pi and your client. Leave empty to disable auth.
+#
+# TRUST MODEL: the agent speaks plain HTTP and is designed for a TRUSTED LAN (a lab
+# bench / isolated network). The API key is compared in constant time (see
+# main.verify_key), but because traffic is not encrypted it travels in cleartext — so
+# the key guards against casual access on the LAN, NOT against an attacker who can
+# sniff the wire. Do not expose the agent to an untrusted network or the public
+# internet; put it behind a VPN or a TLS-terminating reverse proxy if you must.
 
 API_KEY = os.environ.get("SDR_API_KEY", "")
 

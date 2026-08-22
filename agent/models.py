@@ -93,6 +93,8 @@ class AgentInfo(BaseModel):
     python_version: str
     tasks: list[str]
     previous_version: Optional[str] = None   # rollback target, if a release is installed
+    capabilities: list[str] = []             # feature flags the client can gate on
+                                             # (empty on agents predating this field)
     # Where this agent keeps scripts, and the interpreter its tasks should launch
     # with — so the client can pre-fill task defaults per unit. Both the Pi and the
     # X410 report /opt/sdr-agent/scripts (on the X410 that's a symlink onto its

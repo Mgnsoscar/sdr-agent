@@ -52,6 +52,7 @@ POST   /panic                         → emergency stop everything → PanicRes
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import sys
@@ -199,7 +200,9 @@ _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 async def verify_key(key: str | None = Depends(_api_key_header)):
-    if cfg.API_KEY and key != cfg.API_KEY:
+    # Constant-time compare so a wrong key can't be recovered by timing the response.
+    # (Auth is off when API_KEY is empty — a trusted-LAN default; see config.py.)
+    if cfg.API_KEY and not hmac.compare_digest(key or "", cfg.API_KEY):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing API key",
@@ -239,6 +242,7 @@ async def info(manager: ProcessManager = Depends(get_manager)):
         python_version = platform.python_version(),
         tasks          = manager.task_names(),
         previous_version = _make_updater().previous_version(),
+        capabilities     = cfg.AGENT_CAPABILITIES,
         scripts_dir      = str(SCRIPTS_DIR),
         task_interpreter = cfg.TASK_INTERPRETER,
     )
