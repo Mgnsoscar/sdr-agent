@@ -110,8 +110,9 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # and actually install the new code. 1.1.0 adds the per-unit file store + /calibration;
 # 1.1.1 surfaces a script's CAL_SIGNAL_ID in /scripts/{name}/params; 1.1.2 aligns
 # calibration upload-validation and the /calibration view with transmit-time
-# unit_type resolution, and hardens the upload size cap.
-AGENT_VERSION = "1.1.2"
+# unit_type resolution, and hardens the upload size cap; 1.1.3 rejects a
+# duration+hold ramp too short to hold two levels (a single step, not a ramp).
+AGENT_VERSION = "1.1.3"
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
 # task defaults. "python3" (the default) resolves via PATH at launch — on the X410

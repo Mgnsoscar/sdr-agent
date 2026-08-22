@@ -79,8 +79,18 @@ def _full_ladder(start: float, stop: float, delta: float, adelta: float, sign: f
         values = [float(start) + delta * (i / n_int) for i in range(n_int + 1)]
     elif duration_s is not None and hold_s is not None:
         # Duration + hold with no explicit step: the level COUNT is duration/hold
-        # (each level held `hold`), so the whole ramp lasts `duration`.
-        n_levels = max(2, round(float(duration_s) / float(hold_s)))
+        # (each level held `hold`), so the whole ramp lasts `duration`. A ramp needs
+        # at least two held levels; if the duration only fits one (duration rounds to
+        # below 2 × hold), it's a single step, not a ramp — reject it rather than
+        # silently stretching the ramp out to 2 × hold.
+        if float(hold_s) <= 0:
+            raise ValueError("ramp hold time must be positive")
+        n_levels = round(float(duration_s) / float(hold_s))
+        if n_levels < 2:
+            raise ValueError(
+                "duration is too short to ramp at this hold: a ramp needs at least two "
+                "held levels (duration must be about 2 × hold or more). Increase the "
+                "duration, shorten the hold, or use a single tune step instead.")
         n_int = n_levels - 1
         _guard(n_int)
         values = [float(start) + delta * (i / n_int) for i in range(n_int + 1)]

@@ -36,6 +36,17 @@ def test_duration_and_hold_gives_level_count():
     assert r.duration_s == 16
 
 
+def test_duration_hold_too_short_is_rejected():
+    # duration ≈ hold ⇒ a single held level, not a ramp: reject rather than silently
+    # stretching it to 2 × hold (the old max(2, ...) floor did the latter).
+    for duration, hold in ((5, 5), (7, 5), (2, 2)):
+        with pytest.raises(ValueError, match="too short"):
+            ramp.resolve_ramp(0, 10, duration_s=duration, hold_s=hold)
+    # ≥ ~2 × hold still resolves to a real multi-level ramp.
+    r = ramp.resolve_ramp(0, 10, duration_s=10, hold_s=5)
+    assert len(r.values) == 2 and r.duration_s == 10
+
+
 def test_step_not_dividing_clamps_last_to_stop():
     r = ramp.resolve_ramp(0, 42, step=5, hold_s=1)
     assert r.values[0] == 0 and r.values[-1] == 42
