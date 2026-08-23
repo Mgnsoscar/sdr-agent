@@ -772,6 +772,26 @@ async def get_calibration():
             "signals": summary}
 
 
+@app.post("/calibration/validate", tags=["files"], dependencies=[Depends(verify_key)])
+async def validate_calibration(request: Request):
+    """Dry-run: validate a POSTed calibration document WITHOUT storing it, so the editor
+    can preview what it resolves to (or exactly why it's rejected) before Save. Uses the
+    same checks and type-defaults precedence as the upload gate, so the preview matches
+    what a Save would accept and what a transmit would resolve. Always 200 — the verdict
+    is in the body: {valid: true, signals:{…}} or {valid: false, error: "…"}."""
+    import json
+    raw = await request.body()
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        return {"valid": False, "error": f"not valid JSON: {exc}"}
+    try:
+        summary = _calib.validate_document(doc, _effective_type_defaults(doc))
+    except _calib.CalibrationError as exc:
+        return {"valid": False, "error": str(exc)}
+    return {"valid": True, "signals": summary}
+
+
 @app.get("/scripts/{name}/params", tags=["scripts"], dependencies=[Depends(verify_key)])
 async def script_params(name: str):
     """Statically extract a script's parameters (no code execution).

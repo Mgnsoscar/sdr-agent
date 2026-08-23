@@ -121,8 +121,10 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # a run already armed/running on this unit (one TX channel — was a device-busy crash);
 # 1.1.8 moves the read-only task sub-resources (logs, history, live-params, log stream)
 # to their own /task-* prefixes with the name as the terminal segment, so a task name
-# containing '/' can never be misrouted to a shorter name's sub-resource.
-AGENT_VERSION = "1.1.8"
+# containing '/' can never be misrouted to a shorter name's sub-resource;
+# 1.1.9 adds POST /calibration/validate — a dry-run that validates a document without
+# storing it, so the editor can preview what it resolves to before Save.
+AGENT_VERSION = "1.1.9"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -132,6 +134,7 @@ AGENT_CAPABILITIES = [
     "calibration",        # per-unit power calibration: /files store + /calibration view
     "script-cal-signal",  # /scripts/{name}/params reports a script's CAL_SIGNAL_ID
     "ota-status",         # /admin/update-status reports the OTA confirm/rollback state
+    "cal-validate",       # POST /calibration/validate dry-runs a document without storing
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

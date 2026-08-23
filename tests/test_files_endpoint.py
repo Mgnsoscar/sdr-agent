@@ -138,3 +138,46 @@ def test_get_calibration_absent_is_404(tmp_path, monkeypatch):
     with pytest.raises(HTTPException) as exc:
         asyncio.run(main.get_calibration())
     assert exc.value.status_code == 404
+
+
+# ── dry-run validate (POST /calibration/validate) ─────────────────────────────────
+
+class _FakeRequest:
+    """Minimal stand-in: the endpoint only awaits request.body()."""
+    def __init__(self, raw: bytes):
+        self._raw = raw
+
+    async def body(self) -> bytes:
+        return self._raw
+
+
+def _validate(doc_or_bytes):
+    raw = doc_or_bytes if isinstance(doc_or_bytes, (bytes, bytearray)) \
+        else json.dumps(doc_or_bytes).encode()
+    return asyncio.run(main.validate_calibration(_FakeRequest(raw)))
+
+
+def test_validate_ok_returns_signals_without_storing(tmp_path, monkeypatch):
+    _wire(tmp_path, monkeypatch, unit_type="")
+    resp = _validate(_valid_doc())
+    assert resp["valid"] is True
+    assert "gps_l1_mcode" in resp["signals"]
+    # dry run — nothing was written
+    assert not (tmp_path / "data" / "calibration.json").exists()
+
+
+def test_validate_reports_reason_without_raising(tmp_path, monkeypatch):
+    _wire(tmp_path, monkeypatch, unit_type="")
+    doc = _valid_doc()
+    doc["signals"]["gps_l1_mcode"]["curves"]["sdr_output"]["points"] = _pts(
+        [(40, -36.0), (50, -36.0)])                       # not invertible
+    resp = _validate(doc)
+    assert resp["valid"] is False
+    assert "error" in resp and resp["error"]
+
+
+def test_validate_malformed_json_reports_reason(tmp_path, monkeypatch):
+    _wire(tmp_path, monkeypatch, unit_type="")
+    resp = _validate(b"{ not json ")
+    assert resp["valid"] is False
+    assert "JSON" in resp["error"]
