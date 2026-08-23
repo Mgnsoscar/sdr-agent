@@ -12,8 +12,15 @@ GET  /tasks/{name}                    → ProcessStatus
 POST /tasks/{name}/start              → ProcessStatus   body: StartRequest (optional)
 POST /tasks/{name}/stop               → ProcessStatus
 POST /tasks/{name}/restart            → ProcessStatus   body: StartRequest (optional)
-GET  /tasks/{name}/logs?lines=100     → list[str]
-WS   /tasks/{name}/logs/stream        → streaming log
+POST /tasks/{name}/params             → set live params
+GET  /task-logs/{name}?lines=100      → list[str]         (name is terminal — see below)
+WS   /task-log-stream/{name}          → streaming log
+GET  /task-history/{name}             → list[ExitRecord]  (recent exits)
+GET  /task-live-params/{name}         → running task's live-param values
+
+# Read-only task sub-resources use their own /task-* prefixes (name as the final
+# path segment) rather than /tasks/{name}/<sub>, so a task name containing '/' is
+# never misrouted to a shorter name's sub-resource.
 
 GET  /events/stream                   → SSE stream of crash + lifecycle events
 
@@ -25,7 +32,6 @@ DELETE /scripts/{name}                → {"deleted": name}          (delete a s
 GET  /config/tasks-yaml               → raw YAML text
 PUT  /config/tasks-yaml               → write new YAML + auto-reload
 
-GET  /tasks/{name}/history            → list[ExitRecord]  (recent exits)
 GET  /system                          → SystemHealth      (CPU, temp, mem, disk, clock)
 GET  /sdr                             → SdrStatus         (UHD device probe)
 
@@ -380,7 +386,7 @@ async def restart_task(
 
 # ── Live parameters (retune while running) ─────────────────────────────────────
 
-@app.get("/tasks/{name:path}/params/live", tags=["tasks"],
+@app.get("/task-live-params/{name:path}", tags=["tasks"],
          dependencies=[Depends(verify_key)])
 async def get_live_params(name: str, manager: ProcessManager = Depends(get_manager)):
     """The running task's current + applied live-parameter values (from its
@@ -412,7 +418,7 @@ async def set_live_params(
 
 # ── Log fetch (HTTP) ──────────────────────────────────────────────────────────
 
-@app.get("/tasks/{name:path}/logs", response_model=list[str], tags=["logs"],
+@app.get("/task-logs/{name:path}", response_model=list[str], tags=["logs"],
          dependencies=[Depends(verify_key)])
 async def get_logs(
     name: str,
@@ -428,7 +434,7 @@ async def get_logs(
 
 # ── Task exit history ─────────────────────────────────────────────────────────
 
-@app.get("/tasks/{name:path}/history", response_model=list[ExitRecord], tags=["tasks"],
+@app.get("/task-history/{name:path}", response_model=list[ExitRecord], tags=["tasks"],
          dependencies=[Depends(verify_key)])
 async def task_history(name: str, manager: ProcessManager = Depends(get_manager)):
     """Recent exits for a task (newest last) — useful for spotting crash loops."""
@@ -439,9 +445,14 @@ async def task_history(name: str, manager: ProcessManager = Depends(get_manager)
 
 
 # ── Single task status ────────────────────────────────────────────────────────
-# Defined AFTER the /tasks/{name}/… sub-routes: {name:path} is greedy, so registering
-# this catch-all last lets a name contain '/' (e.g. "GPS/L1") without swallowing the
-# more specific /logs, /history, /params routes.
+# The read-only sub-resources (logs, history, live params) live under their own
+# top-level prefixes (/task-logs, /task-history, /task-live-params) where the task
+# name is the FINAL, greedy {name:path} segment. That leaves this bare GET as the sole
+# GET consumer of /tasks/*, so a name containing '/' — even one ending in "logs" or
+# "history" — is never misrouted to a sub-resource of a shorter name. The POST action
+# routes (/start /stop /restart /params) keep their verb suffix: the client always
+# appends the literal verb, so {name:path} can't swallow it. Still registered after the
+# POST routes for clarity; correctness no longer depends on the order.
 
 @app.get("/tasks/{name:path}", response_model=ProcessStatus, tags=["tasks"],
          dependencies=[Depends(verify_key)])
@@ -454,7 +465,7 @@ async def task_status(name: str, manager: ProcessManager = Depends(get_manager))
 
 # ── Log stream (WebSocket) ────────────────────────────────────────────────────
 
-@app.websocket("/tasks/{name:path}/logs/stream")
+@app.websocket("/task-log-stream/{name:path}")
 async def stream_logs(
     name: str,
     websocket: WebSocket,

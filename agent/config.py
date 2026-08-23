@@ -116,8 +116,13 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # 1.1.5 confirms a freshly-activated OTA release before the slow startup steps (so a
 # slow boot can't get a good update rolled back) and exposes /admin/update-status;
 # 1.1.6 lets a task name contain '/' (routes use {name:path}; log/socket paths are
-# sanitised + hash-disambiguated and can no longer traverse).
-AGENT_VERSION = "1.1.6"
+# sanitised + hash-disambiguated and can no longer traverse); 1.1.7 rejects arming a
+# sequence when one of its tasks is already running, or when its on-air window overlaps
+# a run already armed/running on this unit (one TX channel — was a device-busy crash);
+# 1.1.8 moves the read-only task sub-resources (logs, history, live-params, log stream)
+# to their own /task-* prefixes with the name as the terminal segment, so a task name
+# containing '/' can never be misrouted to a shorter name's sub-resource.
+AGENT_VERSION = "1.1.8"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
