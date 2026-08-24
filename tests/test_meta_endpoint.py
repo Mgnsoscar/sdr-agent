@@ -17,6 +17,7 @@ def test_capabilities_advertised_and_stable():
     assert "script-cal-signal" in cfg.AGENT_CAPABILITIES
     assert "cal-validate" in cfg.AGENT_CAPABILITIES
     assert "calibration-components" in cfg.AGENT_CAPABILITIES     # calibration v2
+    assert "calibration-partial-stages" in cfg.AGENT_CAPABILITIES  # partial measured stages
 
 
 def test_agent_info_carries_capabilities():

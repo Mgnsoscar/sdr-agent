@@ -143,7 +143,12 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # frequency; the resolved artifact carries the passive-hop tables + a frequency-split
 # ceiling so the script folds --power at its live frequency. Inline delta_db and every
 # v1 document keep resolving unchanged.
-AGENT_VERSION = "1.2.0"
+# 1.3.0 adds partial measured stages: a signal missing the curve for a non-first measured
+# stage inherits the nearest upstream measured curve (a transparent +0 dB hop) instead of
+# being rejected — so a downstream measured plane can be added for a signal or two without
+# re-measuring the rest. Such a document RESOLVES here but is REJECTED by ≤1.2.0 agents,
+# so the client gates on the calibration-partial-stages capability below.
+AGENT_VERSION = "1.3.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -156,6 +161,8 @@ AGENT_CAPABILITIES = [
     "cal-validate",       # POST /calibration/validate dry-runs a document without storing
     "calibration-components",  # v2: a derived plane may reference a components.yaml entry
                                # (Δ dB-vs-frequency); resolved per transmit frequency
+    "calibration-partial-stages",  # a signal may omit the curve for a non-first measured
+                                   # stage and inherit the nearest upstream measured curve
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
