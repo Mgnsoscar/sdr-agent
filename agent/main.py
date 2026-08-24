@@ -675,6 +675,33 @@ def _validate_calibration_upload(content: bytes) -> dict:
                             detail=f"{cfg.CALIBRATION_NAME} is invalid: {exc}")
 
 
+def _validate_components_upload(content: bytes) -> None:
+    """Validate-on-upload for components.yaml: parse and check every component's
+    delta_db_by_freq table (≥1 point, strictly increasing in frequency), so a broken
+    catalog is rejected here rather than surfacing as an "unknown/invalid component" at
+    transmit. Raises HTTPException 400 with a specific reason."""
+    import io
+    try:
+        doc = yaml.safe_load(io.BytesIO(content)) or {}
+    except yaml.YAMLError as exc:
+        raise HTTPException(status_code=400,
+                            detail=f"{cfg.CALIBRATION_COMPONENTS_NAME} is not valid: {exc}")
+    if not isinstance(doc, dict):
+        raise HTTPException(status_code=400,
+                            detail=f"{cfg.CALIBRATION_COMPONENTS_NAME} is not an object")
+    comps = doc.get("components")
+    if comps is not None and not isinstance(comps, dict):
+        raise HTTPException(status_code=400, detail="'components' must be an object")
+    for cid, spec in (comps or {}).items():
+        if not isinstance(spec, dict):
+            raise HTTPException(status_code=400, detail=f"component {cid!r} is not an object")
+        try:
+            _calib._freq_table(spec.get("delta_db_by_freq"), f"component {cid!r}")
+        except _calib.CalibrationError as exc:
+            raise HTTPException(status_code=400,
+                                detail=f"{cfg.CALIBRATION_COMPONENTS_NAME} is invalid: {exc}")
+
+
 @app.post("/files", tags=["files"], dependencies=[Depends(verify_key)])
 async def upload_file(file: UploadFile = File(...)):
     """Upload a unit-specific data file into the per-unit store. `calibration.json`
@@ -698,8 +725,13 @@ async def upload_file(file: UploadFile = File(...)):
         chunks.append(chunk)
     content = b"".join(chunks)
 
-    # Validate known kinds BEFORE writing, so a bad calibration never lands on disk.
-    summary = _validate_calibration_upload(content) if name == cfg.CALIBRATION_NAME else None
+    # Validate known kinds BEFORE writing, so a bad calibration / catalog never lands
+    # on disk.
+    summary = None
+    if name == cfg.CALIBRATION_NAME:
+        summary = _validate_calibration_upload(content)
+    elif name == cfg.CALIBRATION_COMPONENTS_NAME:
+        _validate_components_upload(content)
 
     try:
         cfg.DATA_DIR.mkdir(parents=True, exist_ok=True)

@@ -387,5 +387,16 @@ Each stage is shippable and leaves the system working (v1 docs valid throughout)
     declaring `CAL_FREQ_PARAM` and passing that value to `PowerMap` (and the client
     setting `SDR_CAL_FREQ_HZ` from it — Stage 3). No committed script uses `PowerMap`
     yet, so there is nothing to port; the consumer contract is ready for the first one.
-- **Stage 3 (client)** — component-library editor + chain builder + set `SDR_CAL_FREQ_HZ`
-  from the script's `CAL_FREQ_PARAM`. Not started.
+- **Stage 3 (client) — mostly done.** `sdr-client`: a `ComponentCatalog` (the client's
+  canonical library; VNA-sweep paste, validation, the `components.yaml` wire format), a
+  **Component library** editor dialog, and the Calibration tab's chain now offers a
+  **component picker** on each derived plane (or a constant Δ dB) plus a per-signal
+  `center_freq_hz` field. On Save/Validate the catalog is uploaded to the unit first so
+  references resolve; on open the unit's catalog is merged back so a fresh client learns
+  the deployed parts. The catalog rides the existing `/files` store as the reserved,
+  validated `components.yaml` (agent `CALIBRATION_COMPONENTS` → `DATA_DIR/components.yaml`,
+  validated on upload) — so "deploy the catalog" reuses the calibration.json path rather
+  than a new fleet-config channel.
+  - *Remaining:* the client setting `SDR_CAL_FREQ_HZ` on a task from the script's
+    `CAL_FREQ_PARAM` (task-creation wiring), and the visual chain-flow polish from the
+    mockup. The resolver/consumer already handle everything behind it.
