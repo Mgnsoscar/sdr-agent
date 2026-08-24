@@ -136,8 +136,14 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # to their own /task-* prefixes with the name as the terminal segment, so a task name
 # containing '/' can never be misrouted to a shorter name's sub-resource;
 # 1.1.9 adds POST /calibration/validate — a dry-run that validates a document without
-# storing it, so the editor can preview what it resolves to before Save.
-AGENT_VERSION = "1.1.9"
+# storing it, so the editor can preview what it resolves to before Save;
+# 1.2.0 adds calibration v2 (docs/calibration-v2.md): a derived plane may reference a
+# shared component catalog (components.yaml — a reserved, validated file in the /files
+# store) whose cable/antenna loss is a Δ dB-vs-frequency table, resolved at the transmit
+# frequency; the resolved artifact carries the passive-hop tables + a frequency-split
+# ceiling so the script folds --power at its live frequency. Inline delta_db and every
+# v1 document keep resolving unchanged.
+AGENT_VERSION = "1.2.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -148,6 +154,8 @@ AGENT_CAPABILITIES = [
     "script-cal-signal",  # /scripts/{name}/params reports a script's CAL_SIGNAL_ID
     "ota-status",         # /admin/update-status reports the OTA confirm/rollback state
     "cal-validate",       # POST /calibration/validate dry-runs a document without storing
+    "calibration-components",  # v2: a derived plane may reference a components.yaml entry
+                               # (Δ dB-vs-frequency); resolved per transmit frequency
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
