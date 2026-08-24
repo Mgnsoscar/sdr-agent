@@ -74,7 +74,8 @@ def _inject_calibration(env: dict, task_name: str) -> None:
     try:
         artifact = _calib.resolve_public(
             _agentcfg.CALIBRATION_DOC, _agentcfg.CALIBRATION_DEFAULTS,
-            signal_id, unit_type=_agentcfg.UNIT_TYPE)
+            signal_id, unit_type=_agentcfg.UNIT_TYPE,
+            components_path=_agentcfg.CALIBRATION_COMPONENTS)
     except _calib.SignalNotCalibrated as exc:
         logger.warning("Task '%s': %s — using the script's baked-in calibration "
                        "defaults", task_name, exc)

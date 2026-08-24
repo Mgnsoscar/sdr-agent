@@ -318,21 +318,41 @@ Each stage is shippable and leaves the system working (v1 docs valid throughout)
 
 ---
 
-## 10. Decisions taken (this thread) and still-open items
+## 10. Decisions taken
 
-**Taken:**
-- Catalog is a **fleet-level shared file**, deployed to units.
-- The **script declares its frequency parameter** (`CAL_FREQ_PARAM`); the agent reads it,
-  the script applies it at runtime.
+- Catalog is a **fleet-level shared file** (`configs/components.yaml`, its own file —
+  components are hardware reusable across *all* unit types, whereas
+  `calibration_defaults.yaml` is keyed *by* unit type), deployed to units.
+- The **script declares its frequency parameter** (`CAL_FREQ_PARAM`); the agent reads
+  it, the script applies it at runtime. *(Stage 2.)*
 - **Only passive components are frequency-aware**; measured planes (SDR, amp) stay
   measured per signal (no VNA on an SDR).
+- A component's table stores **signed `delta_db`** (`delta_db_by_freq: [[hz, db], …]`,
+  negative = loss, positive = gain) — a VNA reading is already signed, and it keeps a
+  single code path.
+- **Linear** interpolation over frequency (matches the gain-curve interp); a monotone
+  spline stays a future option that needs no schema change.
+- A per-signal **`center_freq_hz`** is the *representative* frequency: it both drives the
+  editor's bounds preview **and** is the frequency the agent folds the v1-compat artifact
+  `curve` / scalar ceiling at. It is **required** for a signal whose operating/limit
+  chain passes through a frequency-dependent component (else resolution refuses), and
+  ignored for constant chains.
 
-**Open:**
-- File name/format for the catalog (`components.yaml` vs folding a `components:` block
-  into `calibration_defaults.yaml`).
-- Whether a component's table stores `delta_db` directly (signed) or a typed `loss_db`
-  (positive, sign implied by `kind`). Leaning signed `delta_db` for one code path.
-- Interp over frequency: linear (matches the gain interp) vs a monotone option later —
-  same "open item" v1 left for gain curves.
-- Whether to keep an optional per-signal *representative* frequency in the doc purely so
-  the editor can show bounds before a task exists (display-only; never used at transmit).
+## 11. Implementation status
+
+- **Stage 1 (agent core) — done.** `agent/calibration.py`: derived planes carry a
+  `delta_db`-vs-frequency table resolved from an inline `delta_db` (1-point → constant)
+  or a catalog `component`; the ceiling is split into a frequency-independent part and
+  frequency-dependent limits; `resolve` / `validate_document` take the catalog and an
+  optional representative frequency; `load_components` reads `configs/components.yaml`;
+  the artifact keeps `schema_version: 1` and stays v1-consumable (always emits `curve`),
+  adding the v2 fields (`anchor_curve`, `passive_hops`, `gain_ceiling_db`,
+  `freq_dependent_limits`, `center_freq_hz`) **additively** — a v2 consumer detects them
+  by the presence of `passive_hops`, so no version gate is needed anywhere. Wired into
+  `config.CALIBRATION_COMPONENTS`, `process_manager` injection, and the `/calibration`
+  validate/dry-run endpoints. All v1 documents resolve byte-identically. Covered by
+  `tests/test_calibration_v2.py`.
+- **Stage 2 (script/runtime)** — `CAL_FREQ_PARAM` + agent read-through, `PowerMap` v2
+  (fold `passive_hops` at the live frequency; the injected artifact also grows a
+  `freq_param` field then). Not started.
+- **Stage 3 (client)** — component-library editor + chain builder. Not started.

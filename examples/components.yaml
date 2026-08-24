@@ -1,0 +1,39 @@
+# Shared RF component catalog (calibration v2 — see docs/calibration-v2.md).
+#
+# Passive parts (cables, antennas, pads) characterized once and reused across units.
+# A per-unit calibration.json references these by id from a `derived` plane:
+#
+#     "cable_output": { "type": "derived", "from": "amplifier_output",
+#                       "component": "cable_lmr240_3m_a" }
+#
+# Deploy this file to units as configs/components.yaml (SDR_CALIBRATION_COMPONENTS).
+# Only passive components live here — the amplifier and SDR output are MEASURED per
+# unit and stay in the unit's document, not the catalog.
+schema_version: 1
+components:
+
+  # delta_db_by_freq: [[freq_hz, delta_db], ...], strictly increasing in frequency.
+  # Signed dB — as a VNA reads it: negative = loss, positive = gain. One point ⇒ a
+  # frequency-independent constant. Values between points are linearly interpolated;
+  # a frequency outside the table clamps to the nearest end (never extrapolated).
+
+  cable_lmr240_3m_a:
+    kind: cable
+    description: "3 m LMR-240, connector set A (VNA sweep 2026-08)"
+    delta_db_by_freq:
+      - [1.100e9, -2.30]
+      - [1.400e9, -2.62]
+      - [1.600e9, -2.81]
+
+  patch_a:
+    kind: antenna
+    description: "6 dBi GNSS patch, s/n 014"
+    delta_db_by_freq:
+      - [1.170e9, 5.1]
+      - [1.575e9, 6.0]
+
+  pad_3db:
+    kind: pad
+    description: "3 dB SMA attenuator (flat)"
+    delta_db_by_freq:
+      - [0, -3.0]      # one point ⇒ constant at every frequency

@@ -64,42 +64,92 @@ class _Measured:
 
 @dataclass
 class _Derived:
-    """A derived plane: a constant dB hop from a parent plane."""
+    """A derived plane: a passive dB hop from a parent plane (cable loss, antenna gain,
+    a pad). The hop is a ``delta_db``-vs-frequency table (signed: negative = loss); a
+    single-point table is a frequency-independent constant (an inline v1 ``delta_db``,
+    or a flat pad). ``component`` names the catalog entry it came from, or ``""`` when
+    the hop was stated inline. See docs/calibration-v2.md."""
     frm: str
-    delta_db: float
+    table: list                              # [(freq_hz, delta_db)], strictly increasing freq
+    component: str = ""
     quantity: str = ""
     description: str = ""
+
+    @property
+    def is_freq_dependent(self) -> bool:
+        return len(self.table) > 1
+
+    def delta_at(self, freq: Optional[float]) -> float:
+        """The hop's dB at ``freq`` (linear interp, endpoint-clamped). A one-point table
+        is constant, so ``freq`` may be None there; a multi-point table needs a
+        frequency (the resolver guarantees one is available before it gets here)."""
+        if len(self.table) == 1:
+            return self.table[0][1]
+        if freq is None:
+            raise CalibrationError(
+                f"derived hop from {self.frm!r} is frequency-dependent but no frequency "
+                f"is available to evaluate it")
+        fs = [f for f, _ in self.table]
+        ds = [d for _, d in self.table]
+        return _interp(float(freq), fs, ds)
 
 
 @dataclass
 class ResolvedCalibration:
     """The runtime-usable result for one (unit, signal). ``gain_for_power`` and
     ``power_for_gain`` are the two functions the transmit script needs; the rest is
-    for the banner / reporting."""
+    for the banner / reporting.
+
+    Frequency (docs/calibration-v2.md): passive hops (cable, antenna) can vary with
+    frequency, so the two functions take an optional ``freq`` — defaulting to the
+    signal's representative ``center_freq_hz`` (``_freq_hz``). A constant chain ignores
+    frequency entirely, so v1 documents behave exactly as before with ``freq=None``.
+    The ceiling is split into a frequency-independent part (``_gain_ceiling_const`` —
+    the amp-protection limit lives on a MEASURED plane, so it never moves) and any
+    limits whose plane passes through a passive hop (``_freq_limits``)."""
     signal_id: str
     unit_type: str
     amplitude: Optional[float]
     min_gain_db: float
-    max_gain_db: float
     operating_plane: str
     operating_quantity: str
     _planes: dict = field(repr=False, default_factory=dict)
+    _freq_hz: Optional[float] = None                 # representative frequency, or None
+    _gain_ceiling_const: float = float("inf")        # freq-independent gain cap
+    _freq_limits: list = field(repr=False, default_factory=list)  # [(plane, max_dbm, reason)]
+
+    def _eff_freq(self, freq: Optional[float]) -> Optional[float]:
+        return self._freq_hz if freq is None else freq
+
+    def _max_gain_at(self, freq: Optional[float]) -> float:
+        """The safety ceiling in gain-space at ``freq``: the tightest of the
+        frequency-independent cap and every frequency-dependent limit."""
+        caps = [self._gain_ceiling_const]
+        for plane, max_dbm, _ in self._freq_limits:
+            caps.append(_gain_for_power_on(max_dbm, plane, self._planes, freq))
+        return min(caps)
 
     # ── the two functions the script calls ──────────────────────────────────────
-    def gain_for_power(self, delivered_dbm: float) -> float:
+    def gain_for_power(self, delivered_dbm: float, freq: Optional[float] = None) -> float:
         """Commanded SDR gain (dB) for a requested power at the operating plane,
-        clamped to [min_gain_db, max_gain_db]. Upward is clamped to the ceiling,
-        never extrapolated past it."""
-        g = _gain_for_power_on(float(delivered_dbm), self.operating_plane, self._planes)
-        return min(max(g, self.min_gain_db), self.max_gain_db)
+        clamped to [min_gain_db, max_gain]. Upward is clamped to the ceiling, never
+        extrapolated past it."""
+        f = self._eff_freq(freq)
+        g = _gain_for_power_on(float(delivered_dbm), self.operating_plane, self._planes, f)
+        return min(max(g, self.min_gain_db), self._max_gain_at(f))
 
-    def power_for_gain(self, gain_db: float) -> float:
+    def power_for_gain(self, gain_db: float, freq: Optional[float] = None) -> float:
         """Delivered power (dBm) at the operating plane for an (actual) commanded
         gain — what the radio really settled on, for the report/banner."""
-        g = min(max(float(gain_db), self.min_gain_db), self.max_gain_db)
-        return _power_on(self.operating_plane, g, self._planes)
+        f = self._eff_freq(freq)
+        g = min(max(float(gain_db), self.min_gain_db), self._max_gain_at(f))
+        return _power_on(self.operating_plane, g, self._planes, f)
 
-    # ── convenience for the script's --power min/max bounds ─────────────────────
+    # ── convenience for the script's --power min/max bounds (at the rep. frequency) ─
+    @property
+    def max_gain_db(self) -> float:
+        return self._max_gain_at(self._freq_hz)
+
     @property
     def max_power_dbm(self) -> float:
         return self.power_for_gain(self.max_gain_db)
@@ -113,22 +163,38 @@ class ResolvedCalibration:
         q = self.operating_quantity or "power"
         return f"{q}, at {self.operating_plane}"
 
-    def operating_curve(self) -> list[list[float]]:
+    def operating_curve(self, freq: Optional[float] = None) -> list:
         """The operating-plane transfer as a flat, gain-sorted ``[[gain, power], …]``
-        table at the anchor's measured breakpoints (derived hops folded in). This is
-        the whole mapping a script needs to convert --power ↔ gain at runtime — it
-        can linearly interpolate/invert this directly, no plane model required."""
-        _, anchor = _anchor(self.operating_plane, self._planes)
-        return [[g, _power_on(self.operating_plane, g, self._planes)]
+        table at the anchor's measured breakpoints (derived hops folded in at ``freq``).
+        A v1 script consumes this directly; a v2 script prefers ``anchor_curve`` +
+        ``passive_hops`` so it can re-fold at its live frequency."""
+        f = self._eff_freq(freq)
+        _, anchor = _anchor(self.operating_plane, self._planes, f)
+        return [[g, _power_on(self.operating_plane, g, self._planes, f)]
                 for g in anchor.gains]
 
+    def anchor_curve(self) -> list:
+        """The operating plane's measured anchor curve (gain → power, offset folded in),
+        BEFORE any passive hop — the base a v2 consumer re-folds ``passive_hops`` onto."""
+        _, m = _anchor(self.operating_plane, self._planes, self._freq_hz)
+        return [[g, m.power_at(g)] for g in m.gains]
+
+    def passive_hops(self) -> list:
+        """The ordered passive hops (anchor → operating), each with its frequency table.
+        Empty when the operating plane is measured (no cable/antenna)."""
+        return [{"plane": name, "component": d.component or None,
+                 "delta_db_by_freq": [[f, db] for f, db in d.table]}
+                for name, d in _hops(self.operating_plane, self._planes)]
+
     def to_public_dict(self) -> dict:
-        """The resolved artifact the agent writes for a task to consume. Everything
-        a script needs and nothing about planes: the flattened operating curve, the
-        gain clamps, the amplitude the curves were measured at, and the quantity
-        label for the banner. A single-point curve here means the reader applies the
-        same slope-1 fallback the resolver does."""
-        return {
+        """The resolved artifact the agent writes for a task to consume.
+
+        Always carries the v1 fields (``curve`` folded at the representative frequency,
+        gain clamps, amplitude, quantity) so existing scripts keep working unchanged.
+        When the operating plane sits behind passive hops it ALSO carries the v2 fields
+        (``anchor_curve``, ``passive_hops``, the split ceiling) so a frequency-aware
+        consumer can re-fold at its live transmit frequency (docs/calibration-v2.md)."""
+        out = {
             "schema_version": SCHEMA_VERSION,
             "signal_id": self.signal_id,
             "unit_type": self.unit_type,
@@ -141,6 +207,17 @@ class ResolvedCalibration:
             "max_power_dbm": self.max_power_dbm,
             "curve": self.operating_curve(),
         }
+        hops = self.passive_hops()
+        if hops:
+            out["anchor_curve"] = self.anchor_curve()
+            out["passive_hops"] = hops
+            out["freq_dependent_limits"] = [
+                {"plane": p, "max_dbm": mx, "reason": rs} for p, mx, rs in self._freq_limits]
+            if self._gain_ceiling_const != float("inf"):
+                out["gain_ceiling_db"] = self._gain_ceiling_const
+            if self._freq_hz is not None:
+                out["center_freq_hz"] = self._freq_hz
+        return out
 
 
 # ── Linear interpolation (pure python — the agent has no numpy dependency) ───────
@@ -167,31 +244,50 @@ def _interp(x: float, xs: list[float], ys: list[float]) -> float:
 
 # ── Plane traversal (mirrors docs/calibration.md §7.3) ───────────────────────────
 
-def _power_on(plane_name: str, gain: float, planes: dict) -> float:
+def _power_on(plane_name: str, gain: float, planes: dict, freq: Optional[float]) -> float:
     """Power at ``plane_name`` for a commanded gain, walking derived hops down to a
-    measured curve."""
+    measured curve. Each derived hop is evaluated at ``freq``."""
     p = planes[plane_name]
     if isinstance(p, _Measured):
         return p.power_at(gain)
-    return _power_on(p.frm, gain, planes) + p.delta_db     # derived: constant hop
+    return _power_on(p.frm, gain, planes, freq) + p.delta_at(freq)
 
 
-def _anchor(plane_name: str, planes: dict) -> tuple[float, _Measured]:
+def _anchor(plane_name: str, planes: dict, freq: Optional[float]) -> tuple[float, _Measured]:
     """Walk derived hops down to the nearest measured ancestor, accumulating the
-    total derived delta. Returns (delta, measured_plane)."""
+    total derived delta (evaluated at ``freq``). Returns (delta, measured_plane)."""
     delta, p = 0.0, planes[plane_name]
     while isinstance(p, _Derived):
-        delta += p.delta_db
+        delta += p.delta_at(freq)
         p = planes[p.frm]
     return delta, p
 
 
-def _gain_for_power_on(power: float, plane_name: str, planes: dict) -> float:
+def _hops(plane_name: str, planes: dict) -> list:
+    """The ordered derived hops from the measured anchor OUT to ``plane_name``, as
+    ``[(plane_name, _Derived), …]`` (anchor-first). Empty if the plane is measured."""
+    chain = []
+    name, p = plane_name, planes[plane_name]
+    while isinstance(p, _Derived):
+        chain.append((name, p))
+        name, p = p.frm, planes[p.frm]
+    chain.reverse()
+    return chain
+
+
+def _path_freq_dependent(plane_name: str, planes: dict) -> bool:
+    """True if any derived hop between ``plane_name`` and its measured anchor varies
+    with frequency (a multi-point component table)."""
+    return any(d.is_freq_dependent for _, d in _hops(plane_name, planes))
+
+
+def _gain_for_power_on(power: float, plane_name: str, planes: dict,
+                       freq: Optional[float]) -> float:
     """Gain that yields ``power`` at ``plane_name``. Subtract downstream derived
-    deltas to reach the anchor measured plane, then invert its curve once. Clamps at
-    the measured range — upward to the top gain (never extrapolated past the
-    ceiling), downward to the bottom gain."""
-    delta, m = _anchor(plane_name, planes)
+    deltas (at ``freq``) to reach the anchor measured plane, then invert its curve
+    once. Clamps at the measured range — upward to the top gain (never extrapolated
+    past the ceiling), downward to the bottom gain."""
+    delta, m = _anchor(plane_name, planes, freq)
     target = power - delta - m.offset_db
     if len(m.powers) == 1:
         return m.gains[0] + (target - m.powers[0])         # slope-1 inverse
@@ -221,13 +317,20 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 def resolve(unit_doc: dict,
             type_defaults: Optional[dict],
-            signal_id: str) -> ResolvedCalibration:
+            signal_id: str,
+            components: Optional[dict] = None,
+            freq_hz: Optional[float] = None) -> ResolvedCalibration:
     """Resolve the calibration for one (unit, signal).
 
     ``unit_doc``      the parsed per-unit calibration.json.
     ``type_defaults`` the ``types[unit_type]`` section from the shared
                       calibration_defaults file (chain/defaults skeleton), or None.
     ``signal_id``     the script's stable CAL_SIGNAL_ID.
+    ``components``    the shared component catalog ``{id: {delta_db_by_freq, …}}`` a
+                      derived plane may reference (docs/calibration-v2.md), or None.
+    ``freq_hz``       representative frequency to evaluate frequency-dependent hops at
+                      for the scalar read-outs / the v1-compat artifact curve; falls
+                      back to the signal's ``center_freq_hz``.
 
     Raises :class:`SignalNotCalibrated` if the signal is absent, or
     :class:`CalibrationError` for any hard defect. Otherwise returns a
@@ -262,37 +365,70 @@ def resolve(unit_doc: dict,
     if not isinstance(curves, dict):
         raise CalibrationError(f"signals.{signal_id}.curves is not an object")
     amplitude = sig.get("amplitude", defaults.get("amplitude"))
+    # Representative frequency: explicit arg wins, else the signal's center_freq_hz.
+    rep = freq_hz if freq_hz is not None else sig.get("center_freq_hz")
+    rep_freq = float(rep) if rep is not None else None
 
-    # 3. build planes, attaching this signal's curves into the measured ones
-    planes = _build_planes(planes_spec, curves, signal_id)
+    # 3. build planes, attaching this signal's curves into the measured ones and
+    #    resolving derived planes' hops (inline delta_db or a catalog component).
+    planes = _build_planes(planes_spec, curves, signal_id, components or {})
 
     # 4. validate topology + operating plane usability
     _validate_topology(planes, operating_plane)
 
-    # 5. gain bounds + ceiling
+    # 5. gain bounds + ceiling, split into a frequency-independent part (the tightest
+    #    that never moves — e.g. the amp-protection limit on the MEASURED sdr_output)
+    #    and any limits whose plane sits behind a passive hop (frequency-dependent).
     gl = chain.get("gain_limits") or {}
     gmin = float(gl.get("min_gain_db", 0.0))
-    gmax = _resolve_max_gain(chain, planes)
-    if gmax < gmin:
+    const_caps: list = []
+    freq_limits: list = []
+    if gl.get("max_gain_db") is not None:
+        const_caps.append(float(gl["max_gain_db"]))
+    for lim in (chain.get("limits") or []):
+        plane = lim.get("plane")
+        if plane not in planes:
+            raise CalibrationError(f"limit references unknown plane {plane!r}")
+        _require_usable(plane, planes)               # need a curve to invert against
+        if _path_freq_dependent(plane, planes):
+            freq_limits.append((plane, float(lim["max_dbm"]), lim.get("reason", "")))
+        else:
+            const_caps.append(_gain_for_power_on(float(lim["max_dbm"]), plane, planes, None))
+    if not const_caps and not freq_limits:
+        raise CalibrationError("no safety ceiling derivable — refusing to transmit")
+    gain_ceiling_const = min(const_caps) if const_caps else float("inf")
+
+    # A frequency-dependent operating plane or ceiling needs a representative frequency,
+    # so the scalar read-outs and the v1-compat artifact curve have a defined operating
+    # point (a v2 consumer still re-folds per its live transmit frequency).
+    if (freq_limits or _path_freq_dependent(operating_plane, planes)) and rep_freq is None:
         raise CalibrationError(
-            f"resolved max gain {gmax:.2f} dB is below min gain {gmin:.2f} dB")
+            f"signal {signal_id!r} uses a frequency-dependent component but has no "
+            f"'center_freq_hz' to evaluate the operating point / ceiling at")
 
     op_quantity = _quantity_of(planes[operating_plane])
-    return ResolvedCalibration(
+    resolved = ResolvedCalibration(
         signal_id=signal_id, unit_type=unit_type, amplitude=amplitude,
-        min_gain_db=gmin, max_gain_db=gmax,
-        operating_plane=operating_plane, operating_quantity=op_quantity,
-        _planes=planes)
+        min_gain_db=gmin, operating_plane=operating_plane, operating_quantity=op_quantity,
+        _planes=planes, _freq_hz=rep_freq,
+        _gain_ceiling_const=gain_ceiling_const, _freq_limits=freq_limits)
+    if resolved.max_gain_db < gmin:
+        raise CalibrationError(
+            f"resolved max gain {resolved.max_gain_db:.2f} dB is below min gain "
+            f"{gmin:.2f} dB")
+    return resolved
 
 
-def validate_document(unit_doc: dict, type_defaults: Optional[dict] = None) -> dict:
+def validate_document(unit_doc: dict, type_defaults: Optional[dict] = None,
+                      components: Optional[dict] = None) -> dict:
     """Structural validation of a WHOLE calibration document, as it would resolve at
     runtime — for validate-on-upload (docs/calibration.md §9.2).
 
     Runs :func:`resolve` for every signal in the document (so every measured curve,
-    every plane reference, the ceiling, and the operating plane are checked exactly
-    as at transmit time) and raises :class:`CalibrationError` on any document-level
-    defect or any invalid signal. On success returns a per-signal summary dict:
+    every plane / component reference, the ceiling, and the operating plane are checked
+    exactly as at transmit time) and raises :class:`CalibrationError` on any
+    document-level defect or any invalid signal. ``components`` is the shared catalog a
+    derived plane may reference. On success returns a per-signal summary dict:
     ``{signal_id: {operating_plane, quantity, min/max gain & power}}`` — handy for a
     UI to show what each signal resolved to.
     """
@@ -309,7 +445,7 @@ def validate_document(unit_doc: dict, type_defaults: Optional[dict] = None) -> d
     summary, bad = {}, {}
     for sig_id in signals:
         try:
-            r = resolve(unit_doc, type_defaults, sig_id)
+            r = resolve(unit_doc, type_defaults, sig_id, components)
             summary[sig_id] = {
                 "operating_plane": r.operating_plane,
                 "quantity": r.operating_quantity,
@@ -331,9 +467,28 @@ def validate_document(unit_doc: dict, type_defaults: Optional[dict] = None) -> d
     return summary
 
 
-def _build_planes(planes_spec: dict, curves: dict, signal_id: str) -> dict:
+def _freq_table(raw, ctx: str) -> list:
+    """Validate + sort a ``[[freq_hz, delta_db], …]`` table: ≥1 point, strictly
+    increasing in frequency. Signed dB (negative = loss). One point ⇒ a constant hop."""
+    if not isinstance(raw, list) or not raw:
+        raise CalibrationError(f"{ctx}: delta_db_by_freq must be a non-empty list")
+    try:
+        pts = sorted(((float(f), float(d)) for f, d in raw), key=lambda fd: fd[0])
+    except (TypeError, ValueError) as exc:
+        raise CalibrationError(f"{ctx}: malformed delta_db_by_freq point: {exc}")
+    for i in range(1, len(pts)):
+        if pts[i][0] <= pts[i - 1][0]:
+            raise CalibrationError(
+                f"{ctx}: delta_db_by_freq frequencies not strictly increasing "
+                f"near {pts[i][0]:g} Hz")
+    return pts
+
+
+def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
+                  components: dict) -> dict:
     """Turn the chain's plane specs (topology, no points) plus the signal's curves
-    into resolved _Measured / _Derived objects."""
+    into resolved _Measured / _Derived objects. A derived plane's hop comes from an
+    inline ``delta_db`` (constant) or a catalog ``component`` (a frequency table)."""
     # every curve must name a measured plane in the chain
     for name in curves:
         p = planes_spec.get(name)
@@ -368,9 +523,28 @@ def _build_planes(planes_spec: dict, curves: dict, signal_id: str) -> dict:
             frm = spec.get("from")
             if not frm:
                 raise CalibrationError(f"derived plane {name!r} has no 'from'")
-            if "delta_db" not in spec:
-                raise CalibrationError(f"derived plane {name!r} has no 'delta_db'")
-            planes[name] = _Derived(frm=frm, delta_db=float(spec["delta_db"]),
+            has_comp = "component" in spec
+            has_delta = "delta_db" in spec
+            if has_comp and has_delta:
+                raise CalibrationError(
+                    f"derived plane {name!r} has both 'component' and 'delta_db' "
+                    f"(use one)")
+            if not has_comp and not has_delta:
+                raise CalibrationError(
+                    f"derived plane {name!r} has neither 'component' nor 'delta_db'")
+            comp_id = ""
+            if has_comp:
+                comp_id = spec["component"]
+                comp = components.get(comp_id)
+                if not isinstance(comp, dict):
+                    raise CalibrationError(
+                        f"derived plane {name!r} references unknown component "
+                        f"{comp_id!r}")
+                table = _freq_table(comp.get("delta_db_by_freq"),
+                                    f"component {comp_id!r}")
+            else:
+                table = [(0.0, float(spec["delta_db"]))]   # constant, frequency-independent
+            planes[name] = _Derived(frm=frm, table=table, component=comp_id,
                                     quantity=quantity, description=description)
         else:
             raise CalibrationError(f"plane {name!r} has invalid type {ptype!r}")
@@ -431,25 +605,6 @@ def _require_usable(plane_name: str, planes: dict) -> _Measured:
     return p
 
 
-def _resolve_max_gain(chain: dict, planes: dict) -> float:
-    """The safety ceiling in gain-space: the tightest of the explicit hardware max
-    and every limit (each inverted through its plane against THIS signal's curve).
-    A ceiling is mandatory."""
-    candidates: list[float] = []
-    gl = chain.get("gain_limits") or {}
-    if gl.get("max_gain_db") is not None:
-        candidates.append(float(gl["max_gain_db"]))
-    for lim in (chain.get("limits") or []):
-        plane = lim.get("plane")
-        if plane not in planes:
-            raise CalibrationError(f"limit references unknown plane {plane!r}")
-        _require_usable(plane, planes)               # need a curve to invert against
-        candidates.append(_gain_for_power_on(float(lim["max_dbm"]), plane, planes))
-    if not candidates:
-        raise CalibrationError("no safety ceiling derivable — refusing to transmit")
-    return min(candidates)
-
-
 def _quantity_of(plane) -> str:
     return plane.quantity if plane.quantity else ""
 
@@ -496,27 +651,55 @@ def load_unit_doc(path) -> Optional[dict]:
     return doc
 
 
-def resolve_from_files(unit_path, defaults_path, signal_id: str) -> Optional[ResolvedCalibration]:
-    """Convenience: load the per-unit doc + the matching type defaults and resolve.
-    Returns None when there is no per-unit document at all (caller falls back to the
-    script's baked-in defaults). Propagates SignalNotCalibrated / CalibrationError
-    otherwise, so the caller can distinguish 'fall back' from 'refuse'."""
+def load_components(path) -> dict:
+    """Read the shared component catalog (JSON or YAML) and return its ``components``
+    map ``{id: {kind, delta_db_by_freq, …}}``. Absent file → ``{}`` (no catalog; only
+    inline ``delta_db`` hops resolve). A present-but-malformed file raises
+    CalibrationError (a broken catalog shouldn't be silently ignored)."""
+    import json
+    from pathlib import Path
+    p = Path(path)
+    if not p.exists():
+        return {}
+    text = p.read_text(encoding="utf-8")
+    try:
+        if p.suffix in (".yaml", ".yml"):
+            import yaml
+            doc = yaml.safe_load(text) or {}
+        else:
+            doc = json.loads(text)
+    except Exception as exc:                          # noqa: BLE001
+        raise CalibrationError(f"component catalog {p} is not valid: {exc}")
+    if not isinstance(doc, dict):
+        raise CalibrationError(f"component catalog {p} is not an object")
+    comps = doc.get("components")
+    return comps if isinstance(comps, dict) else {}
+
+
+def resolve_from_files(unit_path, defaults_path, signal_id: str,
+                       components_path=None) -> Optional[ResolvedCalibration]:
+    """Convenience: load the per-unit doc + the matching type defaults + the component
+    catalog and resolve. Returns None when there is no per-unit document at all (caller
+    falls back to the script's baked-in defaults). Propagates SignalNotCalibrated /
+    CalibrationError otherwise, so the caller can distinguish 'fall back' from 'refuse'."""
     unit_doc = load_unit_doc(unit_path)
     if unit_doc is None:
         return None
     unit_type = unit_doc.get("unit_type", "")
     type_defaults = load_type_defaults(defaults_path, unit_type) if unit_type else None
-    return resolve(unit_doc, type_defaults, signal_id)
+    components = load_components(components_path) if components_path else {}
+    return resolve(unit_doc, type_defaults, signal_id, components)
 
 
 def resolve_public(unit_path, defaults_path, signal_id: str,
-                   unit_type: str = "") -> Optional[dict]:
+                   unit_type: str = "", components_path=None) -> Optional[dict]:
     """Resolve to the flat public artifact (:meth:`ResolvedCalibration.to_public_dict`)
     the agent injects into a task, or None if there's no per-unit document at all.
 
     ``unit_type`` (the agent's runtime identity) takes precedence over the doc's own
     ``unit_type`` for selecting the type-defaults layer; if empty the doc's value is
-    used. Propagates SignalNotCalibrated / CalibrationError so the caller can tell
+    used. ``components_path`` is the shared component catalog a derived plane may
+    reference. Propagates SignalNotCalibrated / CalibrationError so the caller can tell
     'fall back' from 'refuse'."""
     unit_doc = load_unit_doc(unit_path)
     if unit_doc is None:
@@ -525,4 +708,5 @@ def resolve_public(unit_path, defaults_path, signal_id: str,
     if ut and not unit_doc.get("unit_type"):
         unit_doc = {**unit_doc, "unit_type": ut}      # so the artifact reports it
     type_defaults = load_type_defaults(defaults_path, ut) if ut else None
-    return resolve(unit_doc, type_defaults, signal_id).to_public_dict()
+    components = load_components(components_path) if components_path else {}
+    return resolve(unit_doc, type_defaults, signal_id, components).to_public_dict()

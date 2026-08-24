@@ -651,6 +651,13 @@ def _effective_type_defaults(doc: dict):
     return _calib.load_type_defaults(cfg.CALIBRATION_DEFAULTS, ut) if ut else None
 
 
+def _effective_components():
+    """The shared component catalog to validate/preview against — the same one
+    transmit-time resolution reads, so a chain that references a cable/antenna resolves
+    identically at upload and at transmit (docs/calibration-v2.md). Absent → {}."""
+    return _calib.load_components(cfg.CALIBRATION_COMPONENTS)
+
+
 def _validate_calibration_upload(content: bytes) -> dict:
     """Full validate-on-upload for calibration.json: parse, merge the unit's type
     defaults, and run the resolver's checks for every signal. Raises HTTPException
@@ -662,7 +669,7 @@ def _validate_calibration_upload(content: bytes) -> dict:
         raise HTTPException(status_code=400,
                             detail=f"{cfg.CALIBRATION_NAME} is not valid JSON: {exc}")
     try:
-        return _calib.validate_document(doc, _effective_type_defaults(doc))
+        return _calib.validate_document(doc, _effective_type_defaults(doc), _effective_components())
     except _calib.CalibrationError as exc:
         raise HTTPException(status_code=400,
                             detail=f"{cfg.CALIBRATION_NAME} is invalid: {exc}")
@@ -764,7 +771,7 @@ async def get_calibration():
         return {"unit_type": cfg.UNIT_TYPE, "valid": False,
                 "error": f"stored calibration.json is not valid JSON: {exc}"}
     try:
-        summary = _calib.validate_document(doc, _effective_type_defaults(doc))
+        summary = _calib.validate_document(doc, _effective_type_defaults(doc), _effective_components())
     except _calib.CalibrationError as exc:
         return {"unit_type": cfg.UNIT_TYPE, "document": doc, "valid": False,
                 "error": str(exc)}
@@ -786,7 +793,7 @@ async def validate_calibration(request: Request):
     except (ValueError, UnicodeDecodeError) as exc:
         return {"valid": False, "error": f"not valid JSON: {exc}"}
     try:
-        summary = _calib.validate_document(doc, _effective_type_defaults(doc))
+        summary = _calib.validate_document(doc, _effective_type_defaults(doc), _effective_components())
     except _calib.CalibrationError as exc:
         return {"valid": False, "error": str(exc)}
     return {"valid": True, "signals": summary}

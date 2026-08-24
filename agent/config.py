@@ -49,6 +49,12 @@ CALIBRATION_DOC      = Path(os.environ.get("SDR_CALIBRATION_DOC",
                                            DATA_DIR / CALIBRATION_NAME))
 CALIBRATION_DEFAULTS = Path(os.environ.get("SDR_CALIBRATION_DEFAULTS",
                                            STATE_DIR / "configs" / "calibration_defaults.yaml"))
+# The shared component catalog (cables / antennas / pads characterized once as a
+# loss-vs-frequency table) a per-unit chain references. Fleet state, so it lives in
+# configs/ beside the type defaults. Absent → no catalog (only inline delta_db hops
+# resolve). See docs/calibration-v2.md.
+CALIBRATION_COMPONENTS = Path(os.environ.get("SDR_CALIBRATION_COMPONENTS",
+                                             STATE_DIR / "configs" / "components.yaml"))
 CAL_RUN_DIR          = Path(os.environ.get("SDR_CAL_RUN_DIR", STATE_DIR / "run" / "cal"))
 # A task opts into calibration by setting this env to its script's CAL_SIGNAL_ID.
 # When present (and a calibration doc exists) the agent resolves it and points the
