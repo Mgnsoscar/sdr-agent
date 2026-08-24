@@ -293,6 +293,16 @@ a frequency-dependent chain).
   increasing freq). Where a single representative frequency is available it additionally
   resolves end-to-end at the **endpoints of each passive table's span**, catching a chain
   that only breaks at some frequencies.
+- **Partial measured stages (`_build_planes`).** A chain may carry more than one measured
+  stage (e.g. `sdr_output` then `amplifier_output`), but you needn't measure every signal
+  at every one. When a signal has **no curve for a measured stage that isn't the first**,
+  that stage is resolved as a *transparent +0 dB hop* from the stage before it, so the
+  signal inherits the nearest upstream measured curve instead of failing — you can add a
+  downstream measured plane for a signal or two without re-measuring all thirty. The
+  **first** stage has nothing to inherit, so a missing source curve stays a hard error. The
+  synthetic hop contributes 0 dB and is omitted from the artifact's `passive_hops`; the
+  amp-protection ceiling still binds on its own measured plane, so the fallback never
+  loosens safety.
 
 ---
 
@@ -371,7 +381,9 @@ Each stage is shippable and leaves the system working (v1 docs valid throughout)
   `freq_dependent_limits`, `center_freq_hz`) **additively** — a v2 consumer detects them
   by the presence of `passive_hops`, so no version gate is needed anywhere. Wired into
   `config.CALIBRATION_COMPONENTS`, `process_manager` injection, and the `/calibration`
-  validate/dry-run endpoints. All v1 documents resolve byte-identically. Covered by
+  validate/dry-run endpoints. All v1 documents resolve byte-identically. **Partial
+  measured stages** (§7): a signal missing the curve for a non-first measured stage
+  inherits the nearest upstream measured curve via a synthetic transparent hop. Covered by
   `tests/test_calibration_v2.py`.
 - **Stage 2 (script/runtime) — done.** `paramkit/calkit.py`: `PowerMap` folds the
   `passive_hops` at the frequency the script passes to `gain_for_power` / `power_for_gain`
@@ -397,6 +409,13 @@ Each stage is shippable and leaves the system working (v1 docs valid throughout)
   validated `components.yaml` (agent `CALIBRATION_COMPONENTS` → `DATA_DIR/components.yaml`,
   validated on upload) — so "deploy the catalog" reuses the calibration.json path rather
   than a new fleet-config channel.
+  The Calibration tab was since rebuilt as the mockup's **chain-flow builder**: a
+  left-to-right flow of stage cards (drag-to-reorder via the grip, or the ◀▶ handles), a
+  per-stage detail pane (a frequency-response plot for a passive stage, the per-signal
+  curve grids for a measured one), the resolved Signals table, and the Component library
+  grid. The source stage is pinned (never removable); a signal can be removed from its
+  expanded editor; a measured stage left unmeasured for a signal shows that it inherits
+  the previous stage (the partial-measured-stage fallback above).
   - *Remaining:* the client setting `SDR_CAL_FREQ_HZ` on a task from the script's
-    `CAL_FREQ_PARAM` (task-creation wiring), and the visual chain-flow polish from the
-    mockup. The resolver/consumer already handle everything behind it.
+    `CAL_FREQ_PARAM` (task-creation wiring). The resolver/consumer already handle
+    everything behind it.

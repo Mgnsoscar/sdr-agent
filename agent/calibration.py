@@ -68,12 +68,19 @@ class _Derived:
     a pad). The hop is a ``delta_db``-vs-frequency table (signed: negative = loss); a
     single-point table is a frequency-independent constant (an inline v1 ``delta_db``,
     or a flat pad). ``component`` names the catalog entry it came from, or ``""`` when
-    the hop was stated inline. See docs/calibration-v2.md."""
+    the hop was stated inline. See docs/calibration-v2.md.
+
+    ``fallback`` marks a *transparent* +0 dB hop synthesised for a MEASURED plane that
+    this signal wasn't measured at (a partial measured stage): it lets the plane inherit
+    the nearest upstream measured curve so a signal measured only at an earlier stage
+    still resolves. Such hops are real for traversal (they contribute 0 dB) but omitted
+    from the published passive-hop list — they aren't cables/antennas."""
     frm: str
     table: list                              # [(freq_hz, delta_db)], strictly increasing freq
     component: str = ""
     quantity: str = ""
     description: str = ""
+    fallback: bool = False
 
     @property
     def is_freq_dependent(self) -> bool:
@@ -181,10 +188,13 @@ class ResolvedCalibration:
 
     def passive_hops(self) -> list:
         """The ordered passive hops (anchor → operating), each with its frequency table.
-        Empty when the operating plane is measured (no cable/antenna)."""
+        Empty when the operating plane is measured (no cable/antenna). Transparent
+        fallback hops (a measured stage this signal skipped) are omitted — they aren't
+        real parts and contribute 0 dB."""
         return [{"plane": name, "component": d.component or None,
                  "delta_db_by_freq": [[f, db] for f, db in d.table]}
-                for name, d in _hops(self.operating_plane, self._planes)]
+                for name, d in _hops(self.operating_plane, self._planes)
+                if not d.fallback]
 
     def _plane_delta_table(self, plane_name: str) -> list:
         """The TOTAL passive delta from the measured anchor out to ``plane_name`` as one
@@ -555,6 +565,7 @@ def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
                 f"curve given for derived plane {name!r} in signal {signal_id!r}")
 
     planes: dict = {}
+    prev_name: Optional[str] = None          # the stage immediately before this one
     for name, spec in planes_spec.items():
         if not isinstance(spec, dict):
             raise CalibrationError(f"plane {name!r} is not an object")
@@ -564,17 +575,29 @@ def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
         if ptype == "measured":
             curve = curves.get(name)
             if curve is None:
-                # latent: declared but not measured for this signal. Legal unless it
-                # turns out to be needed (validated later).
-                planes[name] = _Measured(gains=[], powers=[], quantity=quantity,
-                                         description=description)
-                continue
-            gains, powers = _curve_points(curve, name)
-            planes[name] = _Measured(
-                gains=gains, powers=powers,
-                offset_db=float(curve.get("offset_db", 0.0)),
-                quantity=quantity, description=description)
-        elif ptype == "derived":
+                # Latent: declared measured but not measured for THIS signal. If a stage
+                # precedes it, fall through to that stage with a transparent +0 dB hop, so
+                # a signal measured only upstream still resolves — the operating point
+                # inherits the nearest upstream measured curve (a "partial measured
+                # stage": you can add a downstream measured plane for a signal or two
+                # without re-measuring all the rest). The FIRST stage has nothing upstream,
+                # so a latent source stays latent and _require_usable flags it clearly.
+                if prev_name is not None:
+                    planes[name] = _Derived(frm=prev_name, table=[(0.0, 0.0)],
+                                            fallback=True, quantity=quantity,
+                                            description=description)
+                else:
+                    planes[name] = _Measured(gains=[], powers=[], quantity=quantity,
+                                             description=description)
+            else:
+                gains, powers = _curve_points(curve, name)
+                planes[name] = _Measured(
+                    gains=gains, powers=powers,
+                    offset_db=float(curve.get("offset_db", 0.0)),
+                    quantity=quantity, description=description)
+            prev_name = name
+            continue
+        if ptype == "derived":
             frm = spec.get("from")
             if not frm:
                 raise CalibrationError(f"derived plane {name!r} has no 'from'")
@@ -601,6 +624,7 @@ def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
                 table = [(0.0, float(spec["delta_db"]))]   # constant, frequency-independent
             planes[name] = _Derived(frm=frm, table=table, component=comp_id,
                                     quantity=quantity, description=description)
+            prev_name = name
         else:
             raise CalibrationError(f"plane {name!r} has invalid type {ptype!r}")
     return planes
