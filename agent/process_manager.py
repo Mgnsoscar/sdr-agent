@@ -71,11 +71,21 @@ def _inject_calibration(env: dict, task_name: str) -> None:
     signal_id = env.get(_agentcfg.CAL_SIGNAL_ID_ENV)
     if not signal_id:
         return                                       # task didn't opt in
+    # Optional transmit frequency (Hz) for folding the representative curve/bounds; a
+    # bad value is ignored (the doc's center_freq_hz still applies).
+    freq_hz = None
+    raw_freq = env.get(_agentcfg.CAL_FREQ_HZ_ENV)
+    if raw_freq:
+        try:
+            freq_hz = float(raw_freq)
+        except (TypeError, ValueError):
+            logger.warning("Task '%s': ignoring non-numeric %s=%r",
+                           task_name, _agentcfg.CAL_FREQ_HZ_ENV, raw_freq)
     try:
         artifact = _calib.resolve_public(
             _agentcfg.CALIBRATION_DOC, _agentcfg.CALIBRATION_DEFAULTS,
             signal_id, unit_type=_agentcfg.UNIT_TYPE,
-            components_path=_agentcfg.CALIBRATION_COMPONENTS)
+            components_path=_agentcfg.CALIBRATION_COMPONENTS, freq_hz=freq_hz)
     except _calib.SignalNotCalibrated as exc:
         logger.warning("Task '%s': %s — using the script's baked-in calibration "
                        "defaults", task_name, exc)

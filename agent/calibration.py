@@ -186,6 +186,13 @@ class ResolvedCalibration:
                  "delta_db_by_freq": [[f, db] for f, db in d.table]}
                 for name, d in _hops(self.operating_plane, self._planes)]
 
+    def _plane_delta_table(self, plane_name: str) -> list:
+        """The TOTAL passive delta from the measured anchor out to ``plane_name`` as one
+        ``[[freq, delta], …]`` table (all its hops summed). A consumer inverts a limit on
+        this plane by subtracting this from its threshold and inverting the shared
+        anchor curve — so it needs no plane model of its own."""
+        return [[f, d] for f, d in _sum_tables([dv.table for _, dv in _hops(plane_name, self._planes)])]
+
     def to_public_dict(self) -> dict:
         """The resolved artifact the agent writes for a task to consume.
 
@@ -211,8 +218,13 @@ class ResolvedCalibration:
         if hops:
             out["anchor_curve"] = self.anchor_curve()
             out["passive_hops"] = hops
+            # Each frequency-dependent limit carries its own summed delta from the shared
+            # anchor, so a consumer inverts it against the same anchor_curve at the live
+            # frequency (no plane model needed script-side).
             out["freq_dependent_limits"] = [
-                {"plane": p, "max_dbm": mx, "reason": rs} for p, mx, rs in self._freq_limits]
+                {"plane": p, "max_dbm": mx, "reason": rs,
+                 "delta_db_by_freq": self._plane_delta_table(p)}
+                for p, mx, rs in self._freq_limits]
             if self._gain_ceiling_const != float("inf"):
                 out["gain_ceiling_db"] = self._gain_ceiling_const
             if self._freq_hz is not None:
@@ -279,6 +291,37 @@ def _path_freq_dependent(plane_name: str, planes: dict) -> bool:
     """True if any derived hop between ``plane_name`` and its measured anchor varies
     with frequency (a multi-point component table)."""
     return any(d.is_freq_dependent for _, d in _hops(plane_name, planes))
+
+
+def _anchor_plane(plane_name: str, planes: dict) -> _Measured:
+    """The measured plane a chain resolves down to, WITHOUT evaluating any delta (so it
+    is safe on a frequency-dependent path where the delta needs a frequency)."""
+    p = planes[plane_name]
+    while isinstance(p, _Derived):
+        p = planes[p.frm]
+    return p
+
+
+def _eval_table(table: list, freq: Optional[float]) -> float:
+    """One delta table's value at ``freq`` (constant if single-point)."""
+    if len(table) == 1:
+        return table[0][1]
+    fs = [f for f, _ in table]
+    ds = [d for _, d in table]
+    return _interp(float(freq), fs, ds)
+
+
+def _sum_tables(tables: list) -> list:
+    """Sum several ``[(freq, delta), …]`` tables into one, exactly. The sum of
+    piecewise-linear functions is piecewise-linear with breakpoints at the UNION of the
+    inputs' breakpoints, so sampling the sum at every multi-point breakpoint (or, if all
+    inputs are constant, at a single 0 Hz point) reconstructs it without loss."""
+    if not tables:
+        return [(0.0, 0.0)]
+    multi_freqs = sorted({f for t in tables if len(t) > 1 for f, _ in t})
+    if not multi_freqs:
+        return [(0.0, sum(t[0][1] for t in tables))]     # every hop constant → one point
+    return [(fr, sum(_eval_table(t, fr) for t in tables)) for fr in multi_freqs]
 
 
 def _gain_for_power_on(power: float, plane_name: str, planes: dict,
@@ -397,6 +440,18 @@ def resolve(unit_doc: dict,
     if not const_caps and not freq_limits:
         raise CalibrationError("no safety ceiling derivable — refusing to transmit")
     gain_ceiling_const = min(const_caps) if const_caps else float("inf")
+
+    # A frequency-dependent limit is inverted at runtime against the OPERATING plane's
+    # measured anchor (one shared anchor_curve in the artifact). Downstream passive
+    # limits always share that anchor; guard the unusual topology where they wouldn't.
+    if freq_limits:
+        op_anchor = _anchor_plane(operating_plane, planes)
+        for plane, _mx, _rs in freq_limits:
+            if _anchor_plane(plane, planes) is not op_anchor:
+                raise CalibrationError(
+                    f"frequency-dependent limit on {plane!r} resolves through a different "
+                    f"measured plane than the operating plane {operating_plane!r}; this "
+                    f"topology isn't supported")
 
     # A frequency-dependent operating plane or ceiling needs a representative frequency,
     # so the scalar read-outs and the v1-compat artifact curve have a defined operating
@@ -677,7 +732,7 @@ def load_components(path) -> dict:
 
 
 def resolve_from_files(unit_path, defaults_path, signal_id: str,
-                       components_path=None) -> Optional[ResolvedCalibration]:
+                       components_path=None, freq_hz=None) -> Optional[ResolvedCalibration]:
     """Convenience: load the per-unit doc + the matching type defaults + the component
     catalog and resolve. Returns None when there is no per-unit document at all (caller
     falls back to the script's baked-in defaults). Propagates SignalNotCalibrated /
@@ -688,11 +743,12 @@ def resolve_from_files(unit_path, defaults_path, signal_id: str,
     unit_type = unit_doc.get("unit_type", "")
     type_defaults = load_type_defaults(defaults_path, unit_type) if unit_type else None
     components = load_components(components_path) if components_path else {}
-    return resolve(unit_doc, type_defaults, signal_id, components)
+    return resolve(unit_doc, type_defaults, signal_id, components, freq_hz)
 
 
 def resolve_public(unit_path, defaults_path, signal_id: str,
-                   unit_type: str = "", components_path=None) -> Optional[dict]:
+                   unit_type: str = "", components_path=None,
+                   freq_hz=None) -> Optional[dict]:
     """Resolve to the flat public artifact (:meth:`ResolvedCalibration.to_public_dict`)
     the agent injects into a task, or None if there's no per-unit document at all.
 
@@ -709,4 +765,4 @@ def resolve_public(unit_path, defaults_path, signal_id: str,
         unit_doc = {**unit_doc, "unit_type": ut}      # so the artifact reports it
     type_defaults = load_type_defaults(defaults_path, ut) if ut else None
     components = load_components(components_path) if components_path else {}
-    return resolve(unit_doc, type_defaults, signal_id, components).to_public_dict()
+    return resolve(unit_doc, type_defaults, signal_id, components, freq_hz).to_public_dict()

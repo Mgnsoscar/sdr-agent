@@ -185,45 +185,66 @@ which parameter is the frequency.*
 
 ### 5.2 Artifact v2 (what the agent injects into a task)
 
-The injected artifact stops being a single pre-flattened curve. It carries what
-`PowerMap` needs to fold at any frequency:
+The injected artifact keeps the v1 fields (so existing scripts still work) and, when
+the operating plane sits behind passive hops, ALSO carries what a frequency-aware
+`PowerMap` needs to fold at any frequency. It stays `schema_version: 1` and additive —
+a v2 consumer detects the new shape by the presence of `anchor_curve` / `passive_hops`,
+so there is no version gate anywhere. As implemented:
 
 ```jsonc
 {
-  "schema_version": 2,
+  "schema_version": 1,
   "signal_id": "gps_l1_mcode",
   "operating_plane": "antenna_eirp",
   "quantity": "EIRP",
   "amplitude": 0.8,
-  "freq_param": "freq",                 // echoes CAL_FREQ_PARAM, for the script/banner
-  "anchor_curve": [[40,-36], …],        // the measured anchor plane's gain→power (per signal, as v1)
-  "min_gain_db": 0.0, "max_gain_db": 89.75,
-  // ordered passive hops from the anchor out to the operating plane:
-  "passive_hops": [
-    { "plane": "cable_output", "delta_db_by_freq": [[1.1e9,-2.30],[1.4e9,-2.62],[1.6e9,-2.81]] },
-    { "plane": "antenna_eirp", "delta_db_by_freq": [[1.17e9,5.1],[1.575e9,6.0]] }
+  // v1-compat: the operating curve folded at the representative frequency + clamps,
+  // so a v1 script keeps working unchanged.
+  "curve": [[40,-36.0], …], "min_gain_db": 0.0, "max_gain_db": 74.0,
+  "min_power_dbm": …, "max_power_dbm": …,
+  // v2: the measured anchor + the passive hops as frequency tables + the split ceiling.
+  "anchor_curve": [[40,-36], …],        // the measured anchor plane's gain→power
+  "passive_hops": [                     // ordered anchor → operating; PowerMap sums these
+    { "plane": "cable_output", "component": "cable_lmr240_3m_a",
+      "delta_db_by_freq": [[1.1e9,-2.30],[1.4e9,-2.62],[1.6e9,-2.81]] },
+    { "plane": "antenna_eirp", "component": "patch_a",
+      "delta_db_by_freq": [[1.17e9,5.1],[1.575e9,6.0]] }
   ],
-  // ceilings, split by whether they move with frequency (see §6):
-  "gain_ceiling_db": 74.0,              // frequency-independent caps already folded (amp protection etc.)
-  "freq_dependent_limits": [            // caps whose plane passes through a passive hop
-    { "plane": "antenna_eirp", "max_dbm": 30.0, "reason": "regulatory EIRP" }
-  ]
+  "gain_ceiling_db": 74.0,              // the frequency-INDEPENDENT cap (amp protection, on a measured plane)
+  "freq_dependent_limits": [            // caps whose plane passes a passive hop, each with its
+    { "plane": "antenna_eirp", "max_dbm": 30.0, "reason": "regulatory EIRP",
+      "delta_db_by_freq": [[1.1e9,2.8],[1.6e9,3.19]] }   // summed delta from the shared anchor
+  ],
+  "center_freq_hz": 1.575e9            // representative frequency (present only for a freq-dependent chain)
 }
 ```
+
+The agent's representative frequency (for folding `curve` / bounds) is the task's
+`SDR_CAL_FREQ_HZ` env when set (the client sources it from the script's
+`CAL_FREQ_PARAM`), else the signal's `center_freq_hz`.
 
 ### 5.3 `PowerMap` v2 (script-side)
 
 ```
 delta(f)          = Σ interp(hop.delta_db_by_freq, f)   over passive_hops
-power_for_gain(g, f) = interp(anchor_curve, g)  +  delta(f)
+ceiling(f)        = min( gain_ceiling_db,
+                         min over freq_dependent_limits of
+                             invert(anchor_curve, lim.max_dbm − interp(lim.delta_db_by_freq, f)) )
+power_for_gain(g, f) = interp(anchor_curve, g)  +  delta(f)          # g clamped to [min, ceiling(f)]
 gain_for_power(p, f) = invert(anchor_curve, p − delta(f)),  clamped to [min, ceiling(f)]
 ```
 
 - `PowerMap.load(artifact)` builds this; the script calls `gain_for_power(p, f)` /
-  `power_for_gain(g, f)` with its **current** frequency. On a live-tune of the
-  frequency, it re-evaluates — nothing cached at the wrong `f`.
-- A v1 artifact (no `passive_hops`) loads as today: `delta(f)=0`, behaviour byte-identical
-  to v1. **`PowerMap` stays backward compatible.**
+  `power_for_gain(g, f)` with its **current** frequency (the value of its
+  `CAL_FREQ_PARAM`). On a live-tune of the frequency, it re-evaluates — nothing cached
+  at the wrong `f`. With no `f` given it uses the artifact's `center_freq_hz`.
+- Every frequency-dependent limit shares the operating plane's measured anchor (they
+  are downstream passive planes), so one `anchor_curve` inverts them all — the script
+  needs no plane model.
+- A v1 artifact (no `anchor_curve`) loads as today: `delta(f)=0`, `ceiling=max_gain_db`,
+  behaviour byte-identical to v1. **`PowerMap` stays backward compatible.**
+- calkit and the agent resolver agree at every frequency by construction (a test
+  cross-checks `PowerMap` against `ResolvedCalibration` across frequencies).
 
 ---
 
@@ -352,7 +373,19 @@ Each stage is shippable and leaves the system working (v1 docs valid throughout)
   `config.CALIBRATION_COMPONENTS`, `process_manager` injection, and the `/calibration`
   validate/dry-run endpoints. All v1 documents resolve byte-identically. Covered by
   `tests/test_calibration_v2.py`.
-- **Stage 2 (script/runtime)** — `CAL_FREQ_PARAM` + agent read-through, `PowerMap` v2
-  (fold `passive_hops` at the live frequency; the injected artifact also grows a
-  `freq_param` field then). Not started.
-- **Stage 3 (client)** — component-library editor + chain builder. Not started.
+- **Stage 2 (script/runtime) — done.** `paramkit/calkit.py`: `PowerMap` folds the
+  `passive_hops` at the frequency the script passes to `gain_for_power` / `power_for_gain`
+  (defaulting to `center_freq_hz`), and tightens the ceiling per frequency from
+  `freq_dependent_limits` — inverting them through the shared `anchor_curve`. A v1
+  artifact still loads byte-identically. The artifact's `freq_dependent_limits` now
+  carry a summed `delta_db_by_freq` so the consumer needs no plane model. The agent
+  honours the task's `SDR_CAL_FREQ_HZ` env as the representative fold frequency
+  (`config.CAL_FREQ_HZ_ENV`, threaded through `resolve_public`). Covered by
+  `tests/test_calkit.py`, including a cross-check that `PowerMap` agrees with the agent
+  resolver at every frequency.
+  - *Remaining, and deferred to when a script actually adopts it:* a transmit script
+    declaring `CAL_FREQ_PARAM` and passing that value to `PowerMap` (and the client
+    setting `SDR_CAL_FREQ_HZ` from it — Stage 3). No committed script uses `PowerMap`
+    yet, so there is nothing to port; the consumer contract is ready for the first one.
+- **Stage 3 (client)** — component-library editor + chain builder + set `SDR_CAL_FREQ_HZ`
+  from the script's `CAL_FREQ_PARAM`. Not started.

@@ -1,33 +1,38 @@
 """calkit — the transmit script's power-calibration consumer.
 
 The sdr-agent resolves each unit's measured calibration and injects a flat artifact
-at ``$SDR_CALIBRATION_FILE`` (see the agent's docs/calibration.md). This module turns
-that artifact into a :class:`PowerMap`: the same ``--power`` (dBm) ↔ commanded-gain
-mapping the scripts already use, but backed by the unit's MEASURED curve instead of a
-single baked anchor.
+at ``$SDR_CALIBRATION_FILE`` (see the agent's docs/calibration.md and
+docs/calibration-v2.md). This module turns that artifact into a :class:`PowerMap`:
+the same ``--power`` (dBm) ↔ commanded-gain mapping the scripts already use, backed by
+the unit's MEASURED curve instead of a single baked anchor.
+
+Two artifact shapes, one consumer:
+
+  - **v1 (constant chain):** a pre-flattened ``curve`` (gain→power at the operating
+    plane, derived hops already folded). Frequency is irrelevant. Behaviour is exactly
+    as before.
+  - **v2 (frequency-aware passive chain):** an ``anchor_curve`` (the operating plane's
+    measured anchor) plus ``passive_hops`` — the cable/antenna as ``delta_db``-vs-
+    frequency tables — and a frequency-split ceiling. The script hands
+    :meth:`gain_for_power` / :meth:`power_for_gain` its **current transmit frequency**;
+    the passive hops are folded at that frequency, so ``--power`` stays accurate as the
+    radio retunes (a chirp, a live-tuned centre). A script declares which of its params
+    is the frequency via ``CAL_FREQ_PARAM`` and passes that value in.
 
 When no artifact is present — the unit/signal isn't calibrated, or you're running
 off-unit — :meth:`PowerMap.load` returns a map built from the script's baked
-constants, which is byte-identical to the previous behaviour (a slope-1 line through
-the single anchor). So adopting calkit is a no-op until a unit is actually
-calibrated; once it is, ``--power`` becomes accurate (interpolated) and reads at the
-unit's real operating plane (e.g. EIRP at the antenna).
-
-The artifact schema (produced by ResolvedCalibration.to_public_dict):
-    { "curve": [[gain_db, power_dbm], …],   # gain-sorted, strictly monotonic
-      "min_gain_db", "max_gain_db",          # commanded-gain clamps (the ceiling)
-      "amplitude",                           # baseband amplitude the curve needs
-      "operating_plane", "quantity", … }     # for the banner label
+constants, byte-identical to the previous behaviour.
 """
 from __future__ import annotations
 
 import json
 import os
+from typing import Optional
 
 CALIBRATION_FILE_ENV = "SDR_CALIBRATION_FILE"
 
 
-def _interp(x: float, xs: list[float], ys: list[float]) -> float:
+def _interp(x: float, xs: list, ys: list) -> float:
     """Piecewise-linear y(x) over strictly-increasing xs, endpoint-clamped. A single
     sample degrades to a slope-1 line through it (1 dB gain ≈ 1 dB power) — the same
     single-point fallback the agent resolver uses."""
@@ -45,12 +50,24 @@ def _interp(x: float, xs: list[float], ys: list[float]) -> float:
     return ys[-1]
 
 
-class PowerMap:
-    """Maps a requested delivered/radiated power (dBm) to a commanded SDR gain (dB)
-    and back, over a monotonic measured curve, clamped to the unit's gain limits."""
+def _table_at(freqs: list, deltas: list, freq: Optional[float]) -> float:
+    """A delta table's value at ``freq``: constant if single-point; if the frequency is
+    unknown for a multi-point table, fall back to its lowest-frequency value."""
+    if len(freqs) == 1:
+        return deltas[0]
+    if freq is None:
+        return deltas[0]
+    return _interp(freq, freqs, deltas)
 
-    def __init__(self, gains, powers, min_gain_db, max_gain_db, amplitude,
-                 source, label):
+
+class PowerMap:
+    """Maps a requested delivered/radiated power (dBm) to a commanded SDR gain (dB) and
+    back, over a monotonic measured anchor curve, with any frequency-dependent passive
+    hops (cable, antenna) folded at the transmit frequency, clamped to the unit's gain
+    limits (the ceiling itself may tighten with frequency)."""
+
+    def __init__(self, gains, powers, min_gain_db, ceiling_const, amplitude,
+                 source, label, hops=(), freq_limits=(), center_freq=None):
         if not gains or len(gains) != len(powers):
             raise ValueError("calibration curve is empty or malformed")
         # keep gain-sorted; agent guarantees strict monotonicity, verify defensively
@@ -62,22 +79,56 @@ class PowerMap:
                 raise ValueError("calibration curve is not strictly monotonic "
                                  "(not invertible)")
         self.min_gain_db = float(min_gain_db)
-        self.max_gain_db = float(max_gain_db)
+        self._ceiling_const = float(ceiling_const)
         self.amplitude = float(amplitude)
         self.source = source                 # human tag: where the map came from
         self.label = label                   # what --power means (quantity, at plane)
+        # v2 frequency machinery ((freqs, deltas) per passive hop; per-limit tables).
+        self._hops = [([float(f) for f, _ in t], [float(d) for _, d in t]) for t in hops]
+        self._freq_limits = [
+            (float(mx), [float(f) for f, _ in t], [float(d) for _, d in t])
+            for mx, t in freq_limits]
+        self._center_freq = None if center_freq is None else float(center_freq)
+
+    # ── frequency-dependent internals ────────────────────────────────────────────
+    def _eff(self, freq: Optional[float]) -> Optional[float]:
+        return freq if freq is not None else self._center_freq
+
+    def _op_delta(self, freq: Optional[float]) -> float:
+        """Total passive delta (cable + antenna …) at ``freq`` — 0 for a v1 curve."""
+        return sum(_table_at(fs, ds, freq) for fs, ds in self._hops)
+
+    def _invert(self, target_power: float) -> float:
+        """Anchor gain that yields ``target_power`` at the measured anchor, clamped to
+        the measured range (up to the top gain, never extrapolated)."""
+        return _interp(target_power, self._powers, self._gains)
+
+    def _ceiling(self, freq: Optional[float]) -> float:
+        """Gain ceiling at ``freq``: the frequency-independent cap tightened by any
+        frequency-dependent limit (inverted through the shared anchor). Tightest wins."""
+        cap = self._ceiling_const
+        for max_dbm, fs, ds in self._freq_limits:
+            cap = min(cap, self._invert(max_dbm - _table_at(fs, ds, freq)))
+        return cap
 
     # ── the two functions the script calls ──────────────────────────────────────
-    def gain_for_power(self, delivered_dbm: float) -> float:
-        """Commanded gain (dB) for a requested power, clamped to [min, max]. Upward
-        is clamped to the ceiling, never extrapolated past it."""
-        g = _interp(float(delivered_dbm), self._powers, self._gains)  # invert
-        return min(max(g, self.min_gain_db), self.max_gain_db)
+    def gain_for_power(self, delivered_dbm: float, freq: Optional[float] = None) -> float:
+        """Commanded gain (dB) for a requested power at ``freq`` (defaults to the
+        artifact's representative frequency), clamped to [min, ceiling(freq)]. Upward is
+        clamped to the ceiling, never extrapolated past it."""
+        f = self._eff(freq)
+        g = self._invert(float(delivered_dbm) - self._op_delta(f))
+        return min(max(g, self.min_gain_db), self._ceiling(f))
 
-    def power_for_gain(self, gain_db: float) -> float:
-        """Delivered power (dBm) at the operating plane for an (actual) gain."""
-        g = min(max(float(gain_db), self.min_gain_db), self.max_gain_db)
-        return _interp(g, self._gains, self._powers)
+    def power_for_gain(self, gain_db: float, freq: Optional[float] = None) -> float:
+        """Delivered power (dBm) at the operating plane for an (actual) gain at ``freq``."""
+        f = self._eff(freq)
+        g = min(max(float(gain_db), self.min_gain_db), self._ceiling(f))
+        return _interp(g, self._gains, self._powers) + self._op_delta(f)
+
+    @property
+    def max_gain_db(self) -> float:
+        return self._ceiling(self._center_freq)
 
     @property
     def max_power_dbm(self) -> float:
@@ -86,6 +137,13 @@ class PowerMap:
     @property
     def min_power_dbm(self) -> float:
         return self.power_for_gain(self.min_gain_db)
+
+    @property
+    def freq_dependent(self) -> bool:
+        """True when --power ↔ gain (or the ceiling) actually moves with frequency, so a
+        caller knows to pass its live frequency."""
+        return (any(len(fs) > 1 for fs, _ in self._hops)
+                or any(len(fs) > 1 for _, fs, _ in self._freq_limits))
 
     # ── constructors ────────────────────────────────────────────────────────────
     @classmethod
@@ -100,17 +158,33 @@ class PowerMap:
 
     @classmethod
     def from_artifact(cls, art: dict, fallback_amplitude: float) -> "PowerMap":
-        """Build from the agent's resolved artifact dict."""
-        curve = art.get("curve") or []
-        gains = [pt[0] for pt in curve]
-        powers = [pt[1] for pt in curve]
+        """Build from the agent's resolved artifact dict — v2 (anchor_curve +
+        passive_hops) when present, else the v1 flat curve."""
         amp = art.get("amplitude")
         amp = fallback_amplitude if amp is None else amp
         plane = art.get("operating_plane", "")
         quantity = art.get("quantity") or "power"
         label = f"{quantity}, at {plane}" if plane else quantity
-        return cls(gains, powers,
-                   art.get("min_gain_db"), art.get("max_gain_db"), amp,
+
+        anchor = art.get("anchor_curve")
+        if anchor:                                    # v2: fold passive hops at frequency
+            gains = [pt[0] for pt in anchor]
+            powers = [pt[1] for pt in anchor]
+            hops = [h.get("delta_db_by_freq") or [] for h in art.get("passive_hops", [])]
+            freq_limits = [(lim["max_dbm"], lim.get("delta_db_by_freq") or [])
+                           for lim in art.get("freq_dependent_limits", [])]
+            ceiling_const = art.get("gain_ceiling_db")
+            if ceiling_const is None:
+                ceiling_const = float("inf")          # ceiling comes purely from limits
+            return cls(gains, powers, art.get("min_gain_db"), ceiling_const, amp,
+                       source="calibration file", label=label,
+                       hops=hops, freq_limits=freq_limits,
+                       center_freq=art.get("center_freq_hz"))
+
+        curve = art.get("curve") or []                # v1: pre-flattened operating curve
+        gains = [pt[0] for pt in curve]
+        powers = [pt[1] for pt in curve]
+        return cls(gains, powers, art.get("min_gain_db"), art.get("max_gain_db"), amp,
                    source="calibration file", label=label)
 
     @classmethod
@@ -130,5 +204,7 @@ class PowerMap:
         return cls.from_artifact(art, fallback_amplitude=baked.amplitude)
 
     def describe(self) -> str:
-        """One-line banner summary, e.g. 'calibration file — EIRP, at antenna_eirp'."""
-        return f"{self.source} — {self.label}"
+        """One-line banner summary, e.g. 'calibration file — EIRP, at antenna_eirp'.
+        A frequency-dependent map notes that its numbers are evaluated at a frequency."""
+        base = f"{self.source} — {self.label}"
+        return base + " (frequency-dependent)" if self.freq_dependent else base

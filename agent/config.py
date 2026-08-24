@@ -62,6 +62,11 @@ CAL_RUN_DIR          = Path(os.environ.get("SDR_CAL_RUN_DIR", STATE_DIR / "run" 
 # maps --power (dBm) → gain, falling back to its baked defaults if the var is absent.
 CAL_SIGNAL_ID_ENV    = "SDR_CAL_SIGNAL_ID"
 CALIBRATION_FILE_ENV = "SDR_CALIBRATION_FILE"
+# Optional: the task's transmit centre frequency in Hz. When set (the client sources
+# it from the script's CAL_FREQ_PARAM), the agent folds the artifact's v1-compat curve
+# and scalar bounds at this frequency; a frequency-aware script still re-folds per its
+# live frequency from the artifact's passive_hops. See docs/calibration-v2.md.
+CAL_FREQ_HZ_ENV      = "SDR_CAL_FREQ_HZ"
 
 # ── OTA update layout ─────────────────────────────────────────────────────────
 # Release dirs live under RELEASES_DIR as <version>/ (the code), and BASE_DIR is a
