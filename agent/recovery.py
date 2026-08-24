@@ -69,10 +69,12 @@ async def panic_stop(
     # 2. Cancel/stop scheduled events
     events_cancelled = await scheduler.cancel_all_active(reason="panic stop")
 
-    # 3. Stop any tasks still running (manual starts, or anything left over)
+    # 3. Stop any tasks still running OR mid-launch (manual starts, or anything left
+    #    over). "starting" is included so a task caught in its launch window during a
+    #    panic can't slip through and go on air a moment later.
     tasks_stopped = []
     for status in manager.all_statuses():
-        if status.state == "running":
+        if status.state in ("running", "starting"):
             try:
                 await manager.stop(status.name, source="recovery")
                 tasks_stopped.append(status.name)

@@ -27,6 +27,8 @@ def check(cond, msg):
 PARAMKIT_SRC = '''
 from paramkit import Script
 
+CAL_SIGNAL_ID = "demo_sig"
+
 FREQS = {
     "WiFi ch1 (2.412 GHz)": 2.412e9,
     "GPS L1": 1.57542e9,
@@ -57,6 +59,8 @@ def main() -> int:
     spec = extract_params(PARAMKIT_SRC)
     check(spec.get("format") == "paramkit", "detected as paramkit")
     check(spec.get("description") == "demo tx", "description extracted")
+    check(spec.get("calibration_signal") == "demo_sig",
+          "CAL_SIGNAL_ID surfaced as calibration_signal")
     by = {p["name"]: p for p in spec["params"]}
     check(set(by) == {"freq", "gain", "antenna", "otw", "verbose"}, "all params found")
 
@@ -109,7 +113,10 @@ def main() -> int:
         "  .number('--y', min=0, max=A + B)\n"   # inline expression
         "  .integer('--n', min=1, max=C * 2 + 1))\n"
     )
-    cby = {p["name"]: p for p in extract_params(csrc)["params"]}
+    cspec = extract_params(csrc)
+    check("calibration_signal" not in cspec,
+          "no CAL_SIGNAL_ID → no calibration_signal key")
+    cby = {p["name"]: p for p in cspec["params"]}
     check(cby["x"]["max"] == 91.44, "named computed const (A+B) resolves in schema")
     check(cby["y"]["max"] == 91.44, "inline A+B resolves in schema")
     check(cby["n"]["max"] == 21, "integer computed bound (C*2+1) resolves in schema")

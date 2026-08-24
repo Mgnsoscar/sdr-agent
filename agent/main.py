@@ -12,8 +12,15 @@ GET  /tasks/{name}                    → ProcessStatus
 POST /tasks/{name}/start              → ProcessStatus   body: StartRequest (optional)
 POST /tasks/{name}/stop               → ProcessStatus
 POST /tasks/{name}/restart            → ProcessStatus   body: StartRequest (optional)
-GET  /tasks/{name}/logs?lines=100     → list[str]
-WS   /tasks/{name}/logs/stream        → streaming log
+POST /tasks/{name}/params             → set live params
+GET  /task-logs/{name}?lines=100      → list[str]         (name is terminal — see below)
+WS   /task-log-stream/{name}          → streaming log
+GET  /task-history/{name}             → list[ExitRecord]  (recent exits)
+GET  /task-live-params/{name}         → running task's live-param values
+
+# Read-only task sub-resources use their own /task-* prefixes (name as the final
+# path segment) rather than /tasks/{name}/<sub>, so a task name containing '/' is
+# never misrouted to a shorter name's sub-resource.
 
 GET  /events/stream                   → SSE stream of crash + lifecycle events
 
@@ -25,7 +32,6 @@ DELETE /scripts/{name}                → {"deleted": name}          (delete a s
 GET  /config/tasks-yaml               → raw YAML text
 PUT  /config/tasks-yaml               → write new YAML + auto-reload
 
-GET  /tasks/{name}/history            → list[ExitRecord]  (recent exits)
 GET  /system                          → SystemHealth      (CPU, temp, mem, disk, clock)
 GET  /sdr                             → SdrStatus         (UHD device probe)
 
@@ -52,6 +58,7 @@ POST   /panic                         → emergency stop everything → PanicRes
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import sys
@@ -81,6 +88,7 @@ from .models import (
     TaskConfig, UpdateResult,
 )
 from .updater import Updater, UpdateError
+from . import calibration as _calib
 from .client_state import ClientStateStore
 from .argspec import extract_params
 from .process_manager import ProcessManager
@@ -110,6 +118,14 @@ _client_state: ClientStateStore | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _manager, _scheduler, _runner, _mdns, _client_state
+
+    # OTA: if we just booted a freshly-activated release, confirm it healthy after the
+    # grace period (the external confirm timer rolls back if we never do). Scheduled
+    # FIRST — before the slow manager/scheduler/runner startup below — so a slow boot
+    # can't push confirmation past the rollback window and get a good update reverted.
+    # It only touches the OTA markers, so it has no dependency on that startup.
+    asyncio.create_task(_confirm_release_after_grace(), name="ota-confirm")
+
     tasks = cfg.load_tasks()
     _manager = ProcessManager(tasks, cfg.LOG_DIR, cfg.UNIT_ID)
     await _manager.startup()
@@ -129,10 +145,6 @@ async def lifespan(app: FastAPI):
     _mdns = MdnsAdvertiser(cfg.UNIT_ID, cfg.AGENT_PORT, cfg.AGENT_VERSION,
                            machine_id=cfg.MACHINE_ID)
     _mdns.start()
-
-    # OTA: if we just booted a freshly-activated release, confirm it healthy after
-    # the grace period (the external confirm timer rolls back if we never do).
-    asyncio.create_task(_confirm_release_after_grace(), name="ota-confirm")
 
     yield
 
@@ -198,7 +210,9 @@ _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 async def verify_key(key: str | None = Depends(_api_key_header)):
-    if cfg.API_KEY and key != cfg.API_KEY:
+    # Constant-time compare so a wrong key can't be recovered by timing the response.
+    # (Auth is off when API_KEY is empty — a trusted-LAN default; see config.py.)
+    if cfg.API_KEY and not hmac.compare_digest(key or "", cfg.API_KEY):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing API key",
@@ -233,10 +247,12 @@ async def info(manager: ProcessManager = Depends(get_manager)):
         hostname       = cfg.HOSTNAME,
         unit_id        = cfg.UNIT_ID,
         machine_id     = cfg.MACHINE_ID,
+        unit_type      = cfg.UNIT_TYPE,
         agent_version  = cfg.AGENT_VERSION,
         python_version = platform.python_version(),
         tasks          = manager.task_names(),
         previous_version = _make_updater().previous_version(),
+        capabilities     = cfg.AGENT_CAPABILITIES,
         scripts_dir      = str(SCRIPTS_DIR),
         task_interpreter = cfg.TASK_INTERPRETER,
     )
@@ -250,6 +266,28 @@ async def admin_releases():
     """The agent releases installed on this unit and which one is active/healthy."""
     return [AgentRelease(version=r.version, active=r.active, healthy=r.healthy, path=r.path)
             for r in _make_updater().list_releases()]
+
+
+@app.get("/admin/update-status", tags=["admin"], dependencies=[Depends(verify_key)])
+async def admin_update_status():
+    """The live OTA lifecycle state, so the client can show real progress after an
+    update instead of only watching the version flip:
+
+      pending_version   a freshly-activated release still awaiting its health check
+                        (None once confirmed or rolled back)
+      pending_confirmed the running agent has marked that release healthy
+      current/previous  the active version and the rollback target
+
+    A pending release that never confirms is auto-reverted to `previous` by the
+    external confirm timer — the client can surface that as a rollback."""
+    up = _make_updater()
+    pending = up.pending_version()
+    return {
+        "current_version": up.current_version() or cfg.AGENT_VERSION,
+        "previous_version": up.previous_version(),
+        "pending_version": pending,
+        "pending_confirmed": up.is_confirmed(pending) if pending else False,
+    }
 
 
 @app.post("/admin/update", response_model=UpdateResult,
@@ -303,20 +341,9 @@ async def list_tasks(manager: ProcessManager = Depends(get_manager)):
     return manager.all_statuses()
 
 
-# ── Single task status ────────────────────────────────────────────────────────
-
-@app.get("/tasks/{name}", response_model=ProcessStatus, tags=["tasks"],
-         dependencies=[Depends(verify_key)])
-async def task_status(name: str, manager: ProcessManager = Depends(get_manager)):
-    try:
-        return manager.status(name)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-
-
 # ── Start ─────────────────────────────────────────────────────────────────────
 
-@app.post("/tasks/{name}/start", response_model=ProcessStatus, tags=["tasks"],
+@app.post("/tasks/{name:path}/start", response_model=ProcessStatus, tags=["tasks"],
           dependencies=[Depends(verify_key)])
 async def start_task(
     name: str,
@@ -333,7 +360,7 @@ async def start_task(
 
 # ── Stop ──────────────────────────────────────────────────────────────────────
 
-@app.post("/tasks/{name}/stop", response_model=ProcessStatus, tags=["tasks"],
+@app.post("/tasks/{name:path}/stop", response_model=ProcessStatus, tags=["tasks"],
           dependencies=[Depends(verify_key)])
 async def stop_task(name: str, manager: ProcessManager = Depends(get_manager)):
     try:
@@ -344,7 +371,7 @@ async def stop_task(name: str, manager: ProcessManager = Depends(get_manager)):
 
 # ── Restart ───────────────────────────────────────────────────────────────────
 
-@app.post("/tasks/{name}/restart", response_model=ProcessStatus, tags=["tasks"],
+@app.post("/tasks/{name:path}/restart", response_model=ProcessStatus, tags=["tasks"],
           dependencies=[Depends(verify_key)])
 async def restart_task(
     name: str,
@@ -359,7 +386,7 @@ async def restart_task(
 
 # ── Live parameters (retune while running) ─────────────────────────────────────
 
-@app.get("/tasks/{name}/params/live", tags=["tasks"],
+@app.get("/task-live-params/{name:path}", tags=["tasks"],
          dependencies=[Depends(verify_key)])
 async def get_live_params(name: str, manager: ProcessManager = Depends(get_manager)):
     """The running task's current + applied live-parameter values (from its
@@ -372,7 +399,7 @@ async def get_live_params(name: str, manager: ProcessManager = Depends(get_manag
         raise HTTPException(status_code=409, detail=str(exc))
 
 
-@app.post("/tasks/{name}/params", tags=["tasks"], dependencies=[Depends(verify_key)])
+@app.post("/tasks/{name:path}/params", tags=["tasks"], dependencies=[Depends(verify_key)])
 async def set_live_params(
     name: str,
     request: SetParamsRequest,
@@ -391,7 +418,7 @@ async def set_live_params(
 
 # ── Log fetch (HTTP) ──────────────────────────────────────────────────────────
 
-@app.get("/tasks/{name}/logs", response_model=list[str], tags=["logs"],
+@app.get("/task-logs/{name:path}", response_model=list[str], tags=["logs"],
          dependencies=[Depends(verify_key)])
 async def get_logs(
     name: str,
@@ -407,7 +434,7 @@ async def get_logs(
 
 # ── Task exit history ─────────────────────────────────────────────────────────
 
-@app.get("/tasks/{name}/history", response_model=list[ExitRecord], tags=["tasks"],
+@app.get("/task-history/{name:path}", response_model=list[ExitRecord], tags=["tasks"],
          dependencies=[Depends(verify_key)])
 async def task_history(name: str, manager: ProcessManager = Depends(get_manager)):
     """Recent exits for a task (newest last) — useful for spotting crash loops."""
@@ -417,9 +444,28 @@ async def task_history(name: str, manager: ProcessManager = Depends(get_manager)
         raise HTTPException(status_code=404, detail=str(exc))
 
 
+# ── Single task status ────────────────────────────────────────────────────────
+# The read-only sub-resources (logs, history, live params) live under their own
+# top-level prefixes (/task-logs, /task-history, /task-live-params) where the task
+# name is the FINAL, greedy {name:path} segment. That leaves this bare GET as the sole
+# GET consumer of /tasks/*, so a name containing '/' — even one ending in "logs" or
+# "history" — is never misrouted to a sub-resource of a shorter name. The POST action
+# routes (/start /stop /restart /params) keep their verb suffix: the client always
+# appends the literal verb, so {name:path} can't swallow it. Still registered after the
+# POST routes for clarity; correctness no longer depends on the order.
+
+@app.get("/tasks/{name:path}", response_model=ProcessStatus, tags=["tasks"],
+         dependencies=[Depends(verify_key)])
+async def task_status(name: str, manager: ProcessManager = Depends(get_manager)):
+    try:
+        return manager.status(name)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
 # ── Log stream (WebSocket) ────────────────────────────────────────────────────
 
-@app.websocket("/tasks/{name}/logs/stream")
+@app.websocket("/task-log-stream/{name:path}")
 async def stream_logs(
     name: str,
     websocket: WebSocket,
@@ -576,6 +622,215 @@ async def delete_script(name: str):
     return {"deleted": name}
 
 
+# ── Per-unit data store (docs/calibration.md §9.2) ────────────────────────────
+# A per-unit area for arbitrary unit-specific files. Calibration is the first
+# validated tenant: uploading calibration.json runs the full resolver checks so a
+# broken document is rejected here, not at transmit. Other files are stored as-is
+# (data only — executable kinds are refused; nothing here is ever executed).
+
+_MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+_DENY_EXT = {".py", ".pyc", ".pyo", ".sh", ".bash", ".zsh", ".exe", ".so",
+             ".dll", ".dylib", ".bat", ".cmd", ".ps1", ".rb", ".pl", ".php"}
+
+
+def _safe_data_path(name: str):
+    """Resolve a data-store filename to a path inside DATA_DIR, rejecting traversal."""
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return cfg.DATA_DIR / name
+
+
+def _effective_type_defaults(doc: dict):
+    """The type-defaults layer to validate/preview a document against, using the SAME
+    precedence as transmit-time resolution (calibration.resolve_public): the agent's
+    runtime SDR_UNIT_TYPE wins, else the document's own ``unit_type``. Keeping these in
+    lock-step is what makes validate-on-upload and the /calibration view resolve
+    exactly what a transmit will — otherwise a type-defaults limit could tighten the
+    ceiling at transmit that the upload gate never checked."""
+    ut = cfg.UNIT_TYPE or (doc.get("unit_type") if isinstance(doc, dict) else "") or ""
+    return _calib.load_type_defaults(cfg.CALIBRATION_DEFAULTS, ut) if ut else None
+
+
+def _effective_components():
+    """The shared component catalog to validate/preview against — the same one
+    transmit-time resolution reads, so a chain that references a cable/antenna resolves
+    identically at upload and at transmit (docs/calibration-v2.md). Absent → {}."""
+    return _calib.load_components(cfg.CALIBRATION_COMPONENTS)
+
+
+def _validate_calibration_upload(content: bytes) -> dict:
+    """Full validate-on-upload for calibration.json: parse, merge the unit's type
+    defaults, and run the resolver's checks for every signal. Raises HTTPException
+    400 with a specific reason on any defect. Returns the per-signal summary."""
+    import json
+    try:
+        doc = json.loads(content.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400,
+                            detail=f"{cfg.CALIBRATION_NAME} is not valid JSON: {exc}")
+    try:
+        return _calib.validate_document(doc, _effective_type_defaults(doc), _effective_components())
+    except _calib.CalibrationError as exc:
+        raise HTTPException(status_code=400,
+                            detail=f"{cfg.CALIBRATION_NAME} is invalid: {exc}")
+
+
+def _validate_components_upload(content: bytes) -> None:
+    """Validate-on-upload for components.yaml: parse and check every component's
+    delta_db_by_freq table (≥1 point, strictly increasing in frequency), so a broken
+    catalog is rejected here rather than surfacing as an "unknown/invalid component" at
+    transmit. Raises HTTPException 400 with a specific reason."""
+    import io
+    try:
+        doc = yaml.safe_load(io.BytesIO(content)) or {}
+    except yaml.YAMLError as exc:
+        raise HTTPException(status_code=400,
+                            detail=f"{cfg.CALIBRATION_COMPONENTS_NAME} is not valid: {exc}")
+    if not isinstance(doc, dict):
+        raise HTTPException(status_code=400,
+                            detail=f"{cfg.CALIBRATION_COMPONENTS_NAME} is not an object")
+    comps = doc.get("components")
+    if comps is not None and not isinstance(comps, dict):
+        raise HTTPException(status_code=400, detail="'components' must be an object")
+    for cid, spec in (comps or {}).items():
+        if not isinstance(spec, dict):
+            raise HTTPException(status_code=400, detail=f"component {cid!r} is not an object")
+        try:
+            _calib._freq_table(spec.get("delta_db_by_freq"), f"component {cid!r}")
+        except _calib.CalibrationError as exc:
+            raise HTTPException(status_code=400,
+                                detail=f"{cfg.CALIBRATION_COMPONENTS_NAME} is invalid: {exc}")
+
+
+@app.post("/files", tags=["files"], dependencies=[Depends(verify_key)])
+async def upload_file(file: UploadFile = File(...)):
+    """Upload a unit-specific data file into the per-unit store. `calibration.json`
+    is validated before it is saved (a broken document is rejected, not persisted)."""
+    name = file.filename or ""
+    _safe_data_path(name)                                    # reject traversal
+    ext = os.path.splitext(name)[1].lower()
+    if ext in _DENY_EXT:
+        raise HTTPException(status_code=400,
+                            detail=f"Executable files are not accepted ({ext})")
+    # Read in bounded chunks and stop the moment the cap is exceeded, so an oversized
+    # body can't buffer gigabytes into memory before the size check runs.
+    chunks, total = [], 0
+    while True:
+        chunk = await file.read(1 << 20)                     # 1 MiB at a time
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > _MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="File too large (max 5 MiB)")
+        chunks.append(chunk)
+    content = b"".join(chunks)
+
+    # Validate known kinds BEFORE writing, so a bad calibration / catalog never lands
+    # on disk.
+    summary = None
+    if name == cfg.CALIBRATION_NAME:
+        summary = _validate_calibration_upload(content)
+    elif name == cfg.CALIBRATION_COMPONENTS_NAME:
+        _validate_components_upload(content)
+
+    try:
+        cfg.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        (cfg.DATA_DIR / name).write_bytes(content)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {exc}")
+
+    logger.info("Data file uploaded: %s (%d bytes)", name, len(content))
+    resp = {"saved": name, "size": len(content)}
+    if summary is not None:
+        resp["calibration"] = summary                        # per-signal resolved bounds
+    return resp
+
+
+@app.get("/files", tags=["files"], dependencies=[Depends(verify_key)])
+async def list_files():
+    """List files in the per-unit data store (name, size, modified time)."""
+    from datetime import datetime, timezone
+    d = cfg.DATA_DIR
+    if not d.is_dir():
+        return []
+    out = []
+    for p in sorted(d.iterdir()):
+        if p.is_file():
+            st = p.stat()
+            out.append({"name": p.name, "size": st.st_size,
+                        "modified": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()})
+    return out
+
+
+@app.get("/files/{name}", tags=["files"], dependencies=[Depends(verify_key)])
+async def get_file(name: str):
+    """Return the contents of a file in the per-unit data store."""
+    path = _safe_data_path(name)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"No such file: {name}")
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read file: {exc}")
+    return {"name": name, "content": content, "size": path.stat().st_size}
+
+
+@app.delete("/files/{name}", tags=["files"], dependencies=[Depends(verify_key)])
+async def delete_file(name: str):
+    """Delete a file from the per-unit data store."""
+    path = _safe_data_path(name)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"No such file: {name}")
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to delete file: {exc}")
+    logger.info("Data file deleted: %s", name)
+    return {"deleted": name}
+
+
+@app.get("/calibration", tags=["files"], dependencies=[Depends(verify_key)])
+async def get_calibration():
+    """Convenience view of this unit's calibration: the stored document plus what it
+    resolves to per signal (for a FleetView panel). 404 if the unit isn't calibrated."""
+    import json
+    path = cfg.CALIBRATION_DOC
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="No calibration document for this unit")
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        return {"unit_type": cfg.UNIT_TYPE, "valid": False,
+                "error": f"stored calibration.json is not valid JSON: {exc}"}
+    try:
+        summary = _calib.validate_document(doc, _effective_type_defaults(doc), _effective_components())
+    except _calib.CalibrationError as exc:
+        return {"unit_type": cfg.UNIT_TYPE, "document": doc, "valid": False,
+                "error": str(exc)}
+    return {"unit_type": cfg.UNIT_TYPE, "document": doc, "valid": True,
+            "signals": summary}
+
+
+@app.post("/calibration/validate", tags=["files"], dependencies=[Depends(verify_key)])
+async def validate_calibration(request: Request):
+    """Dry-run: validate a POSTed calibration document WITHOUT storing it, so the editor
+    can preview what it resolves to (or exactly why it's rejected) before Save. Uses the
+    same checks and type-defaults precedence as the upload gate, so the preview matches
+    what a Save would accept and what a transmit would resolve. Always 200 — the verdict
+    is in the body: {valid: true, signals:{…}} or {valid: false, error: "…"}."""
+    import json
+    raw = await request.body()
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        return {"valid": False, "error": f"not valid JSON: {exc}"}
+    try:
+        summary = _calib.validate_document(doc, _effective_type_defaults(doc), _effective_components())
+    except _calib.CalibrationError as exc:
+        return {"valid": False, "error": str(exc)}
+    return {"valid": True, "signals": summary}
+
+
 @app.get("/scripts/{name}/params", tags=["scripts"], dependencies=[Depends(verify_key)])
 async def script_params(name: str):
     """Statically extract a script's parameters (no code execution).
@@ -676,18 +931,26 @@ def _yaml_env(env: dict) -> dict:
 
 
 def _spec_to_entry(spec: TaskConfig) -> dict:
-    """A clean tasks.yaml entry — the commonly-edited fields only."""
+    """A clean tasks.yaml entry — the commonly-edited fields only.
+
+    Every string value is single-quoted so it survives the ruamel (YAML 1.2) →
+    PyYAML (YAML 1.1, config.load_tasks) round-trip. Without quoting, a bare command
+    arg like `on`/`off`/`yes`/`no` reads back as a BOOLEAN in YAML 1.1 (e.g. a
+    `--rf on` argument), which fails TaskConfig's list[str] and silently drops the
+    whole task. This is the same fix _yaml_env applies to env — extended to the
+    command and the other string fields."""
+    sq = SingleQuotedScalarString
     return {
-        "name": spec.name,
-        "description": spec.description,
-        "command": list(spec.command),
-        "working_dir": spec.working_dir or str(SCRIPTS_DIR),
+        "name": sq(spec.name),
+        "description": sq(spec.description),
+        "command": [sq(str(c)) for c in spec.command],
+        "working_dir": sq(spec.working_dir or str(SCRIPTS_DIR)),
         "env": _yaml_env(spec.env),
         "autostart": spec.autostart,
         "restart_on_crash": spec.restart_on_crash,
         # Round-trip the client's library-scope tag; omit when shared (empty) to
         # keep tasks.yaml clean for the common case.
-        **({"types": list(spec.types)} if spec.types else {}),
+        **({"types": [sq(str(t)) for t in spec.types]} if spec.types else {}),
     }
 
 
@@ -704,7 +967,7 @@ async def create_task(spec: TaskConfig, manager: ProcessManager = Depends(get_ma
     return {"created": spec.name, "reload": result}
 
 
-@app.put("/tasks/{name}", tags=["tasks"], dependencies=[Depends(verify_key)])
+@app.put("/tasks/{name:path}", tags=["tasks"], dependencies=[Depends(verify_key)])
 async def update_task(name: str, spec: TaskConfig,
                       manager: ProcessManager = Depends(get_manager)):
     """
@@ -726,7 +989,7 @@ async def update_task(name: str, spec: TaskConfig,
     return {"updated": name, "reload": result}
 
 
-@app.delete("/tasks/{name}", tags=["tasks"], dependencies=[Depends(verify_key)])
+@app.delete("/tasks/{name:path}", tags=["tasks"], dependencies=[Depends(verify_key)])
 async def delete_task(name: str, manager: ProcessManager = Depends(get_manager)):
     """Remove a task from tasks.yaml and reload live. Refuses if it's running."""
     if manager.is_running(name):

@@ -87,6 +87,14 @@ data partition**:
 
 No code change — this is purely which paths the service env points at.
 
+**Script-path parity (implemented):** the real install lives on `/data`, but
+`install.sh` symlinks `/opt/sdr-agent → /data/sdr-agent` and points the service's
+`SDR_AGENT_BASE` at the symlink, so the agent reports and bakes the Pi-identical
+`/opt/sdr-agent/scripts` path into task commands. That's what lets a *shared*
+library task (scoped to both unit types) run on a Pi and an X410 unchanged. The
+symlink is rootfs state, so an OS image update wipes it — the same re-run of
+`install.sh` that re-establishes the unit file recreates it.
+
 `TODO(recon)`: the writable path that survives reboot **and** an OS update.
 
 ### G3 — X410 install profile (no apt, persistent paths)

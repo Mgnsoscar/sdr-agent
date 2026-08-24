@@ -9,6 +9,7 @@ PERSIST_ROOT="${PERSIST_ROOT:-/data}"
 PYROOT="$PERSIST_ROOT/python"
 BASE="$PERSIST_ROOT/sdr-agent"
 SHARED="$PERSIST_ROOT/sdr-agent-shared"
+LINK="/opt/sdr-agent"                  # Pi-identical symlink created by install.sh
 KEEP_STATE="${KEEP_STATE:-0}"          # set 1 to preserve $SHARED (configs/logs)
 
 echo "==> Stopping + disabling the service"
@@ -17,6 +18,9 @@ rm -f /etc/systemd/system/sdr-agent.service
 systemctl daemon-reload
 
 echo "==> Removing code + bundled Python"
+# Only unlink the symlink we made — never rm -rf through it into $BASE, and leave a
+# real dir at $LINK (a genuine /opt install) untouched.
+[ -L "$LINK" ] && rm -f "$LINK"
 rm -rf "$BASE" "$PYROOT"
 if [ "$KEEP_STATE" = "1" ]; then
     echo "    keeping state at $SHARED (KEEP_STATE=1)"
@@ -25,6 +29,6 @@ else
 fi
 
 echo "==> Footprint check (should be nothing):"
-ls -d "$PYROOT" "$BASE" "$SHARED" 2>/dev/null || echo "    (clean)"
+ls -d "$PYROOT" "$BASE" "$SHARED" "$LINK" 2>/dev/null || echo "    (clean)"
 echo "==> Done. If you changed eth0/hostname, revert from ${PERSIST_ROOT}/sdr-netsnapshot"
 echo "    (rm /etc/systemd/network/10-sdr-eth0.network ; systemctl restart systemd-networkd)."

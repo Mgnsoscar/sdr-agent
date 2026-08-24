@@ -23,8 +23,15 @@ touch "$PERSIST_ROOT/.sdr_w" 2>/dev/null && rm -f "$PERSIST_ROOT/.sdr_w" || {
 }
 
 PYROOT="$PERSIST_ROOT/python"            # bundled interpreter (isolated from system py)
-BASE="$PERSIST_ROOT/sdr-agent"           # agent code
+BASE="$PERSIST_ROOT/sdr-agent"           # agent code (real bytes, on persistent storage)
 SHARED="$PERSIST_ROOT/sdr-agent-shared"  # state: configs/logs/run (survives updates)
+# Stable, Pi-identical mount point for the agent. It's a symlink to $BASE, so the
+# real code/scripts stay on the update-surviving /data partition while the paths
+# the agent reports and bakes into task commands match the Pi's /opt layout. That
+# lets one "shared" library task (command: /opt/sdr-agent/scripts/foo.py) run on
+# both a Pi and an X410. The symlink lives on the rootfs, so a full NI OS image
+# update wipes it — re-running this script recreates it (as it does the unit file).
+LINK="/opt/sdr-agent"
 PYBIN="$PYROOT/bin/python3"
 PORT="${SDR_AGENT_PORT:-8765}"
 UNIT_ID="${SDR_UNIT_ID:-$(hostname)}"
@@ -50,6 +57,18 @@ mkdir -p "$BASE"
 cp -a "$HERE/agent" "$HERE/paramkit" "$HERE/requirements.txt" "$BASE/"
 mkdir -p "$BASE/scripts"
 [ -d "$HERE/scripts" ] && cp -a "$HERE/scripts/." "$BASE/scripts/" 2>/dev/null || true
+
+# 2b) Pi-identical path: /opt/sdr-agent -> $BASE. Refuse to clobber a real dir there
+# (a genuine /opt install), but freshen/repoint an existing symlink. Everything the
+# service references below goes through $LINK, so /info and task commands read /opt.
+mkdir -p "$(dirname "$LINK")"
+if [ -L "$LINK" ] || [ ! -e "$LINK" ]; then
+    ln -sfn "$BASE" "$LINK"
+    echo "    linked $LINK -> $BASE"
+else
+    echo "$LINK exists and is not a symlink — refusing to clobber it" >&2
+    exit 1
+fi
 
 # 3) State — seed default configs only where absent (never clobber a unit's state).
 echo "==> Preparing state at $SHARED"
@@ -80,10 +99,10 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=$BASE
-Environment=PYTHONPATH=$BASE
+WorkingDirectory=$LINK
+Environment=PYTHONPATH=$LINK
 Environment=HOME=/root
-Environment=SDR_AGENT_BASE=$BASE
+Environment=SDR_AGENT_BASE=$LINK
 Environment=SDR_STATE_DIR=$SHARED
 Environment=SDR_UNIT_ID=$UNIT_ID
 Environment=SDR_MDNS_EXCLUDE_IFACES=int0

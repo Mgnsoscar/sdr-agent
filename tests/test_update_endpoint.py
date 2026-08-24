@@ -89,3 +89,24 @@ def test_admin_rollback_without_previous(tmp_path, monkeypatch):
         assert res.ok is False and "no previous" in res.message.lower()
 
     asyncio.run(scenario())
+
+
+def test_update_status_lifecycle(tmp_path, monkeypatch):
+    # A fresh update leaves a pending release; /admin/update-status reports it, then
+    # reflects confirmation, then reflects a rollback — the states the client shows.
+    up = _patch_updater(monkeypatch, tmp_path, {})
+
+    async def scenario():
+        await main.admin_update(bundle=UploadFile(filename="b.tar.gz",
+                                                  file=io.BytesIO(_bundle_bytes("1.2.0"))))
+        st = await main.admin_update_status()
+        assert st["current_version"] == "1.2.0"
+        assert st["pending_version"] == "1.2.0"      # awaiting health confirmation
+        assert st["pending_confirmed"] is False
+
+        up.confirm_healthy("1.2.0")                  # the agent marks itself healthy
+        st = await main.admin_update_status()
+        assert st["pending_version"] is None         # marker cleared on confirm
+        assert up.is_confirmed("1.2.0") is True
+
+    asyncio.run(scenario())

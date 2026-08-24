@@ -87,13 +87,19 @@ class AgentInfo(BaseModel):
     hostname: str
     unit_id: str                       # From config or hostname fallback
     machine_id: str = ""               # stable per-machine id (/etc/machine-id)
+    unit_type: str = ""                # this unit's kind (e.g. "broadcaster"); selects
+                                       # the calibration type-defaults layer
     agent_version: str
     python_version: str
     tasks: list[str]
     previous_version: Optional[str] = None   # rollback target, if a release is installed
+    capabilities: list[str] = []             # feature flags the client can gate on
+                                             # (empty on agents predating this field)
     # Where this agent keeps scripts, and the interpreter its tasks should launch
-    # with — so the client can pre-fill task defaults per unit instead of assuming
-    # the Pi layout (X410: /data/sdr-agent/scripts + system python3 for UHD).
+    # with — so the client can pre-fill task defaults per unit. Both the Pi and the
+    # X410 report /opt/sdr-agent/scripts (on the X410 that's a symlink onto its
+    # persistent /data partition), so a task command is portable across unit types;
+    # the interpreter is system python3 (with UHD) on both.
     scripts_dir: str = ""
     task_interpreter: str = "python3"
 
@@ -150,7 +156,8 @@ class SystemHealth(BaseModel):
     load_avg: list[float]              # 1, 5, 15-minute load averages
     utc_now: str = ""                  # Agent's current UTC time (ISO-8601) for clock comparison
     clock_synced: Optional[bool] = None  # True if NTP reports the clock is synchronized
-    clock_source: str = ""             # e.g. "systemd-timesyncd", "chrony", or "" if unknown
+    clock_source: str = ""             # "chrony"/"systemd-timesyncd" (NTP), "manual"
+                                       # (hand-set to the PC clock), or "" if unknown
 
 
 class SdrDevice(BaseModel):
@@ -273,8 +280,12 @@ class RampSpec(BaseModel):
     stop: float
     steps: Optional[int] = None         # number of equal increments (divides evenly)
     step: Optional[float] = None        # OR a fixed value increment per point
-    hold_s: Optional[float] = None      # dwell between points
-    duration_s: Optional[float] = None  # first point → last point (single-anchor)
+    hold_s: Optional[float] = None      # dwell each level is held
+    duration_s: Optional[float] = None  # total held time = levels × hold (single-anchor)
+    # Every emitted level is held for `hold`, incl. the last; drop the start/stop
+    # level (and its hold) to chain ramps without a doubled seam. Single-anchor only.
+    include_first: bool = True
+    include_last: bool = True
     mode: str = "tune"                  # "tune" (live set_params) | "run" (task per point)
     flag: Optional[str] = None          # run mode: CLI flag for the ramped param
     integer: bool = False               # run mode: round each value to an int

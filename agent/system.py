@@ -79,16 +79,36 @@ def _read_throttled() -> Optional[bool]:
 
 # ── Clock / NTP sync ──────────────────────────────────────────────────────────
 
+# Set by _set_clock when the operator sets the clock by hand (e.g. "sync to PC
+# clock" on a no-internet rig). It means "this clock was last disciplined manually
+# and NTP has not since taken over" — cleared the moment we observe NTPSynchronized,
+# so once real internet time returns we report that instead. Uptime-scoped: a reboot
+# clears it (the flag, not the clock), which is correct — we no longer know the
+# clock was hand-set.
+_manual_clock_set = False
+
+
 def _read_clock_sync() -> tuple[Optional[bool], str]:
     """
-    Determine whether the system clock is NTP-synchronized.
+    Determine whether the system clock is trustworthy and how it's disciplined.
 
-    Tries `timedatectl` (systemd-timesyncd / chrony) first since that's the
-    Raspberry Pi OS default. Returns (synced, source). synced is None if it
-    can't be determined.
+    Returns (ntp_synced, source):
+      - ntp_synced: True if `timedatectl` reports NTPSynchronized (real NTP/internet
+        time), False if not, None if it can't be determined.
+      - source: "chrony" / "systemd-timesyncd" when NTP-synced; "manual" when the
+        clock was last set by hand (synced to the PC clock and NTP hasn't taken
+        over); "" otherwise.
+
+    The client renders the pair together: NTP-synced → "internet time", manual →
+    "PC clock", neither → "unsynced". A manual set deliberately leaves NTP enabled
+    (see _set_clock), so NTPSynchronized stays "no" until real internet time
+    returns — which is exactly why the manual flag, not NTPSynchronized, is what
+    tells the operator their PC-clock sync took.
     """
+    global _manual_clock_set
     if shutil.which("timedatectl") is None:
-        return None, ""
+        # Can't read NTP state. If we set the clock by hand we still know that.
+        return (False, "manual") if _manual_clock_set else (None, "")
     try:
         out = subprocess.run(
             ["timedatectl", "show",
@@ -99,15 +119,15 @@ def _read_clock_sync() -> tuple[Optional[bool], str]:
         for line in out.stdout.splitlines():
             if line.startswith("NTPSynchronized="):
                 synced = line.split("=", 1)[1].strip().lower() == "yes"
-        # Best-effort source detection
-        source = ""
-        if shutil.which("chronyc"):
-            source = "chrony"
-        elif Path("/run/systemd/timesync").exists() or shutil.which("timedatectl"):
-            source = "systemd-timesyncd"
-        return synced, source
+        if synced:
+            _manual_clock_set = False   # NTP is the authority now; forget the hand-set
+            source = "chrony" if shutil.which("chronyc") else "systemd-timesyncd"
+            return True, source
+        if _manual_clock_set:
+            return False, "manual"
+        return synced, ""   # False (running free) or None (couldn't parse)
     except (subprocess.SubprocessError, OSError):
-        return None, ""
+        return (False, "manual") if _manual_clock_set else (None, "")
 
 
 # ── Health snapshot ───────────────────────────────────────────────────────────
@@ -170,6 +190,10 @@ def _set_clock(epoch: float) -> tuple[bool, str]:
         # Most likely cause: the agent isn't running as root.
         return False, (proc.stderr.strip()
                        or f"date exited {proc.returncode} (is the agent root?)")
+    # Remember we disciplined the clock by hand, so health reports "PC clock" rather
+    # than "unsynced" until NTP (real internet time) takes over.
+    global _manual_clock_set
+    _manual_clock_set = True
     return True, datetime.now(timezone.utc).isoformat()
 
 

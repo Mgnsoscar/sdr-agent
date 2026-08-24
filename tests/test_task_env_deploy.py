@@ -32,6 +32,29 @@ def test_env_with_yaml_bool_tokens_survives_deploy(tmp_path, monkeypatch):
     assert loaded["rx"].env == env      # every key and value faithful
 
 
+def test_command_with_yaml_bool_arg_survives_deploy(tmp_path, monkeypatch):
+    """A command arg that is a YAML-1.1 boolean token (e.g. `--rf on`) must survive
+    the ruamel→PyYAML round-trip as a string. ruamel leaves `on` bare (a string in
+    YAML 1.2), but PyYAML reads it as True — which failed TaskConfig's list[str] and
+    silently dropped the whole task (the GPS `--rf on` task 'deployed' but never
+    registered)."""
+    _point_at(tmp_path, monkeypatch)
+    (tmp_path / "tasks.yaml").write_text("tasks: []\n")
+
+    command = ["python3", "/opt/sdr-agent/scripts/gps_l1ca_tx.py",
+               "--prn", "1", "--power", "-20", "--samp_rate", "20.46",
+               "--otw", "sc8", "--rf", "on"]
+    spec = TaskConfig(name="GPS L1 CA", command=command)
+
+    doc = main._load_tasks_doc()
+    doc["tasks"] = [main._spec_to_entry(spec)]
+    main._save_tasks_doc(doc)
+
+    loaded = cfg.load_tasks()
+    assert "GPS L1 CA" in loaded, "task with a bool-token command arg was dropped"
+    assert loaded["GPS L1 CA"].command == command   # every arg a faithful string
+
+
 def test_load_tasks_coerces_stray_env_types(tmp_path, monkeypatch):
     """A hand-edited / legacy tasks.yaml with an unquoted on/8080 still loads
     (defensive coercion) rather than dropping the task."""

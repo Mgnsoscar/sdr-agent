@@ -316,7 +316,14 @@ def extract_paramkit_spec(source: str) -> Dict[str, Any]:
             "nargs": "+" if multiple else None,
             "help": _joined_help(kw["help"], consts) if "help" in kw else "",
         })
-    return {"format": "paramkit", "description": description, "params": params}
+    # A calibration-aware script declares a stable CAL_SIGNAL_ID module constant; a
+    # task opts into power calibration by setting SDR_CAL_SIGNAL_ID to it. Surface it
+    # so the client can wire the task's env automatically.
+    cal_signal = consts.get("CAL_SIGNAL_ID")
+    out = {"format": "paramkit", "description": description, "params": params}
+    if isinstance(cal_signal, str) and cal_signal:
+        out["calibration_signal"] = cal_signal
+    return out
 
 
 # ── Dispatcher ───────────────────────────────────────────────────────────────

@@ -33,6 +33,43 @@ SCHEDULE_FILE = Path(os.environ.get("SDR_SCHEDULE_FILE", STATE_DIR / "configs" /
 # ephemeral runtime state, not saved config.
 CTRL_DIR   = Path(os.environ.get("SDR_CTRL_DIR", STATE_DIR / "run" / "ctl"))
 
+# ── Per-unit data store ───────────────────────────────────────────────────────
+# A per-unit area for arbitrary unit-specific files (calibration is the first
+# tenant; see docs/calibration.md §9.2). Distinct from configs/ (fleet-managed
+# state) and scripts/ (code). Uploaded via the /files API, validated per known kind.
+DATA_DIR   = Path(os.environ.get("SDR_DATA_DIR", STATE_DIR / "data"))
+
+# ── Power calibration (see docs/calibration.md) ───────────────────────────────
+# The per-unit calibration document (this box's measured curves) lives in the data
+# store; the shared, type-keyed defaults it merges over live in configs/ (they're
+# fleet state, not per-unit). CAL_RUN_DIR holds the ephemeral per-task RESOLVED
+# artifact the agent injects.
+CALIBRATION_NAME     = "calibration.json"      # reserved, validated name in DATA_DIR
+CALIBRATION_DOC      = Path(os.environ.get("SDR_CALIBRATION_DOC",
+                                           DATA_DIR / CALIBRATION_NAME))
+CALIBRATION_DEFAULTS = Path(os.environ.get("SDR_CALIBRATION_DEFAULTS",
+                                           STATE_DIR / "configs" / "calibration_defaults.yaml"))
+# The component catalog (cables / antennas / pads characterized once as a
+# loss-vs-frequency table) a per-unit chain references. Authored on the client and
+# uploaded to each unit's data store alongside calibration.json (a reserved, validated
+# name), so it travels through the same /files path. Absent → no catalog (only inline
+# delta_db hops resolve). See docs/calibration-v2.md.
+CALIBRATION_COMPONENTS_NAME = "components.yaml"      # reserved, validated name in DATA_DIR
+CALIBRATION_COMPONENTS = Path(os.environ.get("SDR_CALIBRATION_COMPONENTS",
+                                             DATA_DIR / CALIBRATION_COMPONENTS_NAME))
+CAL_RUN_DIR          = Path(os.environ.get("SDR_CAL_RUN_DIR", STATE_DIR / "run" / "cal"))
+# A task opts into calibration by setting this env to its script's CAL_SIGNAL_ID.
+# When present (and a calibration doc exists) the agent resolves it and points the
+# task at the resolved artifact via CALIBRATION_FILE_ENV; the script reads that and
+# maps --power (dBm) → gain, falling back to its baked defaults if the var is absent.
+CAL_SIGNAL_ID_ENV    = "SDR_CAL_SIGNAL_ID"
+CALIBRATION_FILE_ENV = "SDR_CALIBRATION_FILE"
+# Optional: the task's transmit centre frequency in Hz. When set (the client sources
+# it from the script's CAL_FREQ_PARAM), the agent folds the artifact's v1-compat curve
+# and scalar bounds at this frequency; a frequency-aware script still re-folds per its
+# live frequency from the artifact's passive_hops. See docs/calibration-v2.md.
+CAL_FREQ_HZ_ENV      = "SDR_CAL_FREQ_HZ"
+
 # ── OTA update layout ─────────────────────────────────────────────────────────
 # Release dirs live under RELEASES_DIR as <version>/ (the code), and BASE_DIR is a
 # symlink to the active one that the updater flips atomically. OTA markers live in
@@ -54,6 +91,10 @@ UPDATE_HEALTH_GRACE_S = float(os.environ.get("SDR_UPDATE_HEALTH_GRACE_S", "90"))
 import socket
 HOSTNAME   = socket.gethostname()
 UNIT_ID    = os.environ.get("SDR_UNIT_ID", HOSTNAME)
+# This unit's kind (e.g. "broadcaster"). Selects the calibration type-defaults
+# layer (docs/calibration.md §7.1). Empty = no type layer; the per-unit doc stands
+# alone. The agent itself is type-agnostic — this is just data it reads.
+UNIT_TYPE  = os.environ.get("SDR_UNIT_TYPE", "")
 
 
 def machine_id() -> str:
@@ -77,7 +118,45 @@ MACHINE_ID = machine_id()
 
 AGENT_HOST    = os.environ.get("SDR_AGENT_HOST", "0.0.0.0")
 AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
-AGENT_VERSION = "1.0.0"
+# Bump on any change that alters the agent's HTTP surface, so the OTA updater and the
+# client's "Update agent…" flow (which compare version strings) can tell builds apart
+# and actually install the new code. 1.1.0 adds the per-unit file store + /calibration;
+# 1.1.1 surfaces a script's CAL_SIGNAL_ID in /scripts/{name}/params; 1.1.2 aligns
+# calibration upload-validation and the /calibration view with transmit-time
+# unit_type resolution, and hardens the upload size cap; 1.1.3 rejects a
+# duration+hold ramp too short to hold two levels (a single step, not a ramp);
+# 1.1.4 advertises capabilities in /info so the client can feature-gate explicitly;
+# 1.1.5 confirms a freshly-activated OTA release before the slow startup steps (so a
+# slow boot can't get a good update rolled back) and exposes /admin/update-status;
+# 1.1.6 lets a task name contain '/' (routes use {name:path}; log/socket paths are
+# sanitised + hash-disambiguated and can no longer traverse); 1.1.7 rejects arming a
+# sequence when one of its tasks is already running, or when its on-air window overlaps
+# a run already armed/running on this unit (one TX channel — was a device-busy crash);
+# 1.1.8 moves the read-only task sub-resources (logs, history, live-params, log stream)
+# to their own /task-* prefixes with the name as the terminal segment, so a task name
+# containing '/' can never be misrouted to a shorter name's sub-resource;
+# 1.1.9 adds POST /calibration/validate — a dry-run that validates a document without
+# storing it, so the editor can preview what it resolves to before Save;
+# 1.2.0 adds calibration v2 (docs/calibration-v2.md): a derived plane may reference a
+# shared component catalog (components.yaml — a reserved, validated file in the /files
+# store) whose cable/antenna loss is a Δ dB-vs-frequency table, resolved at the transmit
+# frequency; the resolved artifact carries the passive-hop tables + a frequency-split
+# ceiling so the script folds --power at its live frequency. Inline delta_db and every
+# v1 document keep resolving unchanged.
+AGENT_VERSION = "1.2.0"
+
+# Feature flags this agent's HTTP surface supports, reported by GET /info so the
+# client can light features up (or say "needs a newer agent") from an explicit list
+# instead of probing each endpoint and inferring support from a 404. Add a flag when
+# a new capability ships; never remove or rename one (the client matches by string).
+AGENT_CAPABILITIES = [
+    "calibration",        # per-unit power calibration: /files store + /calibration view
+    "script-cal-signal",  # /scripts/{name}/params reports a script's CAL_SIGNAL_ID
+    "ota-status",         # /admin/update-status reports the OTA confirm/rollback state
+    "cal-validate",       # POST /calibration/validate dry-runs a document without storing
+    "calibration-components",  # v2: a derived plane may reference a components.yaml entry
+                               # (Δ dB-vs-frequency); resolved per transmit frequency
+]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
 # task defaults. "python3" (the default) resolves via PATH at launch — on the X410
@@ -86,7 +165,14 @@ AGENT_VERSION = "1.0.0"
 TASK_INTERPRETER = os.environ.get("SDR_TASK_INTERPRETER", "python3")
 
 # ── Auth (optional shared secret) ────────────────────────────────────────────
-# Set SDR_API_KEY on both the Pi and your client.  Leave empty to disable auth.
+# Set SDR_API_KEY on both the Pi and your client. Leave empty to disable auth.
+#
+# TRUST MODEL: the agent speaks plain HTTP and is designed for a TRUSTED LAN (a lab
+# bench / isolated network). The API key is compared in constant time (see
+# main.verify_key), but because traffic is not encrypted it travels in cleartext — so
+# the key guards against casual access on the LAN, NOT against an attacker who can
+# sniff the wire. Do not expose the agent to an untrusted network or the public
+# internet; put it behind a VPN or a TLS-terminating reverse proxy if you must.
 
 API_KEY = os.environ.get("SDR_API_KEY", "")
 

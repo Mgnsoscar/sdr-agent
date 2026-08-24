@@ -33,7 +33,7 @@ import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from . import ramp
 from .log_manager import LogManager
@@ -63,6 +63,21 @@ def _parse(ts: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _spans_overlap(a_start: datetime, a_end: Optional[datetime],
+                   b_start: datetime, b_end: Optional[datetime]) -> bool:
+    """Do half-open spans [a_start, a_end) and [b_start, b_end) overlap? A None end
+    means open-ended (+∞). Touching at an endpoint (a_end == b_start) does not overlap."""
+    a_ok = a_end is None or a_end > b_start
+    b_ok = b_end is None or b_end > a_start
+    return a_ok and b_ok
+
+
+def _fmt_window(start: datetime, end: Optional[datetime]) -> str:
+    lo = start.strftime("%H:%M:%S")
+    hi = end.strftime("%H:%M:%S") if end else "open-ended"
+    return f"{lo}–{hi} UTC"
 
 
 def _seq_id() -> str:
@@ -192,7 +207,9 @@ class SequenceRunner:
                             raise ValueError("a window-filling ramp needs a step count or hold time")
                     else:
                         ramp.resolve_ramp(s.ramp.start, s.ramp.stop, steps=s.ramp.steps, step=s.ramp.step,
-                                          hold_s=s.ramp.hold_s, duration_s=s.ramp.duration_s)
+                                          hold_s=s.ramp.hold_s, duration_s=s.ramp.duration_s,
+                                          include_first=s.ramp.include_first,
+                                          include_last=s.ramp.include_last)
                 except ValueError as exc:
                     raise ValueError(f"ramp step for '{s.task_name}': {exc}")
         # Must have an on-air start (a start-anchored action at offset 0 is the
@@ -302,6 +319,15 @@ class SequenceRunner:
         return min((s.offset_s for s in steps if s.anchor == "start"), default=0.0)
 
     @staticmethod
+    def _active_span(run: SequenceRun) -> Tuple[datetime, Optional[datetime]]:
+        """The wall-clock span a run occupies the TX channel: from its earliest fire
+        (warm-up lead-in) to on_air_end. An open-ended run has no end (+∞)."""
+        fire_times = [_parse(s.fire_at) for s in run.steps if getattr(s, "fire_at", None)]
+        start = min(fire_times) if fire_times else _parse(run.on_air_at)
+        end = _parse(run.on_air_end) if run.on_air_end else None
+        return start, end
+
+    @staticmethod
     def _validate_overrides(
         steps: List[SequenceStep], overrides: List[StepOverride],
     ) -> Dict[int, StepOverride]:
@@ -397,7 +423,8 @@ class SequenceRunner:
             window_s = (on_air_end - on_air_at).total_seconds() - (s.offset_s or 0.0) + end_inset
         try:
             resolved = ramp.resolve_ramp(r.start, r.stop, steps=r.steps, step=r.step, hold_s=r.hold_s,
-                                         duration_s=r.duration_s, window_s=window_s)
+                                         duration_s=r.duration_s, window_s=window_s,
+                                         include_first=r.include_first, include_last=r.include_last)
             points = ramp.place_ramp(s.anchor, s.offset_s, resolved)
         except ValueError as exc:
             logger.error("Ramp step for '%s' could not be resolved: %s", s.task_name, exc)
@@ -497,6 +524,31 @@ class SequenceRunner:
         )
 
         async with self._lock:
+            # A0. Don't arm on top of a task that's already running (started by hand,
+            # by a scheduled event, or by another sequence). This unit has one TX
+            # channel; arming would only collide with it at fire time.
+            already = sorted({s.task_name for s in eff_steps
+                              if self._manager.is_running(s.task_name)})
+            if already:
+                raise ValueError(
+                    "cannot arm: task(s) already running on this unit: "
+                    + ", ".join(f"'{t}'" for t in already))
+
+            # A. Don't arm a run whose active span overlaps another armed/running run
+            # on this unit — overlapping windows would both drive the single TX channel
+            # and produce confusing "device busy" crashes instead of a clean rejection.
+            new_start = earliest_fire
+            new_end = on_air_end   # None ⇒ open-ended ⇒ +∞
+            for other in self._runs.values():
+                if other.state not in (SequenceState.ARMED, SequenceState.RUNNING):
+                    continue
+                o_start, o_end = self._active_span(other)
+                if _spans_overlap(new_start, new_end, o_start, o_end):
+                    win = _fmt_window(o_start, o_end)
+                    raise ValueError(
+                        f"cannot arm: on-air window overlaps run {other.id} "
+                        f"('{other.sequence_name}', {win}) already on this unit")
+
             self._runs[run.id] = run
             self._persist_runs()
 
