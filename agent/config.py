@@ -153,7 +153,13 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # curve-independent structure is validated; a broken chain is still rejected; nothing can
 # transmit until a signal is added. Such a document is REJECTED by ≤1.3.0 agents ("document
 # has no signals"), so the client gates on the calibration-no-signals capability below.
-AGENT_VERSION = "1.4.0"
+# 1.5.0 lets a safety limit choose the stage boundary it applies at: `side: "input"` caps
+# the plane feeding the named stage (one hop upstream), `side: "output"` (default) the plane
+# itself. An input-protection limit (e.g. an amp's max input power) then follows its stage
+# when a component is inserted upstream, instead of naming a fixed plane that detaches. A
+# ≤1.4.0 agent IGNORES `side` and would mis-apply the cap at the output, so the client gates
+# on the calibration-limit-side capability below (a safety gate, not just a feature gate).
+AGENT_VERSION = "1.5.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -170,6 +176,8 @@ AGENT_CAPABILITIES = [
                                    # stage and inherit the nearest upstream measured curve
     "calibration-no-signals",      # a signal-less document (chain + ceiling only) is
                                    # accepted, for onboarding before any signal is measured
+    "calibration-limit-side",      # a limit may set side: input/output to apply at a
+                                   # stage's input (one hop upstream) vs its output plane
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

@@ -124,13 +124,37 @@ amp-protection and a regulatory EIRP cap the same mechanism:
 
 ```jsonc
 "limits": [
-  { "plane": "sdr_output",   "max_dbm": -2.5, "reason": "amp P1dB input" },
-  { "plane": "antenna_eirp", "max_dbm": 30.0, "reason": "regulatory EIRP cap" }
+  { "plane": "amplifier_output", "side": "input",  "max_dbm": -2.5, "reason": "amp P1dB input" },
+  { "plane": "antenna_eirp",     "side": "output", "max_dbm": 50.0, "reason": "licence EIRP cap" }
 ]
 ```
 
 Resolved ceiling = **min** gain over all limits, capped by the hardware max. The
 tightest wins.
+
+**Which stage boundary a limit applies at (`side`).** A plane is a *node* between
+stages: it is the **output** of the stage before it and the **input** of the stage
+after it. `side` picks which boundary a limit protects:
+
+- `"output"` (the default, and what a limit with no `side` means) — the cap is on the
+  named plane itself, i.e. the output of that stage. A regulatory EIRP cap is an
+  output limit on `antenna_eirp`.
+- `"input"` — the cap is on the plane **feeding** the named stage, one hop upstream in
+  the cascade (a derived plane's `from`; a measured plane's predecessor by cascade
+  order). An amplifier's max input power is an input limit on `amplifier_output`.
+
+The point of `"input"` is that the limit **follows its stage**. An amp that must never
+see more than −2.5 dBm at its input is `{ "plane": "amplifier_output", "side": "input" }`.
+If you later insert a pad or a longer cable *in front of* the amp (a new plane between
+the SDR and the amp), the amp's input plane changes — but the limit re-resolves to the
+new upstream plane automatically. You never restate −2.5 dBm on the newly inserted
+component. (An input-side limit on the very first plane has nothing upstream and is
+refused.)
+
+> The default is `"output"`, so every existing `{ plane, max_dbm }` limit keeps
+> resolving exactly as before. `side` is advertised as the `calibration-limit-side`
+> capability (agent ≥ 1.5.0); an older agent ignores the key and would apply the cap at
+> the *output*, so the client refuses to push a `side`-using document to it.
 
 ---
 
@@ -173,7 +197,8 @@ curve against the shared threshold.
     "gain_limits": { "min_gain_db": 0.0, "max_gain_db": 89.75 },
     "operating_plane": "antenna_eirp",     // what --power means; "sdr_output" pre-amp-pass
     "limits": [
-      { "plane": "sdr_output", "max_dbm": -2.5, "reason": "amp P1dB input" }
+      // amp-input protection: follows the amp if a component is inserted upstream
+      { "plane": "amplifier_output", "side": "input", "max_dbm": -2.5, "reason": "amp P1dB input" }
     ],
     "planes": {
       "sdr_output": {
@@ -313,6 +338,7 @@ fields optional (it only supplies defaults). Note that in the per-unit file the
       "additionalProperties": false,
       "properties": {
         "plane":   { "type": "string" },
+        "side":    { "enum": ["input", "output"] },   // default "output" (the plane itself)
         "max_dbm": { "type": "number" },
         "reason":  { "type": "string" }
       }
@@ -450,7 +476,8 @@ def resolve_max_gain(chain, planes):
     if chain.gain_limits.max_gain_db is not None:
         candidates.append(chain.gain_limits.max_gain_db)
     for lim in chain.limits:                      # each limit -> a gain, via this signal's curve
-        candidates.append(gain_for_power_on(lim.max_dbm, lim.plane, planes))
+        plane = upstream_plane(lim.plane) if lim.side == "input" else lim.plane
+        candidates.append(gain_for_power_on(lim.max_dbm, plane, planes))
     if not candidates:
         refuse("no safety ceiling — refusing to transmit")   # MANDATORY
     return min(candidates)                         # hardware max already folded into gain_limits

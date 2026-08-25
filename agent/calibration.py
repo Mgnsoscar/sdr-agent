@@ -312,6 +312,43 @@ def _anchor_plane(plane_name: str, planes: dict) -> _Measured:
     return p
 
 
+_LIMIT_SIDES = ("input", "output")
+
+
+def _upstream_plane(plane_name: str, planes: dict) -> str:
+    """The plane feeding INTO ``plane_name``'s stage — one hop upstream in the cascade.
+    A stage's output is the plane itself; its input is the plane before it. For a
+    derived (passive) plane that upstream plane is its ``from``; for a measured plane it
+    is the plane immediately preceding it in cascade order — the same insertion order the
+    partial-stage fallback already relies on. The first stage has nothing upstream."""
+    p = planes[plane_name]
+    if isinstance(p, _Derived):
+        return p.frm
+    keys = list(planes)
+    i = keys.index(plane_name)
+    if i == 0:
+        raise CalibrationError(
+            f"input-side limit on {plane_name!r} has no upstream stage (it is the first "
+            f"plane in the chain)")
+    return keys[i - 1]
+
+
+def _limit_plane(lim: dict, planes: dict) -> str:
+    """The plane a limit's cap actually applies at, honouring its ``side``. ``output``
+    (the default) is the named plane — the stage's output. ``input`` is the plane feeding
+    that stage, so an input-protection limit (e.g. an amplifier's max input power) follows
+    the stage when a component is inserted upstream, instead of naming a fixed plane that
+    silently detaches. Validates the plane reference and the side."""
+    plane = lim.get("plane")
+    if plane not in planes:
+        raise CalibrationError(f"limit references unknown plane {plane!r}")
+    side = lim.get("side", "output")
+    if side not in _LIMIT_SIDES:
+        raise CalibrationError(
+            f"limit on {plane!r} has invalid side {side!r} (expected 'input' or 'output')")
+    return _upstream_plane(plane, planes) if side == "input" else plane
+
+
 def _eval_table(table: list, freq: Optional[float]) -> float:
     """One delta table's value at ``freq`` (constant if single-point)."""
     if len(table) == 1:
@@ -439,9 +476,7 @@ def resolve(unit_doc: dict,
     if gl.get("max_gain_db") is not None:
         const_caps.append(float(gl["max_gain_db"]))
     for lim in (chain.get("limits") or []):
-        plane = lim.get("plane")
-        if plane not in planes:
-            raise CalibrationError(f"limit references unknown plane {plane!r}")
+        plane = _limit_plane(lim, planes)            # honour side: input → one hop upstream
         _require_usable(plane, planes)               # need a curve to invert against
         if _path_freq_dependent(plane, planes):
             freq_limits.append((plane, float(lim["max_dbm"]), lim.get("reason", "")))
@@ -532,9 +567,9 @@ def validate_chain_structure(unit_doc: dict, type_defaults: Optional[dict] = Non
     if gl.get("max_gain_db") is None and not chain.get("limits"):
         raise CalibrationError("no safety ceiling — set a max gain or add at least one limit")
     for lim in (chain.get("limits") or []):
-        if not isinstance(lim, dict) or lim.get("plane") not in planes:
-            raise CalibrationError(
-                f"limit references unknown plane {(lim or {}).get('plane')!r}")
+        if not isinstance(lim, dict):
+            raise CalibrationError(f"limit is not an object: {lim!r}")
+        _limit_plane(lim, planes)          # validates plane ref, side, and input upstream
 
 
 def validate_document(unit_doc: dict, type_defaults: Optional[dict] = None,

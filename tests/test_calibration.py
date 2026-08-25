@@ -296,6 +296,69 @@ def test_bad_schema_version_refuses():
         _resolve(doc)
 
 
+# ── Limit side: input vs output stage boundary ───────────────────────────────────
+
+def test_limit_side_input_resolves_one_hop_upstream():
+    # An input-side limit on the amplifier stage caps its INPUT plane (sdr_output), so it
+    # matches an output-side limit on sdr_output — not one on amplifier_output's own curve.
+    r_in = _resolve(_doc(operating="amplifier_output",
+                         limits=[{"plane": "amplifier_output", "side": "input", "max_dbm": -2.5}]))
+    r_ref = _resolve(_doc(operating="amplifier_output",
+                          limits=[{"plane": "sdr_output", "max_dbm": -2.5}]))
+    assert r_in.max_gain_db == pytest.approx(r_ref.max_gain_db) == pytest.approx(74.0)
+
+
+def test_limit_side_output_is_the_named_plane():
+    # side:output (the default) caps the named plane's OWN curve. On amplifier_output the
+    # amp curve hits -2.5 dBm at gain 43.5 — distinct from the input case above.
+    r_out = _resolve(_doc(operating="amplifier_output",
+                          limits=[{"plane": "amplifier_output", "side": "output", "max_dbm": -2.5}]))
+    assert r_out.max_gain_db == pytest.approx(43.5)
+    # an absent side behaves as output (backward compatible)
+    r_default = _resolve(_doc(operating="amplifier_output",
+                              limits=[{"plane": "amplifier_output", "max_dbm": -2.5}]))
+    assert r_default.max_gain_db == pytest.approx(43.5)
+
+
+def _doc_with_pad(pad_delta_db, limits):
+    """The default chain with a passive pad inserted between the SDR and the amp, so the
+    amplifier's input plane is now `pad_output` rather than `sdr_output`."""
+    doc = _doc(operating="amplifier_output", limits=limits)
+    planes = doc["chain"]["planes"]
+    doc["chain"]["planes"] = {
+        "sdr_output":       planes["sdr_output"],
+        "pad_output":       {"type": "derived", "from": "sdr_output", "delta_db": pad_delta_db},
+        "amplifier_output": planes["amplifier_output"],
+        "cable_output":     planes["cable_output"],
+        "antenna_eirp":     planes["antenna_eirp"],
+    }
+    return doc
+
+
+def test_limit_side_input_follows_a_component_inserted_upstream():
+    # Insert a +3 dB pad (delta -3.0 loss? no: pad attenuates → -3.0) before the amp. The
+    # amp's input plane is now pad_output; an input-side limit on the amp must re-resolve
+    # there automatically — matching an explicit limit on pad_output, and DIFFERING from
+    # the old sdr_output resolution (the pad relaxes the SDR-gain cap by its loss).
+    lim = [{"plane": "amplifier_output", "side": "input", "max_dbm": -30.0}]
+    r_follow = _resolve(_doc_with_pad(-3.0, lim))
+    r_padref = _resolve(_doc_with_pad(-3.0, [{"plane": "pad_output", "max_dbm": -30.0}]))
+    r_old    = _resolve(_doc_with_pad(-3.0, [{"plane": "sdr_output", "max_dbm": -30.0}]))
+    assert r_follow.max_gain_db == pytest.approx(r_padref.max_gain_db) == pytest.approx(49.0)
+    assert r_old.max_gain_db == pytest.approx(46.0)          # the un-followed (wrong) plane
+
+
+def test_limit_side_input_on_first_plane_refuses():
+    with pytest.raises(CalibrationError, match="no upstream stage"):
+        _resolve(_doc(operating="sdr_output",
+                      limits=[{"plane": "sdr_output", "side": "input", "max_dbm": -2.5}]))
+
+
+def test_limit_invalid_side_refuses():
+    with pytest.raises(CalibrationError, match="invalid side"):
+        _resolve(_doc(limits=[{"plane": "sdr_output", "side": "sideways", "max_dbm": -2.5}]))
+
+
 def test_single_point_curve_uses_slope_one_fallback():
     curves = {"sdr_output": {"points": _pts([(60, -16.0)])}}
     r = _resolve(_doc(operating="sdr_output", curves=curves,
@@ -391,6 +454,12 @@ def test_validate_document_no_signals_still_checks_chain():
     dangling["chain"]["planes"]["cable_output"]["from"] = "ghost"
     with pytest.raises(CalibrationError, match="unknown plane"):
         validate_document(dangling, None)
+    # an input-side limit on the first plane (nothing upstream) — checked without curves
+    bad_side = _doc()
+    bad_side["signals"] = {}
+    bad_side["chain"]["limits"] = [{"plane": "sdr_output", "side": "input", "max_dbm": -2.5}]
+    with pytest.raises(CalibrationError, match="no upstream stage"):
+        validate_document(bad_side, None)
 
 
 def test_validate_document_rejects_non_object_signals():
