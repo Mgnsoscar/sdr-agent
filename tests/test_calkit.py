@@ -187,3 +187,33 @@ def test_load_without_env_returns_baked(monkeypatch):
     monkeypatch.delenv("SDR_CALIBRATION_FILE", raising=False)
     baked = PowerMap.from_linear(0.0, 89.75, -50.0, -2.5, amplitude=0.7)
     assert PowerMap.load(baked) is baked
+
+
+# ── uncalibrated map: no baked absolute scale (issue #4) ─────────────────────────
+
+def test_uncalibrated_map_refuses_absolute_power():
+    from paramkit.calkit import NoAbsoluteScale
+    pm = PowerMap.uncalibrated(0.0, 89.75, amplitude=0.5)
+    assert pm.has_absolute is False
+    assert pm.min_power_dbm is None and pm.max_power_dbm is None
+    assert pm.power_field_kwargs() == {}                 # --power field unbounded / absent
+    assert pm.max_gain_db == pytest.approx(89.75)        # gain limits still apply
+    with pytest.raises(NoAbsoluteScale):
+        pm.gain_for_power(-30.0)
+
+
+def test_load_no_file_returns_uncalibrated(monkeypatch):
+    monkeypatch.delenv("SDR_CALIBRATION_FILE", raising=False)
+    baked = PowerMap.uncalibrated(0.0, 89.75, amplitude=0.5)
+    got = PowerMap.load(baked)
+    assert got is baked and got.has_absolute is False
+
+
+def test_load_amplitude_mismatch_returns_uncalibrated(tmp_path, monkeypatch):
+    r, _ = _pair(_doc("cable_flat", "ant_flat", amplitude=0.8))
+    art_path = tmp_path / "cal.json"
+    art_path.write_text(json.dumps(r.to_public_dict()), encoding="utf-8")
+    baked = PowerMap.uncalibrated(0.0, 89.75, amplitude=0.5)   # script transmits at 0.5
+    monkeypatch.setenv("SDR_CALIBRATION_FILE", str(art_path))
+    pm = PowerMap.load(baked)
+    assert pm is baked and pm.has_absolute is False and pm.warning

@@ -39,6 +39,13 @@ AMPLITUDE_MATCH_TOL = 1e-6
 log = logging.getLogger("calkit")
 
 
+class NoAbsoluteScale(Exception):
+    """Raised when a caller asks for an absolute-power (dBm) conversion but the signal is
+    not calibrated on this unit — there is no baked dBm fallback. A script maps --power only
+    on a real measured curve; uncalibrated it runs on a relative gain, never on invented
+    power levels."""
+
+
 def _interp(x: float, xs: list, ys: list) -> float:
     """Piecewise-linear y(x) over strictly-increasing xs, endpoint-clamped. A single
     sample degrades to a slope-1 line through it (1 dB gain ≈ 1 dB power) — the same
@@ -91,6 +98,7 @@ class PowerMap:
         self.source = source                 # human tag: where the map came from
         self.label = label                   # what --power means (quantity, at plane)
         self.warning = None                  # set when a calibration was rejected (see load)
+        self.has_absolute = True             # a real dBm↔gain scale (False = uncalibrated)
         # v2 frequency machinery ((freqs, deltas) per passive hop; per-limit tables).
         self._hops = [([float(f) for f, _ in t], [float(d) for _, d in t]) for t in hops]
         self._freq_limits = [
@@ -124,12 +132,18 @@ class PowerMap:
         """Commanded gain (dB) for a requested power at ``freq`` (defaults to the
         artifact's representative frequency), clamped to [min, ceiling(freq)]. Upward is
         clamped to the ceiling, never extrapolated past it."""
+        if not self.has_absolute:
+            raise NoAbsoluteScale(
+                "this signal is not calibrated on this unit — absolute --power (dBm) has "
+                "no meaning here; provide --gain (raw dB) instead")
         f = self._eff(freq)
         g = self._invert(float(delivered_dbm) - self._op_delta(f))
         return min(max(g, self.min_gain_db), self._ceiling(f))
 
     def power_for_gain(self, gain_db: float, freq: Optional[float] = None) -> float:
         """Delivered power (dBm) at the operating plane for an (actual) gain at ``freq``."""
+        if not self.has_absolute:
+            raise NoAbsoluteScale("uncalibrated: no absolute power scale for this signal")
         f = self._eff(freq)
         g = min(max(float(gain_db), self.min_gain_db), self._ceiling(f))
         return _interp(g, self._gains, self._powers) + self._op_delta(f)
@@ -139,12 +153,22 @@ class PowerMap:
         return self._ceiling(self._center_freq)
 
     @property
-    def max_power_dbm(self) -> float:
-        return self.power_for_gain(self.max_gain_db)
+    def max_power_dbm(self):
+        """Top of the delivered-power range, or None when uncalibrated (no dBm scale)."""
+        return self.power_for_gain(self.max_gain_db) if self.has_absolute else None
 
     @property
-    def min_power_dbm(self) -> float:
-        return self.power_for_gain(self.min_gain_db)
+    def min_power_dbm(self):
+        return self.power_for_gain(self.min_gain_db) if self.has_absolute else None
+
+    def power_field_kwargs(self) -> dict:
+        """paramkit ``.number()`` bounds for a script's --power field: min/max/default from the
+        resolved calibration range, or ``{}`` (unbounded, no default) when uncalibrated — so an
+        uncalibrated script offers no baked dBm scale, only a relative --gain."""
+        if not self.has_absolute:
+            return {}
+        return {"min": round(self.min_power_dbm, 2), "max": round(self.max_power_dbm, 2),
+                "default": round(self.max_power_dbm, 2)}
 
     @property
     def freq_dependent(self) -> bool:
@@ -163,6 +187,28 @@ class PowerMap:
         return cls([min_gain_db, max_gain_db], [min_power_dbm, max_power_dbm],
                    min_gain_db, max_gain_db, amplitude,
                    source="baked defaults", label=label)
+
+    @classmethod
+    def uncalibrated(cls, min_gain_db, max_gain_db, amplitude) -> "PowerMap":
+        """A gain-only map for when NO calibration is injected: it carries the gain limits
+        (so a relative gain still clamps to a safe range) but has NO absolute dBm scale.
+        ``gain_for_power`` / ``power_for_gain`` refuse (:class:`NoAbsoluteScale`), the power
+        range is None, and ``power_field_kwargs`` is empty. Replaces the old baked slope-1
+        fallback — an uncalibrated script never invents dBm levels."""
+        self = cls.__new__(cls)
+        self._gains = [float(min_gain_db), float(max_gain_db)]
+        self._powers = []
+        self.min_gain_db = float(min_gain_db)
+        self._ceiling_const = float(max_gain_db)
+        self.amplitude = float(amplitude)
+        self.source = "uncalibrated"
+        self.label = "raw gain only (no calibration)"
+        self.warning = None
+        self._hops = []
+        self._freq_limits = []
+        self._center_freq = None
+        self.has_absolute = False
+        return self
 
     @classmethod
     def from_artifact(cls, art: dict, fallback_amplitude: float) -> "PowerMap":
@@ -222,8 +268,8 @@ class PowerMap:
             baked.warning = (
                 f"calibration IGNORED — it was measured at amplitude {float(art_amp):g}, but "
                 f"this script transmits at {baked.amplitude:g}; its calibrated power is no "
-                f"longer valid. Running UNCALIBRATED (baked levels). Re-run calibration at "
-                f"amplitude {baked.amplitude:g} to restore it.")
+                f"longer valid. Running UNCALIBRATED. Re-run calibration at amplitude "
+                f"{baked.amplitude:g} to restore it.")
             log.warning("%s", baked.warning)
             return baked
         return cls.from_artifact(art, fallback_amplitude=baked.amplitude)
