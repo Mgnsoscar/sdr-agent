@@ -244,12 +244,18 @@ def test_no_ceiling_refuses():
                       gain_limits={"min_gain_db": 0.0}))     # no max, no limits
 
 
-def test_operating_plane_without_curve_refuses():
-    # operate on amplifier_output but only measure sdr_output → latent → refuse.
+def test_operating_plane_without_own_curve_inherits_upstream():
+    # Operate on amplifier_output but measure only sdr_output. Since 1.3.0 a downstream
+    # measured stage with no curve for this signal inherits the nearest upstream measured
+    # curve (a transparent +0 dB hop) instead of refusing — see the partial-measured-stage
+    # tests in test_calibration_v2.py. So it resolves to the sdr curve, and the sdr_output
+    # ceiling still binds. (A latent *source* stage, with nothing upstream, still refuses.)
     curves = {"sdr_output": {"points": _pts(SDR_POINTS)}}
-    with pytest.raises(CalibrationError):
-        _resolve(_doc(operating="amplifier_output", curves=curves,
+    r = _resolve(_doc(operating="amplifier_output", curves=curves,
                       limits=[{"plane": "sdr_output", "max_dbm": -2.5}]))
+    assert r.operating_plane == "amplifier_output"
+    assert r.power_for_gain(74.0) == pytest.approx(-2.5)   # inherited sdr curve
+    assert r.max_gain_db == pytest.approx(74.0)            # sdr_output limit still binds
 
 
 def test_curve_for_derived_plane_refuses():

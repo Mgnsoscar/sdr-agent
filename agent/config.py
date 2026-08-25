@@ -148,7 +148,12 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # being rejected — so a downstream measured plane can be added for a signal or two without
 # re-measuring the rest. Such a document RESOLVES here but is REJECTED by ≤1.2.0 agents,
 # so the client gates on the calibration-partial-stages capability below.
-AGENT_VERSION = "1.3.0"
+# 1.4.0 accepts a signal-less calibration document (upload/validate/view): a unit's chain
+# and safety ceiling can be saved during onboarding, before any signal is measured. The
+# curve-independent structure is validated; a broken chain is still rejected; nothing can
+# transmit until a signal is added. Such a document is REJECTED by ≤1.3.0 agents ("document
+# has no signals"), so the client gates on the calibration-no-signals capability below.
+AGENT_VERSION = "1.4.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -163,6 +168,8 @@ AGENT_CAPABILITIES = [
                                # (Δ dB-vs-frequency); resolved per transmit frequency
     "calibration-partial-stages",  # a signal may omit the curve for a non-first measured
                                    # stage and inherit the nearest upstream measured curve
+    "calibration-no-signals",      # a signal-less document (chain + ceiling only) is
+                                   # accepted, for onboarding before any signal is measured
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
