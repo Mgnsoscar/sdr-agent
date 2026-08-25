@@ -159,7 +159,12 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # when a component is inserted upstream, instead of naming a fixed plane that detaches. A
 # ≤1.4.0 agent IGNORES `side` and would mis-apply the cap at the output, so the client gates
 # on the calibration-limit-side capability below (a safety gate, not just a feature gate).
-AGENT_VERSION = "1.5.0"
+# 1.5.1 (bundle-only, no HTTP-surface change) — calkit now enforces an amplitude gate: a
+# transmit script drives a FIXED baseband amplitude, and its injected calibration is honoured
+# only when measured at that same amplitude; a mismatch falls back to uncalibrated (baked)
+# levels with a loud warning instead of transmitting on an invalid power scale. calkit ships
+# in the OTA bundle, so the version bumps to propagate it to units.
+AGENT_VERSION = "1.5.1"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list

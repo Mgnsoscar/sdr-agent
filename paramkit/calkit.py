@@ -26,10 +26,17 @@ constants, byte-identical to the previous behaviour.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Optional
 
 CALIBRATION_FILE_ENV = "SDR_CALIBRATION_FILE"
+
+# Amplitudes are authored numbers in [0, 1]; treat anything within this of the script's
+# fixed amplitude as "the same amplitude" (guards float noise, not a real difference).
+AMPLITUDE_MATCH_TOL = 1e-6
+
+log = logging.getLogger("calkit")
 
 
 def _interp(x: float, xs: list, ys: list) -> float:
@@ -83,6 +90,7 @@ class PowerMap:
         self.amplitude = float(amplitude)
         self.source = source                 # human tag: where the map came from
         self.label = label                   # what --power means (quantity, at plane)
+        self.warning = None                  # set when a calibration was rejected (see load)
         # v2 frequency machinery ((freqs, deltas) per passive hop; per-limit tables).
         self._hops = [([float(f) for f, _ in t], [float(d) for _, d in t]) for t in hops]
         self._freq_limits = [
@@ -192,7 +200,15 @@ class PowerMap:
         """Return the injected calibration map if ``$SDR_CALIBRATION_FILE`` is set,
         else ``baked``. A path that is set but unreadable/malformed raises — the agent
         only ever writes a valid artifact, so a broken one is a real error, not a
-        reason to silently fall back to a different power scale."""
+        reason to silently fall back to a different power scale.
+
+        Amplitude gate: the script transmits at a FIXED baseband amplitude
+        (``baked.amplitude``) and the calibration is only valid at the amplitude it was
+        measured at (the artifact's ``amplitude``). If they differ, the calibrated dBm↔gain
+        mapping no longer describes this script — so the calibration is REJECTED: the baked
+        (uncalibrated) map is returned with a loud ``warning`` and a logged WARNING, never a
+        silent switch to a mismatched power scale. Re-calibrating at the script's amplitude
+        restores it."""
         path = os.environ.get(env_var)
         if not path:
             return baked
@@ -201,6 +217,15 @@ class PowerMap:
                 art = json.load(fh)
         except (OSError, ValueError) as exc:
             raise ValueError(f"{env_var}={path} could not be read: {exc}") from exc
+        art_amp = art.get("amplitude")
+        if art_amp is not None and abs(float(art_amp) - baked.amplitude) > AMPLITUDE_MATCH_TOL:
+            baked.warning = (
+                f"calibration IGNORED — it was measured at amplitude {float(art_amp):g}, but "
+                f"this script transmits at {baked.amplitude:g}; its calibrated power is no "
+                f"longer valid. Running UNCALIBRATED (baked levels). Re-run calibration at "
+                f"amplitude {baked.amplitude:g} to restore it.")
+            log.warning("%s", baked.warning)
+            return baked
         return cls.from_artifact(art, fallback_amplitude=baked.amplitude)
 
     def describe(self) -> str:

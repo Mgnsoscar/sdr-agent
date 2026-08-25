@@ -24,9 +24,9 @@ def _pts(pairs):
     return [{"gain_db": g, "power_dbm": p} for g, p in pairs]
 
 
-def _doc(cable, antenna, center_freq_hz=None, limits=None):
+def _doc(cable, antenna, center_freq_hz=None, limits=None, amplitude=0.8):
     sig = {"curves": {"sdr_output": {"points": _pts(SDR_POINTS)},
-                      "amplifier_output": {"points": _pts(AMP_POINTS)}}, "amplitude": 0.8}
+                      "amplifier_output": {"points": _pts(AMP_POINTS)}}, "amplitude": amplitude}
     if center_freq_hz is not None:
         sig["center_freq_hz"] = center_freq_hz
     return {
@@ -141,15 +141,46 @@ def test_from_linear_baked_unchanged():
 
 
 def test_load_reads_v2_artifact_from_env(tmp_path, monkeypatch):
-    r, _ = _pair(_doc("cable_fdep", "ant_fdep", center_freq_hz=2.0e9))
+    # artifact measured at 0.8, script transmits at 0.8 → amplitudes match → calibrated.
+    r, _ = _pair(_doc("cable_fdep", "ant_fdep", center_freq_hz=2.0e9, amplitude=0.8))
     art_path = tmp_path / "cal.json"
     art_path.write_text(json.dumps(r.to_public_dict()), encoding="utf-8")
-    baked = PowerMap.from_linear(0.0, 89.75, -50.0, -2.5, amplitude=0.7)
+    baked = PowerMap.from_linear(0.0, 89.75, -50.0, -2.5, amplitude=0.8)
     monkeypatch.setenv("SDR_CALIBRATION_FILE", str(art_path))
     pm = PowerMap.load(baked)
     assert pm.source == "calibration file" and pm.freq_dependent
+    assert pm.warning is None
     assert pm.power_for_gain(74.0) == pytest.approx(28.0)   # folded at the 2 GHz center
     assert pm.amplitude == pytest.approx(0.8)               # the amplitude the curves used
+
+
+def test_load_rejects_amplitude_mismatch(tmp_path, monkeypatch):
+    # Calibration measured at 0.8, but the script drives 0.5 → the calibrated power scale
+    # no longer describes this script. It must fall back to uncalibrated (baked) and warn,
+    # never silently transmit on a mismatched scale.
+    r, _ = _pair(_doc("cable_flat", "ant_flat", amplitude=0.8))
+    art_path = tmp_path / "cal.json"
+    art_path.write_text(json.dumps(r.to_public_dict()), encoding="utf-8")
+    baked = PowerMap.from_linear(0.0, 89.75, -50.0, -2.5, amplitude=0.5)
+    monkeypatch.setenv("SDR_CALIBRATION_FILE", str(art_path))
+    pm = PowerMap.load(baked)
+    assert pm is baked                                     # rejected → the uncalibrated map
+    assert pm.source == "baked defaults"
+    assert pm.amplitude == pytest.approx(0.5)              # the script's fixed amplitude
+    assert pm.warning and "0.8" in pm.warning and "0.5" in pm.warning
+
+
+def test_load_accepts_matching_amplitude(tmp_path, monkeypatch):
+    # Same curves, but calibrated at the script's own 0.5 → accepted.
+    r, _ = _pair(_doc("cable_flat", "ant_flat", amplitude=0.5))
+    art_path = tmp_path / "cal.json"
+    art_path.write_text(json.dumps(r.to_public_dict()), encoding="utf-8")
+    baked = PowerMap.from_linear(0.0, 89.75, -50.0, -2.5, amplitude=0.5)
+    monkeypatch.setenv("SDR_CALIBRATION_FILE", str(art_path))
+    pm = PowerMap.load(baked)
+    assert pm.source == "calibration file"
+    assert pm.warning is None
+    assert pm.amplitude == pytest.approx(0.5)
 
 
 def test_load_without_env_returns_baked(monkeypatch):

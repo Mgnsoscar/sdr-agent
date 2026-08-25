@@ -569,8 +569,15 @@ resolver duplicated across repos.
   `PowerMap.load(baked)` returns the artifact-backed map when `SDR_CALIBRATION_FILE`
   is set, else a `from_linear` map built from the baked constants that is byte-
   identical to the old single-anchor behaviour. `--power` ↔ gain both route through
-  it, as does the flowgraph amplitude (taken from the artifact so it matches what the
-  curve was measured at).
+  it, as does the flowgraph amplitude.
+- **Amplitude gate.** A script transmits at a **fixed baseband amplitude** (its baked
+  `AMPLITUDE`, not a task parameter — the operator never sets it), and its calibration
+  is only valid at the amplitude the curve was measured at. `PowerMap.load` compares the
+  two: on a match it uses the calibration; on a **mismatch** the calibrated power scale
+  no longer describes this script, so it **falls back to the baked (uncalibrated) map and
+  warns loudly** (a `warning` on the map, a logged WARNING, and a `⚠ CALIBRATION` banner
+  line) — never a silent switch to a wrong scale. Re-running calibration at the script's
+  amplitude restores it. (The Pi broadcaster scripts fix this at `AMPLITUDE = 0.5`.)
 - The banner echoes the map's **source** and the operating plane's `quantity`, so the
   number is never ambiguous, e.g. `power: -12.0 dBm (EIRP, at antenna_eirp)` +
   `calibration: calibration file`.
