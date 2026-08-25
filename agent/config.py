@@ -164,7 +164,11 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # only when measured at that same amplitude; a mismatch falls back to uncalibrated (baked)
 # levels with a loud warning instead of transmitting on an invalid power scale. calkit ships
 # in the OTA bundle, so the version bumps to propagate it to units.
-AGENT_VERSION = "1.5.1"
+# 1.5.2 (bundle-only, no HTTP-surface change) — calkit drops the baked dBm fallback entirely:
+# with no valid calibration it returns an "uncalibrated" map that refuses --power (NoAbsoluteScale)
+# rather than inventing levels, so a script maps absolute power only on a real measured curve and
+# otherwise runs on a relative gain. Also ships in the OTA bundle, so bump to propagate it.
+AGENT_VERSION = "1.5.2"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
