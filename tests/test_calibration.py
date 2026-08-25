@@ -356,11 +356,42 @@ def test_validate_document_reports_doc_level_defect_once():
     assert "ceiling" in msg
 
 
-def test_validate_document_requires_signals():
+def test_validate_document_accepts_no_signals():
+    # Onboarding: a wired-up chain with a declared ceiling but no signals measured yet
+    # is a valid, savable document — its per-signal summary is simply empty.
     from agent.calibration import validate_document
     doc = _doc()
     doc["signals"] = {}
-    with pytest.raises(CalibrationError):
+    assert validate_document(doc, None) == {}
+
+
+def test_validate_document_no_signals_still_checks_chain():
+    # …but a *broken* chain must still be rejected, even with no signals to resolve.
+    from agent.calibration import validate_document
+    # no ceiling declared
+    no_ceiling = _doc(operating="sdr_output", limits=[], gain_limits={"min_gain_db": 0.0})
+    no_ceiling["signals"] = {}
+    with pytest.raises(CalibrationError, match="ceiling"):
+        validate_document(no_ceiling, None)
+    # operating plane that doesn't exist
+    bad_op = _doc()
+    bad_op["signals"] = {}
+    bad_op["chain"]["operating_plane"] = "nowhere"
+    with pytest.raises(CalibrationError, match="operating_plane"):
+        validate_document(bad_op, None)
+    # a derived plane pointing at an unknown parent
+    dangling = _doc()
+    dangling["signals"] = {}
+    dangling["chain"]["planes"]["cable_output"]["from"] = "ghost"
+    with pytest.raises(CalibrationError, match="unknown plane"):
+        validate_document(dangling, None)
+
+
+def test_validate_document_rejects_non_object_signals():
+    from agent.calibration import validate_document
+    doc = _doc()
+    doc["signals"] = []
+    with pytest.raises(CalibrationError, match="signals must be an object"):
         validate_document(doc, None)
 
 

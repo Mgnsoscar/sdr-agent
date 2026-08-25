@@ -576,6 +576,16 @@ not the only one.
   it would resolve at runtime (merged with this unit's type defaults) — so a broken
   or unsafe document is rejected at upload with a specific reason, never at transmit.
   The success response returns the per-signal resolved summary.
+  - **A signal-less document is accepted** (onboarding: a unit is wired up and its
+    chain + safety ceiling characterised *before* any signal is measured). It is
+    validated by the **curve-independent** subset of the checks
+    (`validate_chain_structure`): plane topology, each derived hop (inline `delta_db`
+    or a catalog `component` and its frequency table), the operating plane's
+    existence, limit plane references, and that a ceiling is *declared*. Curve-based
+    checks (operating-plane usability, a *derivable* ceiling) simply have nothing to
+    run on yet, and nothing can transmit until a signal is added — `resolve` raises
+    `SignalNotCalibrated` for an absent signal — so persisting the skeleton is safe.
+    The success response's per-signal summary is then empty (`{}`).
 - **Discipline that keeps it from rotting:** the area accepts arbitrary *data* files,
   but every *kind* earns a small schema/validator when it's introduced (calibration
   is the first). No executable uploads; a computed calibration is expressed as a

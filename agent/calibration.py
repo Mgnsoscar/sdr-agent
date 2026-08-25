@@ -484,6 +484,59 @@ def resolve(unit_doc: dict,
     return resolved
 
 
+def validate_chain_structure(unit_doc: dict, type_defaults: Optional[dict] = None,
+                             components: Optional[dict] = None) -> None:
+    """Curve-independent structural check of the RF chain, for a document that has no
+    signals yet (onboarding: the chain and its safety ceiling are set up *before* any
+    signal is measured — docs/calibration.md §9.2). Validates everything that does not
+    depend on a measured curve — plane topology, each derived hop (inline ``delta_db``
+    or a catalog ``component`` and its frequency table), the operating plane's
+    existence, limit plane references, and that a safety ceiling is *declared* — and
+    raises :class:`CalibrationError` on any defect. Curve-dependent checks (operating
+    plane usability, a derivable ceiling) can't run without points, so they wait until
+    a signal is present and :func:`resolve` covers them per-signal."""
+    td = type_defaults or {}
+    chain = _deep_merge(td.get("chain", {}), unit_doc.get("chain", {}))
+    planes_spec = chain.get("planes")
+    if not isinstance(planes_spec, dict) or not planes_spec:
+        raise CalibrationError("chain.planes is missing or empty")
+    operating_plane = chain.get("operating_plane")
+    if not operating_plane:
+        raise CalibrationError("chain.operating_plane is missing")
+
+    # Build with no curves: this validates every plane's structure (measured/derived
+    # type, a derived plane's 'from' + exactly one of component/delta_db, a component's
+    # existence and its frequency table) without requiring any measured points.
+    planes = _build_planes(planes_spec, {}, "", components or {})
+
+    # Curve-independent subset of _validate_topology: 'from' references resolve, the
+    # operating plane exists, and the derived graph is acyclic. (Usability — that the
+    # anchor has points — needs a curve, so it waits for a signal.)
+    if operating_plane not in planes:
+        raise CalibrationError(f"operating_plane {operating_plane!r} does not exist")
+    for name, p in planes.items():
+        if isinstance(p, _Derived) and p.frm not in planes:
+            raise CalibrationError(f"plane {name!r} references unknown plane {p.frm!r}")
+        seen, cur = set(), name
+        while isinstance(planes.get(cur), _Derived):
+            if cur in seen:
+                raise CalibrationError(f"derived plane cycle through {cur!r}")
+            seen.add(cur)
+            cur = planes[cur].frm
+            if cur not in planes:
+                break
+
+    # A ceiling can't be *derived* without curves, but its omission is the key safety
+    # footgun — flag it now rather than at the first signal.
+    gl = chain.get("gain_limits") or {}
+    if gl.get("max_gain_db") is None and not chain.get("limits"):
+        raise CalibrationError("no safety ceiling — set a max gain or add at least one limit")
+    for lim in (chain.get("limits") or []):
+        if not isinstance(lim, dict) or lim.get("plane") not in planes:
+            raise CalibrationError(
+                f"limit references unknown plane {(lim or {}).get('plane')!r}")
+
+
 def validate_document(unit_doc: dict, type_defaults: Optional[dict] = None,
                       components: Optional[dict] = None) -> dict:
     """Structural validation of a WHOLE calibration document, as it would resolve at
@@ -504,8 +557,17 @@ def validate_document(unit_doc: dict, type_defaults: Optional[dict] = None,
             f"unsupported schema_version {unit_doc.get('schema_version')!r} "
             f"(expected {SCHEMA_VERSION})")
     signals = unit_doc.get("signals")
-    if not isinstance(signals, dict) or not signals:
-        raise CalibrationError("document has no signals")
+    if signals is None:
+        signals = {}
+    if not isinstance(signals, dict):
+        raise CalibrationError("signals must be an object")
+    if not signals:
+        # No signals measured yet (onboarding): validate the chain structure so a
+        # broken chain is still rejected, then accept the signal-less document. Nothing
+        # can transmit until a signal is added — resolve() raises SignalNotCalibrated
+        # for an absent signal — so persisting the chain + ceiling skeleton is safe.
+        validate_chain_structure(unit_doc, type_defaults, components)
+        return {}
 
     summary, bad = {}, {}
     for sig_id in signals:
