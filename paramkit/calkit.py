@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from typing import Optional
 
@@ -81,7 +82,8 @@ class PowerMap:
     limits (the ceiling itself may tighten with frequency)."""
 
     def __init__(self, gains, powers, min_gain_db, ceiling_const, amplitude,
-                 source, label, hops=(), freq_limits=(), center_freq=None):
+                 source, label, hops=(), freq_limits=(), center_freq=None,
+                 gain_step_db=None):
         if not gains or len(gains) != len(powers):
             raise ValueError("calibration curve is empty or malformed")
         # keep gain-sorted; agent guarantees strict monotonicity, verify defensively
@@ -99,6 +101,10 @@ class PowerMap:
         self.label = label                   # what --power means (quantity, at plane)
         self.warning = None                  # set when a calibration was rejected (see load)
         self.has_absolute = True             # a real dBm↔gain scale (False = uncalibrated)
+        # Hardware gain step (dB): the SDR only settles on a discrete gain grid, so the
+        # commanded gain is snapped to the nearest grid point (never above the ceiling), and
+        # the reported power reflects that actual gain. None/0 = continuous (no snapping).
+        self._gain_step = float(gain_step_db) if gain_step_db and float(gain_step_db) > 0 else None
         # v2 frequency machinery ((freqs, deltas) per passive hop; per-limit tables).
         self._hops = [([float(f) for f, _ in t], [float(d) for _, d in t]) for t in hops]
         self._freq_limits = [
@@ -127,6 +133,21 @@ class PowerMap:
             cap = min(cap, self._invert(max_dbm - _table_at(fs, ds, freq)))
         return cap
 
+    def _snap(self, gain: float, freq: Optional[float]) -> float:
+        """Clamp ``gain`` to [min, ceiling(freq)] and, when a hardware gain step is set,
+        snap it to the nearest step on that grid — but NEVER above the ceiling (floor to the
+        grid there) so quantisation can't push past a safety limit."""
+        lo, hi = self.min_gain_db, self._ceiling(freq)
+        step = self._gain_step
+        if not step:
+            return min(max(float(gain), lo), hi)
+        g = round(float(gain) / step) * step
+        if g > hi:                       # rounding up must not breach the ceiling
+            g = math.floor(hi / step) * step
+        if g < lo:
+            g = math.ceil(lo / step) * step
+        return round(g, 6)
+
     # ── the two functions the script calls ──────────────────────────────────────
     def gain_for_power(self, delivered_dbm: float, freq: Optional[float] = None) -> float:
         """Commanded gain (dB) for a requested power at ``freq`` (defaults to the
@@ -138,19 +159,21 @@ class PowerMap:
                 "no meaning here; provide --gain (raw dB) instead")
         f = self._eff(freq)
         g = self._invert(float(delivered_dbm) - self._op_delta(f))
-        return min(max(g, self.min_gain_db), self._ceiling(f))
+        return self._snap(g, f)
 
     def power_for_gain(self, gain_db: float, freq: Optional[float] = None) -> float:
-        """Delivered power (dBm) at the operating plane for an (actual) gain at ``freq``."""
+        """Delivered power (dBm) at the operating plane for an (actual) gain at ``freq``.
+        The gain is snapped to the hardware grid first, so the reported power reflects what
+        the SDR really settles on."""
         if not self.has_absolute:
             raise NoAbsoluteScale("uncalibrated: no absolute power scale for this signal")
         f = self._eff(freq)
-        g = min(max(float(gain_db), self.min_gain_db), self._ceiling(f))
+        g = self._snap(float(gain_db), f)
         return _interp(g, self._gains, self._powers) + self._op_delta(f)
 
     @property
     def max_gain_db(self) -> float:
-        return self._ceiling(self._center_freq)
+        return self._snap(self._ceiling(self._center_freq), self._center_freq)
 
     @property
     def max_power_dbm(self):
@@ -207,6 +230,7 @@ class PowerMap:
         self._hops = []
         self._freq_limits = []
         self._center_freq = None
+        self._gain_step = None
         self.has_absolute = False
         return self
 
@@ -220,6 +244,7 @@ class PowerMap:
         quantity = art.get("quantity") or "power"
         label = f"{quantity}, at {plane}" if plane else quantity
 
+        step = art.get("gain_step_db")
         anchor = art.get("anchor_curve")
         if anchor:                                    # v2: fold passive hops at frequency
             gains = [pt[0] for pt in anchor]
@@ -233,13 +258,13 @@ class PowerMap:
             return cls(gains, powers, art.get("min_gain_db"), ceiling_const, amp,
                        source="calibration file", label=label,
                        hops=hops, freq_limits=freq_limits,
-                       center_freq=art.get("center_freq_hz"))
+                       center_freq=art.get("center_freq_hz"), gain_step_db=step)
 
         curve = art.get("curve") or []                # v1: pre-flattened operating curve
         gains = [pt[0] for pt in curve]
         powers = [pt[1] for pt in curve]
         return cls(gains, powers, art.get("min_gain_db"), art.get("max_gain_db"), amp,
-                   source="calibration file", label=label)
+                   source="calibration file", label=label, gain_step_db=step)
 
     @classmethod
     def load(cls, baked: "PowerMap", env_var: str = CALIBRATION_FILE_ENV) -> "PowerMap":

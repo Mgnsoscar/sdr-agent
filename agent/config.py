@@ -182,7 +182,13 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # upstream quantity for that signal instead of the save being rejected — while safety limits are
 # unaffected (they already gauge on that upstream curve). No new capability; reported stages are
 # already gated on calibration-plane-roles.
-AGENT_VERSION = "1.6.1"
+# 1.7.0 adds chain.gain_limits.gain_step_db: the SDR settles on a discrete gain grid, so the
+# commanded gain is snapped to the nearest step on that grid (never above the safety ceiling —
+# it floors there), and the reported power reflects the snapped gain. Both the resolver and the
+# script-side calkit (in the OTA bundle) snap, so they agree. A ≤1.6.1 agent ignores the field
+# and would command an off-grid gain the SDR silently rounds, so the client gates on the
+# calibration-gain-step capability below.
+AGENT_VERSION = "1.7.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -204,6 +210,8 @@ AGENT_CAPABILITIES = [
     "calibration-plane-roles",     # a measured plane may set role: limiting/reported; a
                                    # reported plane (of: a limiting plane) is shown to the
                                    # operator but invisible to limits (they punch through it)
+    "calibration-gain-step",       # chain.gain_limits.gain_step_db snaps the commanded gain
+                                   # to the SDR's discrete gain grid (never above the ceiling)
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

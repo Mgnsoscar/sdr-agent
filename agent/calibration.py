@@ -27,6 +27,7 @@ requested signal raises :class:`SignalNotCalibrated`, which the caller may treat
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -140,6 +141,7 @@ class ResolvedCalibration:
     operating_quantity: str
     _planes: dict = field(repr=False, default_factory=dict)
     _freq_hz: Optional[float] = None                 # representative frequency, or None
+    _gain_step: Optional[float] = None               # hardware gain grid (dB), or None
     _gain_ceiling_const: float = float("inf")        # freq-independent gain cap
     _freq_limits: list = field(repr=False, default_factory=list)  # [(plane, max_dbm, reason)]
     _limit_gauges: list = field(repr=False, default_factory=list)  # per-limit gauge info
@@ -162,6 +164,21 @@ class ResolvedCalibration:
             caps.append(_gain_for_power_on(max_dbm, plane, self._planes, freq, for_limit=True))
         return min(caps)
 
+    def _snap(self, gain: float, freq: Optional[float]) -> float:
+        """Clamp to [min_gain, ceiling(freq)] and, when a hardware gain step is set, snap to
+        the nearest step on that grid — never above the ceiling (floor there), so
+        quantisation can't push a commanded gain past a safety limit."""
+        lo, hi = self.min_gain_db, self._max_gain_at(freq)
+        step = self._gain_step
+        if not step:
+            return min(max(float(gain), lo), hi)
+        g = round(float(gain) / step) * step
+        if g > hi:
+            g = math.floor(hi / step) * step
+        if g < lo:
+            g = math.ceil(lo / step) * step
+        return round(g, 6)
+
     # ── the two functions the script calls ──────────────────────────────────────
     def gain_for_power(self, delivered_dbm: float, freq: Optional[float] = None) -> float:
         """Commanded SDR gain (dB) for a requested power at the operating plane,
@@ -169,19 +186,20 @@ class ResolvedCalibration:
         extrapolated past it."""
         f = self._eff_freq(freq)
         g = _gain_for_power_on(float(delivered_dbm), self.operating_plane, self._planes, f)
-        return min(max(g, self.min_gain_db), self._max_gain_at(f))
+        return self._snap(g, f)
 
     def power_for_gain(self, gain_db: float, freq: Optional[float] = None) -> float:
         """Delivered power (dBm) at the operating plane for an (actual) commanded
-        gain — what the radio really settled on, for the report/banner."""
+        gain — what the radio really settled on, for the report/banner. The gain is snapped
+        to the hardware grid first, so the reported power matches what the SDR will set."""
         f = self._eff_freq(freq)
-        g = min(max(float(gain_db), self.min_gain_db), self._max_gain_at(f))
+        g = self._snap(float(gain_db), f)
         return _power_on(self.operating_plane, g, self._planes, f)
 
     # ── convenience for the script's --power min/max bounds (at the rep. frequency) ─
     @property
     def max_gain_db(self) -> float:
-        return self._max_gain_at(self._freq_hz)
+        return self._snap(self._max_gain_at(self._freq_hz), self._freq_hz)
 
     @property
     def max_power_dbm(self) -> float:
@@ -250,6 +268,8 @@ class ResolvedCalibration:
             "max_power_dbm": self.max_power_dbm,
             "curve": self.operating_curve(),
         }
+        if self._gain_step:
+            out["gain_step_db"] = self._gain_step
         hops = self.passive_hops()
         if hops:
             out["anchor_curve"] = self.anchor_curve()
@@ -522,6 +542,12 @@ def resolve(unit_doc: dict,
     #    and any limits whose plane sits behind a passive hop (frequency-dependent).
     gl = chain.get("gain_limits") or {}
     gmin = float(gl.get("min_gain_db", 0.0))
+    gstep = gl.get("gain_step_db")
+    if gstep is not None:
+        gstep = float(gstep)
+        if gstep <= 0:
+            raise CalibrationError(
+                f"gain_step_db must be positive, got {gstep:g}")
     const_caps: list = []
     freq_limits: list = []
     limit_gauges: list = []
@@ -581,7 +607,7 @@ def resolve(unit_doc: dict,
     resolved = ResolvedCalibration(
         signal_id=signal_id, unit_type=unit_type, amplitude=amplitude,
         min_gain_db=gmin, operating_plane=operating_plane, operating_quantity=op_quantity,
-        _planes=planes, _freq_hz=rep_freq,
+        _planes=planes, _freq_hz=rep_freq, _gain_step=gstep,
         _gain_ceiling_const=gain_ceiling_const, _freq_limits=freq_limits,
         _limit_gauges=limit_gauges)
     if resolved.max_gain_db < gmin:
@@ -639,6 +665,9 @@ def validate_chain_structure(unit_doc: dict, type_defaults: Optional[dict] = Non
     gl = chain.get("gain_limits") or {}
     if gl.get("max_gain_db") is None and not chain.get("limits"):
         raise CalibrationError("no safety ceiling — set a max gain or add at least one limit")
+    if gl.get("gain_step_db") is not None and float(gl["gain_step_db"]) <= 0:
+        raise CalibrationError(
+            f"gain_step_db must be positive, got {float(gl['gain_step_db']):g}")
     for lim in (chain.get("limits") or []):
         if not isinstance(lim, dict):
             raise CalibrationError(f"limit is not an object: {lim!r}")

@@ -365,8 +365,9 @@ fields optional (it only supplies defaults). Note that in the per-unit file the
     "gain_limits": {
       "type": "object",
       "properties": {
-        "min_gain_db": { "type": "number", "minimum": 0 },
-        "max_gain_db": { "type": "number", "minimum": 0 }
+        "min_gain_db":  { "type": "number", "minimum": 0 },
+        "max_gain_db":  { "type": "number", "minimum": 0 },
+        "gain_step_db": { "type": "number", "exclusiveMinimum": 0 }  // SDR gain grid; snaps the command
       }
     },
     "point": {
