@@ -442,6 +442,16 @@ Each stage is shippable and leaves the system working (v1 docs valid throughout)
     keystroke), and degrades to the resolved representative range against an older agent
     that doesn't embed the artifact. Covered by `tests/test_power_fold.py` and
     `tests/test_param_form_freq_refold.py`.
+  - **Clamp warning across a sequence — done.** A tune step can move the frequency to a
+    point where the running `--power` can't be delivered (the runtime clamps it safely, but
+    then delivers less than the number says). The sequence step editor carries the
+    effective `--freq` / `--power` forward from the task's deployed args through the earlier
+    same-task steps (`timeline_model.sequence_effective_values`), folds the step's `--power`
+    range at that effective frequency (even when the step doesn't set `--freq` itself), and
+    shows a **warning — never a block** (`power_fold.clamp_warning`) when the effective power
+    exceeds the achievable range there. The live-tune dialog re-folds and warns the same way
+    as you tune a running task. Covered by `tests/test_sequence_effective_values.py` and the
+    fold tests above.
   - *Remaining:* the client setting `SDR_CAL_FREQ_HZ` on a task from the script's
     `CAL_FREQ_PARAM` (task-creation wiring) — with the script now reading its own `--freq`,
     this only pins the agent's representative fold for the v1-compat scalar read-outs.
