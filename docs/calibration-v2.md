@@ -215,13 +215,17 @@ so there is no version gate anywhere. As implemented:
     { "plane": "antenna_eirp", "max_dbm": 30.0, "reason": "regulatory EIRP",
       "delta_db_by_freq": [[1.1e9,2.8],[1.6e9,3.19]] }   // summed delta from the shared anchor
   ],
-  "center_freq_hz": 1.575e9            // representative frequency (present only for a freq-dependent chain)
+  "center_freq_hz": 1.575e9            // representative frequency (on a freq-dependent chain; derived when the signal omits it)
 }
 ```
 
 The agent's representative frequency (for folding `curve` / bounds) is the task's
 `SDR_CAL_FREQ_HZ` env when set (the client sources it from the script's
-`CAL_FREQ_PARAM`), else the signal's `center_freq_hz`.
+`CAL_FREQ_PARAM`), else the signal's `center_freq_hz`, else — when the signal declares
+none on a frequency-dependent chain — a representative one the resolver derives (the
+tightest-ceiling breakpoint under a frequency-dependent safety limit, else the breakpoint
+midpoint). Either way the artifact carries the chosen `center_freq_hz`, so a v1 script
+that folds no frequency of its own uses that safe representative value.
 
 ### 5.3 `PowerMap` v2 (script-side)
 
@@ -365,9 +369,16 @@ Each stage is shippable and leaves the system working (v1 docs valid throughout)
   spline stays a future option that needs no schema change.
 - A per-signal **`center_freq_hz`** is the *representative* frequency: it both drives the
   editor's bounds preview **and** is the frequency the agent folds the v1-compat artifact
-  `curve` / scalar ceiling at. It is **required** for a signal whose operating/limit
-  chain passes through a frequency-dependent component (else resolution refuses), and
-  ignored for constant chains.
+  `curve` / scalar ceiling at. It is **optional** even on a frequency-dependent chain — the
+  real transmit frequency is a runtime quantity the task supplies via `--freq` /
+  `CAL_FREQ_PARAM` (`SDR_CAL_FREQ_HZ`), and a v2 consumer re-folds at that live frequency.
+  When it is absent the resolver derives a representative one (agent ≥ 1.7.1): the
+  **tightest-ceiling breakpoint** when the chain carries a frequency-dependent *safety
+  limit* (so a v1 script that folds no frequency of its own can never exceed a per-frequency
+  limit), else the midpoint of the chain's frequency breakpoints. Setting it pins the
+  preview / v1 fold to one frequency. It is ignored for constant chains. (A ≤ 1.7.0 agent
+  still *requires* it on a frequency-dependent chain; the client gates the blank field on
+  the `calibration-freq-optional-center` capability.)
 
 ## 11. Implementation status
 

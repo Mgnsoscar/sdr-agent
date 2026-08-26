@@ -188,7 +188,15 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # script-side calkit (in the OTA bundle) snap, so they agree. A ≤1.6.1 agent ignores the field
 # and would command an off-grid gain the SDR silently rounds, so the client gates on the
 # calibration-gain-step capability below.
-AGENT_VERSION = "1.7.0"
+# 1.7.1 makes a signal's center_freq_hz OPTIONAL on a frequency-dependent chain: the transmit
+# frequency is a runtime quantity (the task's --freq / CAL_FREQ_PARAM), so instead of rejecting
+# a document with no center_freq_hz the resolver derives a representative one — the tightest-
+# ceiling breakpoint when a frequency-dependent SAFETY limit exists (so a v1 script folding no
+# frequency of its own still can't exceed a per-frequency limit), else the midpoint of the
+# chain's breakpoints. A ≤1.7.0 agent still rejects such a document at validate, so the client
+# gates on the calibration-freq-optional-center capability below before allowing an empty
+# center-frequency field on a frequency-dependent chain.
+AGENT_VERSION = "1.7.1"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -212,6 +220,10 @@ AGENT_CAPABILITIES = [
                                    # operator but invisible to limits (they punch through it)
     "calibration-gain-step",       # chain.gain_limits.gain_step_db snaps the commanded gain
                                    # to the SDR's discrete gain grid (never above the ceiling)
+    "calibration-freq-optional-center",  # center_freq_hz is optional on a frequency-dependent
+                                         # chain: the resolver derives a representative (worst-
+                                         # case) frequency when it's absent, since --freq supplies
+                                         # the real transmit frequency at runtime
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

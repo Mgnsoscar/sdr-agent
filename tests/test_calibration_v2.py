@@ -100,9 +100,26 @@ def test_frequency_outside_table_clamps_to_the_end():
     assert above == pytest.approx(28.0)
 
 
-def test_freq_dependent_chain_without_center_freq_refuses():
-    with pytest.raises(CalibrationError, match="center_freq_hz"):
-        _resolve(_doc(cable="cable_fdep", antenna="ant_fdep", center_freq_hz=None))
+def test_freq_dependent_chain_without_center_freq_uses_midpoint():
+    # The transmit frequency is a runtime quantity (the task's --freq), so an absent
+    # center_freq_hz is not an error: with no frequency-dependent SAFETY limit the
+    # operating point is folded at the midpoint of the chain's frequency breakpoints.
+    r = _resolve(_doc(cable="cable_fdep", antenna="ant_fdep", center_freq_hz=None))
+    assert r.power_for_gain(74.0) == pytest.approx(24 + (-2.5) + 6.0)   # folded at 1.5 GHz
+    assert r.to_public_dict()["center_freq_hz"] == pytest.approx(1.5e9)
+
+
+def test_freq_dependent_limit_without_center_freq_picks_worst_case():
+    # With a frequency-dependent regulatory cap and no center_freq_hz, a v1 script folds
+    # the flat ceiling here, so the representative frequency must be the one whose ceiling
+    # is TIGHTEST — 2.0 GHz (gain 70) rather than 1.0 GHz (gain 72) — so the fallback can
+    # never exceed the per-frequency limit.
+    limits = [{"plane": "sdr_output", "max_dbm": -2.5, "reason": "amp"},
+              {"plane": "antenna_eirp", "max_dbm": 26.0, "reason": "EIRP cap"}]
+    r = _resolve(_doc(cable="cable_fdep", antenna="ant_fdep", center_freq_hz=None,
+                      limits=limits))
+    assert r.max_gain_db == pytest.approx(70.0)                         # worst case (2 GHz)
+    assert r.to_public_dict()["center_freq_hz"] == pytest.approx(2.0e9)
 
 
 def test_amp_protection_ceiling_is_frequency_independent():

@@ -459,6 +459,54 @@ def _gain_for_power_on(power: float, plane_name: str, planes: dict,
     return _interp(target, m.powers, m.gains)              # powers monotonic → unambiguous
 
 
+def _breakpoint_freqs(plane_name: str, planes: dict) -> list:
+    """The distinct frequency breakpoints of every frequency-dependent hop feeding
+    ``plane_name`` (sorted; empty when none of its hops vary with frequency)."""
+    fs: set = set()
+    for _, d in _hops(plane_name, planes):
+        if d.is_freq_dependent:
+            fs.update(float(f) for f, _ in d.table)
+    return sorted(fs)
+
+
+def _representative_freq(planes: dict, operating_plane: str, freq_limits: list,
+                         gain_ceiling_const: float) -> Optional[float]:
+    """A representative frequency to fold the scalar read-outs and the v1-compat artifact
+    curve at when the signal declares no ``center_freq_hz`` — the transmit frequency is a
+    runtime quantity the task supplies via ``--freq``. A frequency-aware (v2) consumer
+    still re-folds at its live frequency from the published ``passive_hops`` /
+    ``freq_dependent_limits``; this only fixes the operating point of the flat artifact for
+    a v1 script that folds no frequency of its own.
+
+    When frequency-dependent SAFETY limits exist the pick must be conservative: that v1
+    script would fold its flat ceiling here, so choose the breakpoint whose gain ceiling is
+    TIGHTEST (lowest), guaranteeing the fallback never exceeds a per-frequency limit. The
+    combined ceiling is piecewise-linear in frequency, so its minimum over the operating
+    band is reached at one of the union of the limits' (and operating plane's) breakpoints.
+    With no frequency-dependent limits the choice only shifts the reported operating point,
+    so the midpoint of the operating plane's breakpoints is a fair representative value.
+    Returns None when no breakpoints exist (nothing to evaluate at)."""
+    if freq_limits:
+        cands: set = set()
+        for plane, _mx, _rs in freq_limits:
+            cands.update(_breakpoint_freqs(plane, planes))
+        cands.update(_breakpoint_freqs(operating_plane, planes))
+        if not cands:
+            return None
+
+        def ceiling_at(fr: float) -> float:
+            caps = [gain_ceiling_const]
+            for plane, mx, _rs in freq_limits:
+                caps.append(_gain_for_power_on(mx, plane, planes, fr, for_limit=True))
+            return min(caps)
+
+        return min(cands, key=ceiling_at)
+    fs = _breakpoint_freqs(operating_plane, planes)
+    if not fs:
+        return None
+    return 0.5 * (fs[0] + fs[-1])
+
+
 # ── Merge (docs/calibration.md §7.1) ─────────────────────────────────────────────
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -597,11 +645,18 @@ def resolve(unit_doc: dict,
 
     # A frequency-dependent operating plane or ceiling needs a representative frequency,
     # so the scalar read-outs and the v1-compat artifact curve have a defined operating
-    # point (a v2 consumer still re-folds per its live transmit frequency).
+    # point (a v2 consumer still re-folds per its live transmit frequency). The transmit
+    # frequency is a runtime quantity — a task's --freq — so an absent center_freq_hz is
+    # not an error: derive a representative one (worst-case tightest ceiling when there are
+    # frequency-dependent safety limits, so a v1 script folding no frequency stays safe).
     if (freq_limits or _path_freq_dependent(operating_plane, planes)) and rep_freq is None:
-        raise CalibrationError(
-            f"signal {signal_id!r} uses a frequency-dependent component but has no "
-            f"'center_freq_hz' to evaluate the operating point / ceiling at")
+        rep_freq = _representative_freq(planes, operating_plane, freq_limits,
+                                        gain_ceiling_const)
+        if rep_freq is None:
+            raise CalibrationError(
+                f"signal {signal_id!r} uses a frequency-dependent component but has no "
+                f"'center_freq_hz' and no frequency breakpoints to derive a representative "
+                f"operating frequency from")
 
     op_quantity = _quantity_of(planes[operating_plane])
     resolved = ResolvedCalibration(
