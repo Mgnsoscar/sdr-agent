@@ -210,6 +210,17 @@ def test_validate_document_reports_per_signal_summary():
     assert summary["sig"]["max_power_dbm"] == pytest.approx(27.0)
 
 
+def test_summary_carries_the_resolved_artifact_for_client_refold():
+    # The per-signal summary embeds the full artifact (v2 anchor + passive hops) so the
+    # client can re-fold the --power range at the operator's chosen frequency.
+    summary = validate_document(_doc(cable="cable_fdep", antenna="ant_fdep",
+                                     center_freq_hz=1.0e9), None, COMPONENTS)
+    art = summary["sig"]["artifact"]
+    assert art["anchor_curve"][-1] == [74.0, 24.0]
+    hops = {h["plane"]: h for h in art["passive_hops"]}
+    assert hops["cable_output"]["delta_db_by_freq"] == [[1.0e9, -2.0], [2.0e9, -3.0]]
+
+
 def test_validate_document_flags_unknown_component():
     with pytest.raises(CalibrationError, match="unknown component"):
         validate_document(_doc(cable="nope", antenna="ant_flat"), None, COMPONENTS)

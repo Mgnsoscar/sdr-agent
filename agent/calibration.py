@@ -772,6 +772,10 @@ def validate_document(unit_doc: dict, type_defaults: Optional[dict] = None,
                 "min_gain_db": r.min_gain_db, "max_gain_db": r.max_gain_db,
                 "min_power_dbm": r.min_power_dbm, "max_power_dbm": r.max_power_dbm,
                 "limit_gauges": r.limit_gauges(),
+                # The full resolved artifact (v1 curve + v2 anchor/hops/limits) so a
+                # frequency-aware client re-folds the --power range at the frequency the
+                # operator picks, the same fold the transmit script does (calkit).
+                "artifact": r.to_public_dict(),
             }
         except CalibrationError as exc:
             bad[sig_id] = str(exc)

@@ -406,10 +406,14 @@ Each stage is shippable and leaves the system working (v1 docs valid throughout)
   (`config.CAL_FREQ_HZ_ENV`, threaded through `resolve_public`). Covered by
   `tests/test_calkit.py`, including a cross-check that `PowerMap` agrees with the agent
   resolver at every frequency.
-  - *Remaining, and deferred to when a script actually adopts it:* a transmit script
-    declaring `CAL_FREQ_PARAM` and passing that value to `PowerMap` (and the client
-    setting `SDR_CAL_FREQ_HZ` from it — Stage 3). No committed script uses `PowerMap`
-    yet, so there is nothing to port; the consumer contract is ready for the first one.
+  - **Script adoption — done for the frequency-swept signals.** `fm_chirp_tx.py` and
+    `cw_tx.py` declare `CAL_FREQ_PARAM = "freq"` and pass their transmit frequency to
+    `PowerMap.gain_for_power` / `power_for_gain`. The chirp's `--freq` is live, so a
+    retune re-maps the held target `--power` at the new frequency (a raw `--gain`
+    override drops the held target so it isn't re-applied). The static extractor surfaces
+    the declared param as `calibration_freq_param` in `/scripts/{name}/params` (agent
+    1.7.2). Other frequency-fixed signals can adopt the same two-line pattern when their
+    chain becomes frequency-dependent.
 - **Stage 3 (client) — mostly done.** `sdr-client`: a `ComponentCatalog` (the client's
   canonical library; VNA-sweep paste, validation, the `components.yaml` wire format), a
   **Component library** editor dialog, and the Calibration tab's chain now offers a
@@ -427,6 +431,17 @@ Each stage is shippable and leaves the system working (v1 docs valid throughout)
   grid. The source stage is pinned (never removable); a signal can be removed from its
   expanded editor; a measured stage left unmeasured for a signal shows that it inherits
   the previous stage (the partial-measured-stage fallback above).
+  - **Form re-fold — done.** The Run… dialog and the sequence step editor re-fold a
+    signal's `--power` / `--gain` range at the frequency the operator enters, so the
+    displayed range is the range at THAT frequency (a frequency-dependent chain's range
+    moves with frequency). The `/calibration` view's per-signal summary carries the full
+    resolved `artifact` (agent 1.7.2), and `state/power_fold.py` (`PowerFold`) re-folds it
+    client-side — a deliberate mirror of `calkit.PowerMap`, so the form shows exactly what
+    the script will map. Wiring: the form reads the script's `calibration_freq_param`,
+    folds on a committed frequency change (preset pick / Enter / focus-out, never per
+    keystroke), and degrades to the resolved representative range against an older agent
+    that doesn't embed the artifact. Covered by `tests/test_power_fold.py` and
+    `tests/test_param_form_freq_refold.py`.
   - *Remaining:* the client setting `SDR_CAL_FREQ_HZ` on a task from the script's
-    `CAL_FREQ_PARAM` (task-creation wiring). The resolver/consumer already handle
-    everything behind it.
+    `CAL_FREQ_PARAM` (task-creation wiring) — with the script now reading its own `--freq`,
+    this only pins the agent's representative fold for the v1-compat scalar read-outs.

@@ -323,6 +323,13 @@ def extract_paramkit_spec(source: str) -> Dict[str, Any]:
     out = {"format": "paramkit", "description": description, "params": params}
     if isinstance(cal_signal, str) and cal_signal:
         out["calibration_signal"] = cal_signal
+    # A frequency-aware script also declares CAL_FREQ_PARAM naming which of its params
+    # carries the transmit frequency, so the client folds the calibration bounds at the
+    # value the operator enters (a frequency-dependent chain's --power range moves with
+    # frequency) instead of only at the artifact's representative frequency.
+    cal_freq_param = consts.get("CAL_FREQ_PARAM")
+    if isinstance(cal_freq_param, str) and cal_freq_param:
+        out["calibration_freq_param"] = cal_freq_param
     return out
 
 

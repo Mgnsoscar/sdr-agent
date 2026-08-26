@@ -196,7 +196,14 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # chain's breakpoints. A ≤1.7.0 agent still rejects such a document at validate, so the client
 # gates on the calibration-freq-optional-center capability below before allowing an empty
 # center-frequency field on a frequency-dependent chain.
-AGENT_VERSION = "1.7.1"
+# 1.7.2 carries the full resolved artifact (v1 curve + v2 anchor/passive-hops/limits) in the
+# /calibration view's per-signal summary, and surfaces a script's CAL_FREQ_PARAM in
+# /scripts/{name}/params as calibration_freq_param. Together these let the client re-fold a
+# signal's --power range at the frequency the operator picks in the Run/sequence form — the
+# same fold calkit does at transmit — instead of showing only the representative-frequency
+# range. Purely additive; a client gates the re-fold on the calibration-summary-artifact
+# capability below.
+AGENT_VERSION = "1.7.2"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -224,6 +231,9 @@ AGENT_CAPABILITIES = [
                                          # chain: the resolver derives a representative (worst-
                                          # case) frequency when it's absent, since --freq supplies
                                          # the real transmit frequency at runtime
+    "calibration-summary-artifact",      # the /calibration view's per-signal summary carries the
+                                         # full resolved artifact, so the client re-folds the
+                                         # --power range at the operator's chosen frequency
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
