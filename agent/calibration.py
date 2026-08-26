@@ -768,9 +768,11 @@ def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
                 # stage": you can add a downstream measured plane for a signal or two
                 # without re-measuring all the rest). The FIRST stage has nothing upstream,
                 # so a latent source stays latent and _require_usable flags it clearly.
-                # A reported plane is a re-measurement, not a series stage, so it never
-                # inherits an upstream curve — it stays latent until measured.
-                if prev_name is not None and role != "reported":
+                # This applies to a reported stage too: a signal not measured there passes
+                # straight through to the upstream (limiting) curve — it just reports the
+                # upstream quantity for that signal, while safety limits are unaffected
+                # (they already gauge on that upstream curve).
+                if prev_name is not None:
                     planes[name] = _Derived(frm=prev_name, table=[(0.0, 0.0)],
                                             fallback=True, quantity=quantity,
                                             description=description)

@@ -70,6 +70,24 @@ def test_amp_limit_gauges_on_fullband_not_mainlobe():
     assert r.operating_quantity == "main-lobe power"
 
 
+def test_signal_not_measured_at_reported_stage_passes_through():
+    # A signal measured only on the source (full-band) — not on the reported area-of-interest
+    # stage — passes straight through: the operating point inherits the source curve, and the
+    # amp limit still gauges on the source. (This is the partial-measured-stage fallback,
+    # extended to reported stages.)
+    doc = _doc()
+    doc["signals"]["gps"]["curves"].pop("main_lobe")     # measured on source only
+    r = resolve(doc, None, "gps")
+    assert r.max_gain_db == pytest.approx(80.0, abs=1e-6)      # limit still on full-band
+    assert r.max_power_dbm == pytest.approx(-2.5, abs=1e-6)    # reports the source curve
+    # A sibling signal that IS measured at the reported stage still reports area-of-interest.
+    doc["signals"]["gps2"] = {"amplitude": 0.5, "curves": {
+        "source": {"points": _pts(SOURCE_PTS)},
+        "main_lobe": {"points": _pts(MAINLOBE_PTS)}}}
+    r2 = resolve(doc, None, "gps2")
+    assert r2.max_power_dbm == pytest.approx(-3.5, abs=1e-6)
+
+
 def test_reported_quantity_propagates_downstream():
     # "the rest of the chain reflects" main-lobe: observing at the antenna anchors on the
     # main-lobe curve, so the EIRP read-out is main-lobe EIRP (main_lobe + 20 - 1.8 + 6).

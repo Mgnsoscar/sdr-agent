@@ -177,7 +177,12 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # limiting one (mis-gauging the ceiling), so the client gates on the calibration-plane-roles
 # capability below (a safety gate). The validate summary now also reports each limit's resolved
 # gauge plane + quantity.
-AGENT_VERSION = "1.6.0"
+# 1.6.1 extends the partial-measured-stage fallback to reported stages: a signal not measured
+# at a reported stage passes straight through to the upstream (limiting) curve — it reports the
+# upstream quantity for that signal instead of the save being rejected — while safety limits are
+# unaffected (they already gauge on that upstream curve). No new capability; reported stages are
+# already gated on calibration-plane-roles.
+AGENT_VERSION = "1.6.1"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
