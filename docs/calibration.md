@@ -156,6 +156,52 @@ refused.)
 > capability (agent ≥ 1.5.0); an older agent ignores the key and would apply the cap at
 > the *output*, so the client refuses to push a `side`-using document to it.
 
+### 4.1 Measured-plane roles: what a curve counts toward (`role` / `of`)
+
+A safety limit is a threshold in a *specific quantity*, and it is only meaningful when
+inverted through a curve measured in that **same** quantity. That becomes explicit when
+one physical node is measured two ways — e.g. a source measured as **full-band integrated
+power** (what an amplifier's input P1dB spec refers to) *and* as **main-lobe power** (the
+region of interest the operator actually wants to read). Gauging the amp's full-band limit
+through the main-lobe curve silently over-drives it: main-lobe reads lower, so the ceiling
+lands too high.
+
+`role` keeps the two apart:
+
+- **`"limiting"`** (the default — every v1 plane is this) — the curve safety limits invert
+  through, and a valid operating/reporting anchor.
+- **`"reported"`** — a *re-measurement of the same node in a different quantity*. It is the
+  number `--power` shows and it propagates downstream like any anchor, but it is
+  **invisible to limit inversion**: the limit walk punches straight through it (0 dB, same
+  node) to the `"limiting"` curve named by **`of`**. So `--power` reports the region of
+  interest while every limit is still gauged in its own quantity.
+
+A `"reported"` plane **must** set `of` to a `"limiting"` plane; that requirement makes the
+source/root plane impossible to mark `"reported"` (it has no limiting basis to point at).
+Downstream stages derive from the reported plane, so observed power flows in the
+region-of-interest quantity, while a limit anywhere below it still resolves to the limiting
+curve — and, via `side: "input"`, still **follows its stage**: drop a pad in front of the
+amp and the source may climb by the pad while the amp stays protected on full-band.
+
+```jsonc
+"planes": {
+  "source":    { "type": "measured", "role": "limiting",
+                 "quantity": "total in-band power" },       // amp-protection basis
+  "main_lobe": { "type": "measured", "role": "reported", "of": "source",
+                 "quantity": "main-lobe power" },           // what --power shows
+  "amplifier": { "type": "derived", "from": "main_lobe", "delta_db": 20.0 }
+}
+// limit { plane: "amplifier", side: "input", max_dbm: -2.5 } gauges on `source` (full-band),
+// while operating_plane "main_lobe" reports main-lobe power.
+```
+
+The validate-on-save summary reports, per limit, the plane and quantity it resolved to
+gauge on (`amp P1dB input → gauged on 'source' (total in-band power)`), so a quantity
+mismatch is visible at save time. `role`/`of` are advertised as the
+`calibration-plane-roles` capability (agent ≥ 1.6.0); a `≤1.5.2` agent doesn't understand
+them and would treat a reported plane as an ordinary limiting one (mis-gauging the
+ceiling), so the client refuses to push a role-using document to it.
+
 ---
 
 ## 5. The format (annotated)
@@ -352,6 +398,8 @@ fields optional (it only supplies defaults). Note that in the per-unit file the
           "additionalProperties": false,
           "properties": {
             "type":        { "const": "measured" },
+            "role":        { "enum": ["limiting", "reported"] },  // default "limiting" (§4.1)
+            "of":          { "type": "string" },   // reported only → the limiting plane it re-measures
             "quantity":    { "type": "string" },
             "description": { "type": "string" }
           }

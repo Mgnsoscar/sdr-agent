@@ -51,12 +51,30 @@ class SignalNotCalibrated(CalibrationError):
 
 @dataclass
 class _Measured:
-    """A measured plane: a monotonic gain→power curve plus a fixed offset."""
+    """A measured plane: a monotonic gain→power curve plus a fixed offset.
+
+    ``role`` decides what the curve backs (docs/calibration.md §4.1):
+
+    - ``"limiting"`` (default) — the curve safety limits invert through, AND a valid
+      operating/reporting anchor. Every v1 plane is this.
+    - ``"reported"`` — a *re-measurement of the same physical node in a different
+      quantity* (e.g. main-lobe power vs the node's full-band ``limiting`` curve). It is
+      the number shown to the operator, but it is INVISIBLE to limit inversion: the limit
+      walk punches straight through it (0 dB, same node) to the ``limiting`` curve named
+      by ``of``. So a limit is always gauged in its own quantity while ``--power`` reports
+      the region of interest. A ``reported`` plane MUST set ``of`` to a ``limiting`` plane;
+      that requirement makes the root (source) plane impossible to mark ``reported``."""
     gains: list[float]
     powers: list[float]
     offset_db: float = 0.0
     quantity: str = ""
     description: str = ""
+    role: str = "limiting"
+    of: str = ""                             # reported → the limiting plane it re-measures
+
+    @property
+    def is_reported(self) -> bool:
+        return self.role == "reported"
 
     def power_at(self, gain: float) -> float:
         return _interp(gain, self.gains, self.powers) + self.offset_db
@@ -124,6 +142,14 @@ class ResolvedCalibration:
     _freq_hz: Optional[float] = None                 # representative frequency, or None
     _gain_ceiling_const: float = float("inf")        # freq-independent gain cap
     _freq_limits: list = field(repr=False, default_factory=list)  # [(plane, max_dbm, reason)]
+    _limit_gauges: list = field(repr=False, default_factory=list)  # per-limit gauge info
+
+    def limit_gauges(self) -> list:
+        """Per-limit transparency: which plane (and quantity) each safety limit inverts
+        against after honouring ``side`` and punching through any ``reported`` planes. Lets
+        a UI show ``amp P1dB input → gauged on 'sdr_output' (total in-band power)`` so a
+        quantity mismatch is visible at save time rather than as amp compression."""
+        return list(self._limit_gauges)
 
     def _eff_freq(self, freq: Optional[float]) -> Optional[float]:
         return self._freq_hz if freq is None else freq
@@ -133,7 +159,7 @@ class ResolvedCalibration:
         frequency-independent cap and every frequency-dependent limit."""
         caps = [self._gain_ceiling_const]
         for plane, max_dbm, _ in self._freq_limits:
-            caps.append(_gain_for_power_on(max_dbm, plane, self._planes, freq))
+            caps.append(_gain_for_power_on(max_dbm, plane, self._planes, freq, for_limit=True))
         return min(caps)
 
     # ── the two functions the script calls ──────────────────────────────────────
@@ -275,13 +301,29 @@ def _power_on(plane_name: str, gain: float, planes: dict, freq: Optional[float])
     return _power_on(p.frm, gain, planes, freq) + p.delta_at(freq)
 
 
-def _anchor(plane_name: str, planes: dict, freq: Optional[float]) -> tuple[float, _Measured]:
+def _anchor(plane_name: str, planes: dict, freq: Optional[float],
+            for_limit: bool = False) -> tuple[float, _Measured]:
     """Walk derived hops down to the nearest measured ancestor, accumulating the
-    total derived delta (evaluated at ``freq``). Returns (delta, measured_plane)."""
+    total derived delta (evaluated at ``freq``). Returns (delta, measured_plane).
+
+    ``for_limit`` makes the walk transparent through ``reported`` planes: a reported
+    plane is a re-measurement of its ``of`` node (0 dB between them), so a limit gauged
+    on the node's quantity punches through to that ``limiting`` curve instead of stopping
+    on the reported one. The observed walk (``for_limit=False``) stops at the reported
+    plane and uses its own curve."""
     delta, p = 0.0, planes[plane_name]
-    while isinstance(p, _Derived):
-        delta += p.delta_at(freq)
-        p = planes[p.frm]
+    seen: set[int] = set()
+    while True:
+        if isinstance(p, _Derived):
+            delta += p.delta_at(freq)
+            p = planes[p.frm]
+        elif for_limit and p.is_reported and p.of:
+            if id(p) in seen:                # of-cycle guard (validation forbids this)
+                break
+            seen.add(id(p))
+            p = planes[p.of]
+        else:
+            break
     return delta, p
 
 
@@ -303,12 +345,20 @@ def _path_freq_dependent(plane_name: str, planes: dict) -> bool:
     return any(d.is_freq_dependent for _, d in _hops(plane_name, planes))
 
 
-def _anchor_plane(plane_name: str, planes: dict) -> _Measured:
+def _anchor_plane(plane_name: str, planes: dict, for_limit: bool = False) -> _Measured:
     """The measured plane a chain resolves down to, WITHOUT evaluating any delta (so it
-    is safe on a frequency-dependent path where the delta needs a frequency)."""
+    is safe on a frequency-dependent path where the delta needs a frequency). ``for_limit``
+    punches through ``reported`` planes to the ``limiting`` curve they re-measure."""
     p = planes[plane_name]
-    while isinstance(p, _Derived):
-        p = planes[p.frm]
+    seen: set[int] = set()
+    while True:
+        if isinstance(p, _Derived):
+            p = planes[p.frm]
+        elif for_limit and p.is_reported and p.of and id(p) not in seen:
+            seen.add(id(p))
+            p = planes[p.of]
+        else:
+            break
     return p
 
 
@@ -372,12 +422,13 @@ def _sum_tables(tables: list) -> list:
 
 
 def _gain_for_power_on(power: float, plane_name: str, planes: dict,
-                       freq: Optional[float]) -> float:
+                       freq: Optional[float], for_limit: bool = False) -> float:
     """Gain that yields ``power`` at ``plane_name``. Subtract downstream derived
     deltas (at ``freq``) to reach the anchor measured plane, then invert its curve
     once. Clamps at the measured range — upward to the top gain (never extrapolated
-    past the ceiling), downward to the bottom gain."""
-    delta, m = _anchor(plane_name, planes, freq)
+    past the ceiling), downward to the bottom gain. ``for_limit`` gauges a safety limit:
+    the walk punches through ``reported`` planes to the ``limiting`` curve (§4.1)."""
+    delta, m = _anchor(plane_name, planes, freq, for_limit=for_limit)
     target = power - delta - m.offset_db
     if len(m.powers) == 1:
         return m.gains[0] + (target - m.powers[0])         # slope-1 inverse
@@ -473,15 +524,21 @@ def resolve(unit_doc: dict,
     gmin = float(gl.get("min_gain_db", 0.0))
     const_caps: list = []
     freq_limits: list = []
+    limit_gauges: list = []
     if gl.get("max_gain_db") is not None:
         const_caps.append(float(gl["max_gain_db"]))
     for lim in (chain.get("limits") or []):
         plane = _limit_plane(lim, planes)            # honour side: input → one hop upstream
-        _require_usable(plane, planes)               # need a curve to invert against
+        anchor = _require_usable(plane, planes, for_limit=True)   # gauge on the LIMITING curve
+        limit_gauges.append({
+            "reason": lim.get("reason", ""), "max_dbm": float(lim["max_dbm"]),
+            "at_plane": plane, "gauge_plane": _plane_name(anchor, planes),
+            "gauge_quantity": anchor.quantity})
         if _path_freq_dependent(plane, planes):
             freq_limits.append((plane, float(lim["max_dbm"]), lim.get("reason", "")))
         else:
-            const_caps.append(_gain_for_power_on(float(lim["max_dbm"]), plane, planes, None))
+            const_caps.append(
+                _gain_for_power_on(float(lim["max_dbm"]), plane, planes, None, for_limit=True))
     if not const_caps and not freq_limits:
         raise CalibrationError("no safety ceiling derivable — refusing to transmit")
     gain_ceiling_const = min(const_caps) if const_caps else float("inf")
@@ -490,9 +547,23 @@ def resolve(unit_doc: dict,
     # measured anchor (one shared anchor_curve in the artifact). Downstream passive
     # limits always share that anchor; guard the unusual topology where they wouldn't.
     if freq_limits:
-        op_anchor = _anchor_plane(operating_plane, planes)
+        op_anchor = _anchor_plane(operating_plane, planes)            # observed anchor curve
         for plane, _mx, _rs in freq_limits:
-            if _anchor_plane(plane, planes) is not op_anchor:
+            lim_anchor = _anchor_plane(plane, planes, for_limit=True)  # the limiting curve
+            if lim_anchor is not op_anchor:
+                # A v2 script re-folds a frequency-dependent limit against the operating
+                # plane's published anchor_curve. That only works when the limit gauges on
+                # the same measured curve the operating plane anchors on. A reported
+                # operating plane anchors on its own (reported) curve while the limit
+                # gauges on the limiting one, so the two differ — refuse rather than
+                # publish a mis-referenced delta.
+                if op_anchor.is_reported or _anchor_plane(operating_plane, planes,
+                                                          for_limit=True) is lim_anchor:
+                    raise CalibrationError(
+                        f"frequency-dependent limit on {plane!r} gauges on a 'limiting' "
+                        f"curve, but the operating plane {operating_plane!r} reports on a "
+                        f"different curve; frequency-dependent limits combined with a "
+                        f"'reported' operating plane aren't supported yet")
                 raise CalibrationError(
                     f"frequency-dependent limit on {plane!r} resolves through a different "
                     f"measured plane than the operating plane {operating_plane!r}; this "
@@ -511,7 +582,8 @@ def resolve(unit_doc: dict,
         signal_id=signal_id, unit_type=unit_type, amplitude=amplitude,
         min_gain_db=gmin, operating_plane=operating_plane, operating_quantity=op_quantity,
         _planes=planes, _freq_hz=rep_freq,
-        _gain_ceiling_const=gain_ceiling_const, _freq_limits=freq_limits)
+        _gain_ceiling_const=gain_ceiling_const, _freq_limits=freq_limits,
+        _limit_gauges=limit_gauges)
     if resolved.max_gain_db < gmin:
         raise CalibrationError(
             f"resolved max gain {resolved.max_gain_db:.2f} dB is below min gain "
@@ -549,6 +621,7 @@ def validate_chain_structure(unit_doc: dict, type_defaults: Optional[dict] = Non
     # anchor has points — needs a curve, so it waits for a signal.)
     if operating_plane not in planes:
         raise CalibrationError(f"operating_plane {operating_plane!r} does not exist")
+    _validate_role_refs(planes)
     for name, p in planes.items():
         if isinstance(p, _Derived) and p.frm not in planes:
             raise CalibrationError(f"plane {name!r} references unknown plane {p.frm!r}")
@@ -614,6 +687,7 @@ def validate_document(unit_doc: dict, type_defaults: Optional[dict] = None,
                 "amplitude": r.amplitude,
                 "min_gain_db": r.min_gain_db, "max_gain_db": r.max_gain_db,
                 "min_power_dbm": r.min_power_dbm, "max_power_dbm": r.max_power_dbm,
+                "limit_gauges": r.limit_gauges(),
             }
         except CalibrationError as exc:
             bad[sig_id] = str(exc)
@@ -670,6 +744,21 @@ def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
         quantity = spec.get("quantity", "")
         description = spec.get("description", "")
         if ptype == "measured":
+            role = spec.get("role", "limiting")
+            if role not in ("limiting", "reported"):
+                raise CalibrationError(
+                    f"plane {name!r} has invalid role {role!r} "
+                    f"(expected 'limiting' or 'reported')")
+            of = spec.get("of", "")
+            if role == "reported":
+                if not of:
+                    raise CalibrationError(
+                        f"reported plane {name!r} must set 'of' to the limiting plane it "
+                        f"re-measures (the source/root plane can't be 'reported')")
+            elif of:
+                raise CalibrationError(
+                    f"plane {name!r} sets 'of' but is not 'reported' "
+                    f"('of' names the limiting plane a reported plane re-measures)")
             curve = curves.get(name)
             if curve is None:
                 # Latent: declared measured but not measured for THIS signal. If a stage
@@ -679,19 +768,21 @@ def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
                 # stage": you can add a downstream measured plane for a signal or two
                 # without re-measuring all the rest). The FIRST stage has nothing upstream,
                 # so a latent source stays latent and _require_usable flags it clearly.
-                if prev_name is not None:
+                # A reported plane is a re-measurement, not a series stage, so it never
+                # inherits an upstream curve — it stays latent until measured.
+                if prev_name is not None and role != "reported":
                     planes[name] = _Derived(frm=prev_name, table=[(0.0, 0.0)],
                                             fallback=True, quantity=quantity,
                                             description=description)
                 else:
                     planes[name] = _Measured(gains=[], powers=[], quantity=quantity,
-                                             description=description)
+                                             description=description, role=role, of=of)
             else:
                 gains, powers = _curve_points(curve, name)
                 planes[name] = _Measured(
                     gains=gains, powers=powers,
                     offset_db=float(curve.get("offset_db", 0.0)),
-                    quantity=quantity, description=description)
+                    quantity=quantity, description=description, role=role, of=of)
             prev_name = name
             continue
         if ptype == "derived":
@@ -751,29 +842,57 @@ def _curve_points(curve: dict, name: str) -> tuple[list[float], list[float]]:
     return gains, powers
 
 
+def _validate_role_refs(planes: dict) -> None:
+    """Each ``reported`` plane's ``of`` must name an existing ``limiting`` measured plane —
+    the curve its limits punch through to. Pointing at a derived plane, a missing plane, or
+    another reported plane is refused (a reported plane never backs a limit)."""
+    for name, p in planes.items():
+        if isinstance(p, _Measured) and p.is_reported:
+            target = planes.get(p.of)
+            if target is None:
+                raise CalibrationError(
+                    f"reported plane {name!r} re-measures unknown plane {p.of!r}")
+            if not isinstance(target, _Measured) or target.is_reported:
+                raise CalibrationError(
+                    f"reported plane {name!r} must re-measure a 'limiting' plane, but "
+                    f"{p.of!r} is not one")
+
+
 def _validate_topology(planes: dict, operating_plane: str) -> None:
     """Every 'from' resolves, the derived graph is acyclic and ends at a measured
     plane, and the operating plane has a usable transfer for this signal."""
     for name, p in planes.items():
         if isinstance(p, _Derived) and p.frm not in planes:
             raise CalibrationError(f"plane {name!r} references unknown plane {p.frm!r}")
+    _validate_role_refs(planes)
     if operating_plane not in planes:
         raise CalibrationError(f"operating_plane {operating_plane!r} does not exist")
     # walk from operating plane to its measured anchor, guarding against cycles
     _require_usable(operating_plane, planes)
 
 
-def _require_usable(plane_name: str, planes: dict) -> _Measured:
+def _require_usable(plane_name: str, planes: dict, for_limit: bool = False) -> _Measured:
     """Return the measured anchor of ``plane_name`` if it has points; raise otherwise.
-    Detects cycles in the derived chain."""
+    Detects cycles in the derived chain. ``for_limit`` punches through ``reported`` planes
+    to the ``limiting`` curve, so a limit is validated against the curve it will actually
+    invert on (not the reported one it passes through)."""
     seen: set[str] = set()
     p = planes[plane_name]
-    while isinstance(p, _Derived):
-        if plane_name in seen:
-            raise CalibrationError(f"derived plane cycle through {plane_name!r}")
-        seen.add(plane_name)
-        plane_name = p.frm
-        p = planes[plane_name]
+    while True:
+        if isinstance(p, _Derived):
+            if plane_name in seen:
+                raise CalibrationError(f"derived plane cycle through {plane_name!r}")
+            seen.add(plane_name)
+            plane_name = p.frm
+            p = planes[plane_name]
+        elif for_limit and p.is_reported and p.of:
+            if plane_name in seen:
+                raise CalibrationError(f"reported-plane cycle through {plane_name!r}")
+            seen.add(plane_name)
+            plane_name = p.of
+            p = planes[plane_name]
+        else:
+            break
     if not p.gains:                                  # measured but latent (no points)
         raise CalibrationError(
             f"plane {plane_name!r} has no measured curve for this signal "
@@ -783,6 +902,11 @@ def _require_usable(plane_name: str, planes: dict) -> _Measured:
 
 def _quantity_of(plane) -> str:
     return plane.quantity if plane.quantity else ""
+
+
+def _plane_name(plane, planes: dict) -> str:
+    """The dict key of a resolved plane object (for reporting which curve a limit hit)."""
+    return next((n for n, p in planes.items() if p is plane), "")
 
 
 # ── File loaders (thin; the pure resolver above stays I/O-free & unit-testable) ──

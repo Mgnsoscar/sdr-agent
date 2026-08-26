@@ -168,7 +168,16 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # with no valid calibration it returns an "uncalibrated" map that refuses --power (NoAbsoluteScale)
 # rather than inventing levels, so a script maps absolute power only on a real measured curve and
 # otherwise runs on a relative gain. Also ships in the OTA bundle, so bump to propagate it.
-AGENT_VERSION = "1.5.2"
+# 1.6.0 gives a measured plane a `role`: `limiting` (default — safety limits invert through it)
+# or `reported` (a re-measurement of the same node in a different quantity, e.g. main-lobe vs
+# full-band, that `of:` names). A reported plane is what --power shows the operator but is
+# INVISIBLE to limit inversion — the limit walk punches through it to the limiting curve — so a
+# limit is always gauged in its own quantity while the operator sees the region of interest. A
+# ≤1.5.2 agent doesn't understand `role`/`of` and would treat a reported plane as an ordinary
+# limiting one (mis-gauging the ceiling), so the client gates on the calibration-plane-roles
+# capability below (a safety gate). The validate summary now also reports each limit's resolved
+# gauge plane + quantity.
+AGENT_VERSION = "1.6.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -187,6 +196,9 @@ AGENT_CAPABILITIES = [
                                    # accepted, for onboarding before any signal is measured
     "calibration-limit-side",      # a limit may set side: input/output to apply at a
                                    # stage's input (one hop upstream) vs its output plane
+    "calibration-plane-roles",     # a measured plane may set role: limiting/reported; a
+                                   # reported plane (of: a limiting plane) is shown to the
+                                   # operator but invisible to limits (they punch through it)
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
