@@ -143,7 +143,67 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # frequency; the resolved artifact carries the passive-hop tables + a frequency-split
 # ceiling so the script folds --power at its live frequency. Inline delta_db and every
 # v1 document keep resolving unchanged.
-AGENT_VERSION = "1.2.0"
+# 1.3.0 adds partial measured stages: a signal missing the curve for a non-first measured
+# stage inherits the nearest upstream measured curve (a transparent +0 dB hop) instead of
+# being rejected — so a downstream measured plane can be added for a signal or two without
+# re-measuring the rest. Such a document RESOLVES here but is REJECTED by ≤1.2.0 agents,
+# so the client gates on the calibration-partial-stages capability below.
+# 1.4.0 accepts a signal-less calibration document (upload/validate/view): a unit's chain
+# and safety ceiling can be saved during onboarding, before any signal is measured. The
+# curve-independent structure is validated; a broken chain is still rejected; nothing can
+# transmit until a signal is added. Such a document is REJECTED by ≤1.3.0 agents ("document
+# has no signals"), so the client gates on the calibration-no-signals capability below.
+# 1.5.0 lets a safety limit choose the stage boundary it applies at: `side: "input"` caps
+# the plane feeding the named stage (one hop upstream), `side: "output"` (default) the plane
+# itself. An input-protection limit (e.g. an amp's max input power) then follows its stage
+# when a component is inserted upstream, instead of naming a fixed plane that detaches. A
+# ≤1.4.0 agent IGNORES `side` and would mis-apply the cap at the output, so the client gates
+# on the calibration-limit-side capability below (a safety gate, not just a feature gate).
+# 1.5.1 (bundle-only, no HTTP-surface change) — calkit now enforces an amplitude gate: a
+# transmit script drives a FIXED baseband amplitude, and its injected calibration is honoured
+# only when measured at that same amplitude; a mismatch falls back to uncalibrated (baked)
+# levels with a loud warning instead of transmitting on an invalid power scale. calkit ships
+# in the OTA bundle, so the version bumps to propagate it to units.
+# 1.5.2 (bundle-only, no HTTP-surface change) — calkit drops the baked dBm fallback entirely:
+# with no valid calibration it returns an "uncalibrated" map that refuses --power (NoAbsoluteScale)
+# rather than inventing levels, so a script maps absolute power only on a real measured curve and
+# otherwise runs on a relative gain. Also ships in the OTA bundle, so bump to propagate it.
+# 1.6.0 gives a measured plane a `role`: `limiting` (default — safety limits invert through it)
+# or `reported` (a re-measurement of the same node in a different quantity, e.g. main-lobe vs
+# full-band, that `of:` names). A reported plane is what --power shows the operator but is
+# INVISIBLE to limit inversion — the limit walk punches through it to the limiting curve — so a
+# limit is always gauged in its own quantity while the operator sees the region of interest. A
+# ≤1.5.2 agent doesn't understand `role`/`of` and would treat a reported plane as an ordinary
+# limiting one (mis-gauging the ceiling), so the client gates on the calibration-plane-roles
+# capability below (a safety gate). The validate summary now also reports each limit's resolved
+# gauge plane + quantity.
+# 1.6.1 extends the partial-measured-stage fallback to reported stages: a signal not measured
+# at a reported stage passes straight through to the upstream (limiting) curve — it reports the
+# upstream quantity for that signal instead of the save being rejected — while safety limits are
+# unaffected (they already gauge on that upstream curve). No new capability; reported stages are
+# already gated on calibration-plane-roles.
+# 1.7.0 adds chain.gain_limits.gain_step_db: the SDR settles on a discrete gain grid, so the
+# commanded gain is snapped to the nearest step on that grid (never above the safety ceiling —
+# it floors there), and the reported power reflects the snapped gain. Both the resolver and the
+# script-side calkit (in the OTA bundle) snap, so they agree. A ≤1.6.1 agent ignores the field
+# and would command an off-grid gain the SDR silently rounds, so the client gates on the
+# calibration-gain-step capability below.
+# 1.7.1 makes a signal's center_freq_hz OPTIONAL on a frequency-dependent chain: the transmit
+# frequency is a runtime quantity (the task's --freq / CAL_FREQ_PARAM), so instead of rejecting
+# a document with no center_freq_hz the resolver derives a representative one — the tightest-
+# ceiling breakpoint when a frequency-dependent SAFETY limit exists (so a v1 script folding no
+# frequency of its own still can't exceed a per-frequency limit), else the midpoint of the
+# chain's breakpoints. A ≤1.7.0 agent still rejects such a document at validate, so the client
+# gates on the calibration-freq-optional-center capability below before allowing an empty
+# center-frequency field on a frequency-dependent chain.
+# 1.7.2 carries the full resolved artifact (v1 curve + v2 anchor/passive-hops/limits) in the
+# /calibration view's per-signal summary, and surfaces a script's CAL_FREQ_PARAM in
+# /scripts/{name}/params as calibration_freq_param. Together these let the client re-fold a
+# signal's --power range at the frequency the operator picks in the Run/sequence form — the
+# same fold calkit does at transmit — instead of showing only the representative-frequency
+# range. Purely additive; a client gates the re-fold on the calibration-summary-artifact
+# capability below.
+AGENT_VERSION = "1.7.2"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -156,6 +216,24 @@ AGENT_CAPABILITIES = [
     "cal-validate",       # POST /calibration/validate dry-runs a document without storing
     "calibration-components",  # v2: a derived plane may reference a components.yaml entry
                                # (Δ dB-vs-frequency); resolved per transmit frequency
+    "calibration-partial-stages",  # a signal may omit the curve for a non-first measured
+                                   # stage and inherit the nearest upstream measured curve
+    "calibration-no-signals",      # a signal-less document (chain + ceiling only) is
+                                   # accepted, for onboarding before any signal is measured
+    "calibration-limit-side",      # a limit may set side: input/output to apply at a
+                                   # stage's input (one hop upstream) vs its output plane
+    "calibration-plane-roles",     # a measured plane may set role: limiting/reported; a
+                                   # reported plane (of: a limiting plane) is shown to the
+                                   # operator but invisible to limits (they punch through it)
+    "calibration-gain-step",       # chain.gain_limits.gain_step_db snaps the commanded gain
+                                   # to the SDR's discrete gain grid (never above the ceiling)
+    "calibration-freq-optional-center",  # center_freq_hz is optional on a frequency-dependent
+                                         # chain: the resolver derives a representative (worst-
+                                         # case) frequency when it's absent, since --freq supplies
+                                         # the real transmit frequency at runtime
+    "calibration-summary-artifact",      # the /calibration view's per-signal summary carries the
+                                         # full resolved artifact, so the client re-folds the
+                                         # --power range at the operator's chosen frequency
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

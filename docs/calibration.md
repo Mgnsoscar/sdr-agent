@@ -124,13 +124,83 @@ amp-protection and a regulatory EIRP cap the same mechanism:
 
 ```jsonc
 "limits": [
-  { "plane": "sdr_output",   "max_dbm": -2.5, "reason": "amp P1dB input" },
-  { "plane": "antenna_eirp", "max_dbm": 30.0, "reason": "regulatory EIRP cap" }
+  { "plane": "amplifier_output", "side": "input",  "max_dbm": -2.5, "reason": "amp P1dB input" },
+  { "plane": "antenna_eirp",     "side": "output", "max_dbm": 50.0, "reason": "licence EIRP cap" }
 ]
 ```
 
 Resolved ceiling = **min** gain over all limits, capped by the hardware max. The
 tightest wins.
+
+**Which stage boundary a limit applies at (`side`).** A plane is a *node* between
+stages: it is the **output** of the stage before it and the **input** of the stage
+after it. `side` picks which boundary a limit protects:
+
+- `"output"` (the default, and what a limit with no `side` means) — the cap is on the
+  named plane itself, i.e. the output of that stage. A regulatory EIRP cap is an
+  output limit on `antenna_eirp`.
+- `"input"` — the cap is on the plane **feeding** the named stage, one hop upstream in
+  the cascade (a derived plane's `from`; a measured plane's predecessor by cascade
+  order). An amplifier's max input power is an input limit on `amplifier_output`.
+
+The point of `"input"` is that the limit **follows its stage**. An amp that must never
+see more than −2.5 dBm at its input is `{ "plane": "amplifier_output", "side": "input" }`.
+If you later insert a pad or a longer cable *in front of* the amp (a new plane between
+the SDR and the amp), the amp's input plane changes — but the limit re-resolves to the
+new upstream plane automatically. You never restate −2.5 dBm on the newly inserted
+component. (An input-side limit on the very first plane has nothing upstream and is
+refused.)
+
+> The default is `"output"`, so every existing `{ plane, max_dbm }` limit keeps
+> resolving exactly as before. `side` is advertised as the `calibration-limit-side`
+> capability (agent ≥ 1.5.0); an older agent ignores the key and would apply the cap at
+> the *output*, so the client refuses to push a `side`-using document to it.
+
+### 4.1 Measured-plane roles: what a curve counts toward (`role` / `of`)
+
+A safety limit is a threshold in a *specific quantity*, and it is only meaningful when
+inverted through a curve measured in that **same** quantity. That becomes explicit when
+one physical node is measured two ways — e.g. a source measured as **full-band integrated
+power** (what an amplifier's input P1dB spec refers to) *and* as **main-lobe power** (the
+region of interest the operator actually wants to read). Gauging the amp's full-band limit
+through the main-lobe curve silently over-drives it: main-lobe reads lower, so the ceiling
+lands too high.
+
+`role` keeps the two apart:
+
+- **`"limiting"`** (the default — every v1 plane is this) — the curve safety limits invert
+  through, and a valid operating/reporting anchor.
+- **`"reported"`** — a *re-measurement of the same node in a different quantity*. It is the
+  number `--power` shows and it propagates downstream like any anchor, but it is
+  **invisible to limit inversion**: the limit walk punches straight through it (0 dB, same
+  node) to the `"limiting"` curve named by **`of`**. So `--power` reports the region of
+  interest while every limit is still gauged in its own quantity.
+
+A `"reported"` plane **must** set `of` to a `"limiting"` plane; that requirement makes the
+source/root plane impossible to mark `"reported"` (it has no limiting basis to point at).
+Downstream stages derive from the reported plane, so observed power flows in the
+region-of-interest quantity, while a limit anywhere below it still resolves to the limiting
+curve — and, via `side: "input"`, still **follows its stage**: drop a pad in front of the
+amp and the source may climb by the pad while the amp stays protected on full-band.
+
+```jsonc
+"planes": {
+  "source":    { "type": "measured", "role": "limiting",
+                 "quantity": "total in-band power" },       // amp-protection basis
+  "main_lobe": { "type": "measured", "role": "reported", "of": "source",
+                 "quantity": "main-lobe power" },           // what --power shows
+  "amplifier": { "type": "derived", "from": "main_lobe", "delta_db": 20.0 }
+}
+// limit { plane: "amplifier", side: "input", max_dbm: -2.5 } gauges on `source` (full-band),
+// while operating_plane "main_lobe" reports main-lobe power.
+```
+
+The validate-on-save summary reports, per limit, the plane and quantity it resolved to
+gauge on (`amp P1dB input → gauged on 'source' (total in-band power)`), so a quantity
+mismatch is visible at save time. `role`/`of` are advertised as the
+`calibration-plane-roles` capability (agent ≥ 1.6.0); a `≤1.5.2` agent doesn't understand
+them and would treat a reported plane as an ordinary limiting one (mis-gauging the
+ceiling), so the client refuses to push a role-using document to it.
 
 ---
 
@@ -173,7 +243,8 @@ curve against the shared threshold.
     "gain_limits": { "min_gain_db": 0.0, "max_gain_db": 89.75 },
     "operating_plane": "antenna_eirp",     // what --power means; "sdr_output" pre-amp-pass
     "limits": [
-      { "plane": "sdr_output", "max_dbm": -2.5, "reason": "amp P1dB input" }
+      // amp-input protection: follows the amp if a component is inserted upstream
+      { "plane": "amplifier_output", "side": "input", "max_dbm": -2.5, "reason": "amp P1dB input" }
     ],
     "planes": {
       "sdr_output": {
@@ -294,8 +365,9 @@ fields optional (it only supplies defaults). Note that in the per-unit file the
     "gain_limits": {
       "type": "object",
       "properties": {
-        "min_gain_db": { "type": "number", "minimum": 0 },
-        "max_gain_db": { "type": "number", "minimum": 0 }
+        "min_gain_db":  { "type": "number", "minimum": 0 },
+        "max_gain_db":  { "type": "number", "minimum": 0 },
+        "gain_step_db": { "type": "number", "exclusiveMinimum": 0 }  // SDR gain grid; snaps the command
       }
     },
     "point": {
@@ -313,6 +385,7 @@ fields optional (it only supplies defaults). Note that in the per-unit file the
       "additionalProperties": false,
       "properties": {
         "plane":   { "type": "string" },
+        "side":    { "enum": ["input", "output"] },   // default "output" (the plane itself)
         "max_dbm": { "type": "number" },
         "reason":  { "type": "string" }
       }
@@ -326,6 +399,8 @@ fields optional (it only supplies defaults). Note that in the per-unit file the
           "additionalProperties": false,
           "properties": {
             "type":        { "const": "measured" },
+            "role":        { "enum": ["limiting", "reported"] },  // default "limiting" (§4.1)
+            "of":          { "type": "string" },   // reported only → the limiting plane it re-measures
             "quantity":    { "type": "string" },
             "description": { "type": "string" }
           }
@@ -450,7 +525,8 @@ def resolve_max_gain(chain, planes):
     if chain.gain_limits.max_gain_db is not None:
         candidates.append(chain.gain_limits.max_gain_db)
     for lim in chain.limits:                      # each limit -> a gain, via this signal's curve
-        candidates.append(gain_for_power_on(lim.max_dbm, lim.plane, planes))
+        plane = upstream_plane(lim.plane) if lim.side == "input" else lim.plane
+        candidates.append(gain_for_power_on(lim.max_dbm, plane, planes))
     if not candidates:
         refuse("no safety ceiling — refusing to transmit")   # MANDATORY
     return min(candidates)                         # hardware max already folded into gain_limits
@@ -542,8 +618,15 @@ resolver duplicated across repos.
   `PowerMap.load(baked)` returns the artifact-backed map when `SDR_CALIBRATION_FILE`
   is set, else a `from_linear` map built from the baked constants that is byte-
   identical to the old single-anchor behaviour. `--power` ↔ gain both route through
-  it, as does the flowgraph amplitude (taken from the artifact so it matches what the
-  curve was measured at).
+  it, as does the flowgraph amplitude.
+- **Amplitude gate.** A script transmits at a **fixed baseband amplitude** (its baked
+  `AMPLITUDE`, not a task parameter — the operator never sets it), and its calibration
+  is only valid at the amplitude the curve was measured at. `PowerMap.load` compares the
+  two: on a match it uses the calibration; on a **mismatch** the calibrated power scale
+  no longer describes this script, so it **falls back to the baked (uncalibrated) map and
+  warns loudly** (a `warning` on the map, a logged WARNING, and a `⚠ CALIBRATION` banner
+  line) — never a silent switch to a wrong scale. Re-running calibration at the script's
+  amplitude restores it. (The Pi broadcaster scripts fix this at `AMPLITUDE = 0.5`.)
 - The banner echoes the map's **source** and the operating plane's `quantity`, so the
   number is never ambiguous, e.g. `power: -12.0 dBm (EIRP, at antenna_eirp)` +
   `calibration: calibration file`.
@@ -576,6 +659,16 @@ not the only one.
   it would resolve at runtime (merged with this unit's type defaults) — so a broken
   or unsafe document is rejected at upload with a specific reason, never at transmit.
   The success response returns the per-signal resolved summary.
+  - **A signal-less document is accepted** (onboarding: a unit is wired up and its
+    chain + safety ceiling characterised *before* any signal is measured). It is
+    validated by the **curve-independent** subset of the checks
+    (`validate_chain_structure`): plane topology, each derived hop (inline `delta_db`
+    or a catalog `component` and its frequency table), the operating plane's
+    existence, limit plane references, and that a ceiling is *declared*. Curve-based
+    checks (operating-plane usability, a *derivable* ceiling) simply have nothing to
+    run on yet, and nothing can transmit until a signal is added — `resolve` raises
+    `SignalNotCalibrated` for an absent signal — so persisting the skeleton is safe.
+    The success response's per-signal summary is then empty (`{}`).
 - **Discipline that keeps it from rotting:** the area accepts arbitrary *data* files,
   but every *kind* earns a small schema/validator when it's introduced (calibration
   is the first). No executable uploads; a computed calibration is expressed as a

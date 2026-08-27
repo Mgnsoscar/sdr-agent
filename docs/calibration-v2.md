@@ -215,13 +215,17 @@ so there is no version gate anywhere. As implemented:
     { "plane": "antenna_eirp", "max_dbm": 30.0, "reason": "regulatory EIRP",
       "delta_db_by_freq": [[1.1e9,2.8],[1.6e9,3.19]] }   // summed delta from the shared anchor
   ],
-  "center_freq_hz": 1.575e9            // representative frequency (present only for a freq-dependent chain)
+  "center_freq_hz": 1.575e9            // representative frequency (on a freq-dependent chain; derived when the signal omits it)
 }
 ```
 
 The agent's representative frequency (for folding `curve` / bounds) is the task's
 `SDR_CAL_FREQ_HZ` env when set (the client sources it from the script's
-`CAL_FREQ_PARAM`), else the signal's `center_freq_hz`.
+`CAL_FREQ_PARAM`), else the signal's `center_freq_hz`, else — when the signal declares
+none on a frequency-dependent chain — a representative one the resolver derives (the
+tightest-ceiling breakpoint under a frequency-dependent safety limit, else the breakpoint
+midpoint). Either way the artifact carries the chosen `center_freq_hz`, so a v1 script
+that folds no frequency of its own uses that safe representative value.
 
 ### 5.3 `PowerMap` v2 (script-side)
 
@@ -293,6 +297,16 @@ a frequency-dependent chain).
   increasing freq). Where a single representative frequency is available it additionally
   resolves end-to-end at the **endpoints of each passive table's span**, catching a chain
   that only breaks at some frequencies.
+- **Partial measured stages (`_build_planes`).** A chain may carry more than one measured
+  stage (e.g. `sdr_output` then `amplifier_output`), but you needn't measure every signal
+  at every one. When a signal has **no curve for a measured stage that isn't the first**,
+  that stage is resolved as a *transparent +0 dB hop* from the stage before it, so the
+  signal inherits the nearest upstream measured curve instead of failing — you can add a
+  downstream measured plane for a signal or two without re-measuring all thirty. The
+  **first** stage has nothing to inherit, so a missing source curve stays a hard error. The
+  synthetic hop contributes 0 dB and is omitted from the artifact's `passive_hops`; the
+  amp-protection ceiling still binds on its own measured plane, so the fallback never
+  loosens safety.
 
 ---
 
@@ -355,9 +369,16 @@ Each stage is shippable and leaves the system working (v1 docs valid throughout)
   spline stays a future option that needs no schema change.
 - A per-signal **`center_freq_hz`** is the *representative* frequency: it both drives the
   editor's bounds preview **and** is the frequency the agent folds the v1-compat artifact
-  `curve` / scalar ceiling at. It is **required** for a signal whose operating/limit
-  chain passes through a frequency-dependent component (else resolution refuses), and
-  ignored for constant chains.
+  `curve` / scalar ceiling at. It is **optional** even on a frequency-dependent chain — the
+  real transmit frequency is a runtime quantity the task supplies via `--freq` /
+  `CAL_FREQ_PARAM` (`SDR_CAL_FREQ_HZ`), and a v2 consumer re-folds at that live frequency.
+  When it is absent the resolver derives a representative one (agent ≥ 1.7.1): the
+  **tightest-ceiling breakpoint** when the chain carries a frequency-dependent *safety
+  limit* (so a v1 script that folds no frequency of its own can never exceed a per-frequency
+  limit), else the midpoint of the chain's frequency breakpoints. Setting it pins the
+  preview / v1 fold to one frequency. It is ignored for constant chains. (A ≤ 1.7.0 agent
+  still *requires* it on a frequency-dependent chain; the client gates the blank field on
+  the `calibration-freq-optional-center` capability.)
 
 ## 11. Implementation status
 
@@ -371,7 +392,9 @@ Each stage is shippable and leaves the system working (v1 docs valid throughout)
   `freq_dependent_limits`, `center_freq_hz`) **additively** — a v2 consumer detects them
   by the presence of `passive_hops`, so no version gate is needed anywhere. Wired into
   `config.CALIBRATION_COMPONENTS`, `process_manager` injection, and the `/calibration`
-  validate/dry-run endpoints. All v1 documents resolve byte-identically. Covered by
+  validate/dry-run endpoints. All v1 documents resolve byte-identically. **Partial
+  measured stages** (§7): a signal missing the curve for a non-first measured stage
+  inherits the nearest upstream measured curve via a synthetic transparent hop. Covered by
   `tests/test_calibration_v2.py`.
 - **Stage 2 (script/runtime) — done.** `paramkit/calkit.py`: `PowerMap` folds the
   `passive_hops` at the frequency the script passes to `gain_for_power` / `power_for_gain`
@@ -383,10 +406,14 @@ Each stage is shippable and leaves the system working (v1 docs valid throughout)
   (`config.CAL_FREQ_HZ_ENV`, threaded through `resolve_public`). Covered by
   `tests/test_calkit.py`, including a cross-check that `PowerMap` agrees with the agent
   resolver at every frequency.
-  - *Remaining, and deferred to when a script actually adopts it:* a transmit script
-    declaring `CAL_FREQ_PARAM` and passing that value to `PowerMap` (and the client
-    setting `SDR_CAL_FREQ_HZ` from it — Stage 3). No committed script uses `PowerMap`
-    yet, so there is nothing to port; the consumer contract is ready for the first one.
+  - **Script adoption — done for the frequency-swept signals.** `fm_chirp_tx.py` and
+    `cw_tx.py` declare `CAL_FREQ_PARAM = "freq"` and pass their transmit frequency to
+    `PowerMap.gain_for_power` / `power_for_gain`. The chirp's `--freq` is live, so a
+    retune re-maps the held target `--power` at the new frequency (a raw `--gain`
+    override drops the held target so it isn't re-applied). The static extractor surfaces
+    the declared param as `calibration_freq_param` in `/scripts/{name}/params` (agent
+    1.7.2). Other frequency-fixed signals can adopt the same two-line pattern when their
+    chain becomes frequency-dependent.
 - **Stage 3 (client) — mostly done.** `sdr-client`: a `ComponentCatalog` (the client's
   canonical library; VNA-sweep paste, validation, the `components.yaml` wire format), a
   **Component library** editor dialog, and the Calibration tab's chain now offers a
@@ -397,6 +424,34 @@ Each stage is shippable and leaves the system working (v1 docs valid throughout)
   validated `components.yaml` (agent `CALIBRATION_COMPONENTS` → `DATA_DIR/components.yaml`,
   validated on upload) — so "deploy the catalog" reuses the calibration.json path rather
   than a new fleet-config channel.
+  The Calibration tab was since rebuilt as the mockup's **chain-flow builder**: a
+  left-to-right flow of stage cards (drag-to-reorder via the grip, or the ◀▶ handles), a
+  per-stage detail pane (a frequency-response plot for a passive stage, the per-signal
+  curve grids for a measured one), the resolved Signals table, and the Component library
+  grid. The source stage is pinned (never removable); a signal can be removed from its
+  expanded editor; a measured stage left unmeasured for a signal shows that it inherits
+  the previous stage (the partial-measured-stage fallback above).
+  - **Form re-fold — done.** The Run… dialog and the sequence step editor re-fold a
+    signal's `--power` / `--gain` range at the frequency the operator enters, so the
+    displayed range is the range at THAT frequency (a frequency-dependent chain's range
+    moves with frequency). The `/calibration` view's per-signal summary carries the full
+    resolved `artifact` (agent 1.7.2), and `state/power_fold.py` (`PowerFold`) re-folds it
+    client-side — a deliberate mirror of `calkit.PowerMap`, so the form shows exactly what
+    the script will map. Wiring: the form reads the script's `calibration_freq_param`,
+    folds on a committed frequency change (preset pick / Enter / focus-out, never per
+    keystroke), and degrades to the resolved representative range against an older agent
+    that doesn't embed the artifact. Covered by `tests/test_power_fold.py` and
+    `tests/test_param_form_freq_refold.py`.
+  - **Clamp warning across a sequence — done.** A tune step can move the frequency to a
+    point where the running `--power` can't be delivered (the runtime clamps it safely, but
+    then delivers less than the number says). The sequence step editor carries the
+    effective `--freq` / `--power` forward from the task's deployed args through the earlier
+    same-task steps (`timeline_model.sequence_effective_values`), folds the step's `--power`
+    range at that effective frequency (even when the step doesn't set `--freq` itself), and
+    shows a **warning — never a block** (`power_fold.clamp_warning`) when the effective power
+    exceeds the achievable range there. The live-tune dialog re-folds and warns the same way
+    as you tune a running task. Covered by `tests/test_sequence_effective_values.py` and the
+    fold tests above.
   - *Remaining:* the client setting `SDR_CAL_FREQ_HZ` on a task from the script's
-    `CAL_FREQ_PARAM` (task-creation wiring), and the visual chain-flow polish from the
-    mockup. The resolver/consumer already handle everything behind it.
+    `CAL_FREQ_PARAM` (task-creation wiring) — with the script now reading its own `--freq`,
+    this only pins the agent's representative fold for the v1-compat scalar read-outs.

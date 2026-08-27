@@ -26,10 +26,25 @@ constants, byte-identical to the previous behaviour.
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
 from typing import Optional
 
 CALIBRATION_FILE_ENV = "SDR_CALIBRATION_FILE"
+
+# Amplitudes are authored numbers in [0, 1]; treat anything within this of the script's
+# fixed amplitude as "the same amplitude" (guards float noise, not a real difference).
+AMPLITUDE_MATCH_TOL = 1e-6
+
+log = logging.getLogger("calkit")
+
+
+class NoAbsoluteScale(Exception):
+    """Raised when a caller asks for an absolute-power (dBm) conversion but the signal is
+    not calibrated on this unit — there is no baked dBm fallback. A script maps --power only
+    on a real measured curve; uncalibrated it runs on a relative gain, never on invented
+    power levels."""
 
 
 def _interp(x: float, xs: list, ys: list) -> float:
@@ -67,7 +82,8 @@ class PowerMap:
     limits (the ceiling itself may tighten with frequency)."""
 
     def __init__(self, gains, powers, min_gain_db, ceiling_const, amplitude,
-                 source, label, hops=(), freq_limits=(), center_freq=None):
+                 source, label, hops=(), freq_limits=(), center_freq=None,
+                 gain_step_db=None):
         if not gains or len(gains) != len(powers):
             raise ValueError("calibration curve is empty or malformed")
         # keep gain-sorted; agent guarantees strict monotonicity, verify defensively
@@ -83,6 +99,12 @@ class PowerMap:
         self.amplitude = float(amplitude)
         self.source = source                 # human tag: where the map came from
         self.label = label                   # what --power means (quantity, at plane)
+        self.warning = None                  # set when a calibration was rejected (see load)
+        self.has_absolute = True             # a real dBm↔gain scale (False = uncalibrated)
+        # Hardware gain step (dB): the SDR only settles on a discrete gain grid, so the
+        # commanded gain is snapped to the nearest grid point (never above the ceiling), and
+        # the reported power reflects that actual gain. None/0 = continuous (no snapping).
+        self._gain_step = float(gain_step_db) if gain_step_db and float(gain_step_db) > 0 else None
         # v2 frequency machinery ((freqs, deltas) per passive hop; per-limit tables).
         self._hops = [([float(f) for f, _ in t], [float(d) for _, d in t]) for t in hops]
         self._freq_limits = [
@@ -111,32 +133,65 @@ class PowerMap:
             cap = min(cap, self._invert(max_dbm - _table_at(fs, ds, freq)))
         return cap
 
+    def _snap(self, gain: float, freq: Optional[float]) -> float:
+        """Clamp ``gain`` to [min, ceiling(freq)] and, when a hardware gain step is set,
+        snap it to the nearest step on that grid — but NEVER above the ceiling (floor to the
+        grid there) so quantisation can't push past a safety limit."""
+        lo, hi = self.min_gain_db, self._ceiling(freq)
+        step = self._gain_step
+        if not step:
+            return min(max(float(gain), lo), hi)
+        g = round(float(gain) / step) * step
+        if g > hi:                       # rounding up must not breach the ceiling
+            g = math.floor(hi / step) * step
+        if g < lo:
+            g = math.ceil(lo / step) * step
+        return round(g, 6)
+
     # ── the two functions the script calls ──────────────────────────────────────
     def gain_for_power(self, delivered_dbm: float, freq: Optional[float] = None) -> float:
         """Commanded gain (dB) for a requested power at ``freq`` (defaults to the
         artifact's representative frequency), clamped to [min, ceiling(freq)]. Upward is
         clamped to the ceiling, never extrapolated past it."""
+        if not self.has_absolute:
+            raise NoAbsoluteScale(
+                "this signal is not calibrated on this unit — absolute --power (dBm) has "
+                "no meaning here; provide --gain (raw dB) instead")
         f = self._eff(freq)
         g = self._invert(float(delivered_dbm) - self._op_delta(f))
-        return min(max(g, self.min_gain_db), self._ceiling(f))
+        return self._snap(g, f)
 
     def power_for_gain(self, gain_db: float, freq: Optional[float] = None) -> float:
-        """Delivered power (dBm) at the operating plane for an (actual) gain at ``freq``."""
+        """Delivered power (dBm) at the operating plane for an (actual) gain at ``freq``.
+        The gain is snapped to the hardware grid first, so the reported power reflects what
+        the SDR really settles on."""
+        if not self.has_absolute:
+            raise NoAbsoluteScale("uncalibrated: no absolute power scale for this signal")
         f = self._eff(freq)
-        g = min(max(float(gain_db), self.min_gain_db), self._ceiling(f))
+        g = self._snap(float(gain_db), f)
         return _interp(g, self._gains, self._powers) + self._op_delta(f)
 
     @property
     def max_gain_db(self) -> float:
-        return self._ceiling(self._center_freq)
+        return self._snap(self._ceiling(self._center_freq), self._center_freq)
 
     @property
-    def max_power_dbm(self) -> float:
-        return self.power_for_gain(self.max_gain_db)
+    def max_power_dbm(self):
+        """Top of the delivered-power range, or None when uncalibrated (no dBm scale)."""
+        return self.power_for_gain(self.max_gain_db) if self.has_absolute else None
 
     @property
-    def min_power_dbm(self) -> float:
-        return self.power_for_gain(self.min_gain_db)
+    def min_power_dbm(self):
+        return self.power_for_gain(self.min_gain_db) if self.has_absolute else None
+
+    def power_field_kwargs(self) -> dict:
+        """paramkit ``.number()`` bounds for a script's --power field: min/max/default from the
+        resolved calibration range, or ``{}`` (unbounded, no default) when uncalibrated — so an
+        uncalibrated script offers no baked dBm scale, only a relative --gain."""
+        if not self.has_absolute:
+            return {}
+        return {"min": round(self.min_power_dbm, 2), "max": round(self.max_power_dbm, 2),
+                "default": round(self.max_power_dbm, 2)}
 
     @property
     def freq_dependent(self) -> bool:
@@ -157,6 +212,29 @@ class PowerMap:
                    source="baked defaults", label=label)
 
     @classmethod
+    def uncalibrated(cls, min_gain_db, max_gain_db, amplitude) -> "PowerMap":
+        """A gain-only map for when NO calibration is injected: it carries the gain limits
+        (so a relative gain still clamps to a safe range) but has NO absolute dBm scale.
+        ``gain_for_power`` / ``power_for_gain`` refuse (:class:`NoAbsoluteScale`), the power
+        range is None, and ``power_field_kwargs`` is empty. Replaces the old baked slope-1
+        fallback — an uncalibrated script never invents dBm levels."""
+        self = cls.__new__(cls)
+        self._gains = [float(min_gain_db), float(max_gain_db)]
+        self._powers = []
+        self.min_gain_db = float(min_gain_db)
+        self._ceiling_const = float(max_gain_db)
+        self.amplitude = float(amplitude)
+        self.source = "uncalibrated"
+        self.label = "raw gain only (no calibration)"
+        self.warning = None
+        self._hops = []
+        self._freq_limits = []
+        self._center_freq = None
+        self._gain_step = None
+        self.has_absolute = False
+        return self
+
+    @classmethod
     def from_artifact(cls, art: dict, fallback_amplitude: float) -> "PowerMap":
         """Build from the agent's resolved artifact dict — v2 (anchor_curve +
         passive_hops) when present, else the v1 flat curve."""
@@ -166,6 +244,7 @@ class PowerMap:
         quantity = art.get("quantity") or "power"
         label = f"{quantity}, at {plane}" if plane else quantity
 
+        step = art.get("gain_step_db")
         anchor = art.get("anchor_curve")
         if anchor:                                    # v2: fold passive hops at frequency
             gains = [pt[0] for pt in anchor]
@@ -179,20 +258,28 @@ class PowerMap:
             return cls(gains, powers, art.get("min_gain_db"), ceiling_const, amp,
                        source="calibration file", label=label,
                        hops=hops, freq_limits=freq_limits,
-                       center_freq=art.get("center_freq_hz"))
+                       center_freq=art.get("center_freq_hz"), gain_step_db=step)
 
         curve = art.get("curve") or []                # v1: pre-flattened operating curve
         gains = [pt[0] for pt in curve]
         powers = [pt[1] for pt in curve]
         return cls(gains, powers, art.get("min_gain_db"), art.get("max_gain_db"), amp,
-                   source="calibration file", label=label)
+                   source="calibration file", label=label, gain_step_db=step)
 
     @classmethod
     def load(cls, baked: "PowerMap", env_var: str = CALIBRATION_FILE_ENV) -> "PowerMap":
         """Return the injected calibration map if ``$SDR_CALIBRATION_FILE`` is set,
         else ``baked``. A path that is set but unreadable/malformed raises — the agent
         only ever writes a valid artifact, so a broken one is a real error, not a
-        reason to silently fall back to a different power scale."""
+        reason to silently fall back to a different power scale.
+
+        Amplitude gate: the script transmits at a FIXED baseband amplitude
+        (``baked.amplitude``) and the calibration is only valid at the amplitude it was
+        measured at (the artifact's ``amplitude``). If they differ, the calibrated dBm↔gain
+        mapping no longer describes this script — so the calibration is REJECTED: the baked
+        (uncalibrated) map is returned with a loud ``warning`` and a logged WARNING, never a
+        silent switch to a mismatched power scale. Re-calibrating at the script's amplitude
+        restores it."""
         path = os.environ.get(env_var)
         if not path:
             return baked
@@ -201,6 +288,15 @@ class PowerMap:
                 art = json.load(fh)
         except (OSError, ValueError) as exc:
             raise ValueError(f"{env_var}={path} could not be read: {exc}") from exc
+        art_amp = art.get("amplitude")
+        if art_amp is not None and abs(float(art_amp) - baked.amplitude) > AMPLITUDE_MATCH_TOL:
+            baked.warning = (
+                f"calibration IGNORED — it was measured at amplitude {float(art_amp):g}, but "
+                f"this script transmits at {baked.amplitude:g}; its calibrated power is no "
+                f"longer valid. Running UNCALIBRATED. Re-run calibration at amplitude "
+                f"{baked.amplitude:g} to restore it.")
+            log.warning("%s", baked.warning)
+            return baked
         return cls.from_artifact(art, fallback_amplitude=baked.amplitude)
 
     def describe(self) -> str:

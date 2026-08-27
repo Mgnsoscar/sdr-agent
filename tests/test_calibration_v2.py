@@ -100,9 +100,26 @@ def test_frequency_outside_table_clamps_to_the_end():
     assert above == pytest.approx(28.0)
 
 
-def test_freq_dependent_chain_without_center_freq_refuses():
-    with pytest.raises(CalibrationError, match="center_freq_hz"):
-        _resolve(_doc(cable="cable_fdep", antenna="ant_fdep", center_freq_hz=None))
+def test_freq_dependent_chain_without_center_freq_uses_midpoint():
+    # The transmit frequency is a runtime quantity (the task's --freq), so an absent
+    # center_freq_hz is not an error: with no frequency-dependent SAFETY limit the
+    # operating point is folded at the midpoint of the chain's frequency breakpoints.
+    r = _resolve(_doc(cable="cable_fdep", antenna="ant_fdep", center_freq_hz=None))
+    assert r.power_for_gain(74.0) == pytest.approx(24 + (-2.5) + 6.0)   # folded at 1.5 GHz
+    assert r.to_public_dict()["center_freq_hz"] == pytest.approx(1.5e9)
+
+
+def test_freq_dependent_limit_without_center_freq_picks_worst_case():
+    # With a frequency-dependent regulatory cap and no center_freq_hz, a v1 script folds
+    # the flat ceiling here, so the representative frequency must be the one whose ceiling
+    # is TIGHTEST — 2.0 GHz (gain 70) rather than 1.0 GHz (gain 72) — so the fallback can
+    # never exceed the per-frequency limit.
+    limits = [{"plane": "sdr_output", "max_dbm": -2.5, "reason": "amp"},
+              {"plane": "antenna_eirp", "max_dbm": 26.0, "reason": "EIRP cap"}]
+    r = _resolve(_doc(cable="cable_fdep", antenna="ant_fdep", center_freq_hz=None,
+                      limits=limits))
+    assert r.max_gain_db == pytest.approx(70.0)                         # worst case (2 GHz)
+    assert r.to_public_dict()["center_freq_hz"] == pytest.approx(2.0e9)
 
 
 def test_amp_protection_ceiling_is_frequency_independent():
@@ -193,6 +210,17 @@ def test_validate_document_reports_per_signal_summary():
     assert summary["sig"]["max_power_dbm"] == pytest.approx(27.0)
 
 
+def test_summary_carries_the_resolved_artifact_for_client_refold():
+    # The per-signal summary embeds the full artifact (v2 anchor + passive hops) so the
+    # client can re-fold the --power range at the operator's chosen frequency.
+    summary = validate_document(_doc(cable="cable_fdep", antenna="ant_fdep",
+                                     center_freq_hz=1.0e9), None, COMPONENTS)
+    art = summary["sig"]["artifact"]
+    assert art["anchor_curve"][-1] == [74.0, 24.0]
+    hops = {h["plane"]: h for h in art["passive_hops"]}
+    assert hops["cable_output"]["delta_db_by_freq"] == [[1.0e9, -2.0], [2.0e9, -3.0]]
+
+
 def test_validate_document_flags_unknown_component():
     with pytest.raises(CalibrationError, match="unknown component"):
         validate_document(_doc(cable="nope", antenna="ant_flat"), None, COMPONENTS)
@@ -216,6 +244,72 @@ def test_load_components_malformed_raises(tmp_path):
     p.write_text("{ not json", encoding="utf-8")
     with pytest.raises(CalibrationError, match="not valid"):
         cal.load_components(p)
+
+
+# ── partial measured stages (a signal measured only at an earlier stage) ─────────
+
+def _two_measured_doc(sig_curves, operating="amplifier_output", cable=None, antenna=None):
+    """A chain with two measured stages (sdr_output → amplifier_output), optionally a
+    passive cable/antenna after them. `sig_curves` is the one signal's curves dict."""
+    planes = {
+        "sdr_output":       {"type": "measured", "quantity": "total in-band power"},
+        "amplifier_output": {"type": "measured", "quantity": "main-lobe power"},
+    }
+    if cable:
+        planes["cable_output"] = {"type": "derived", "from": "amplifier_output",
+                                  "component": cable}
+    if antenna:
+        planes["antenna_eirp"] = {"type": "derived", "from": "cable_output",
+                                  "component": antenna, "quantity": "EIRP"}
+    return {
+        "schema_version": 1, "unit_type": "broadcaster",
+        "chain": {
+            "gain_limits": {"min_gain_db": 0.0, "max_gain_db": 89.75},
+            "operating_plane": operating,
+            "limits": [{"plane": "sdr_output", "max_dbm": -2.5, "reason": "amp P1dB"}],
+            "planes": planes,
+        },
+        "signals": {"sig": {"amplitude": 0.8, "curves": sig_curves}},
+    }
+
+
+def test_signal_measured_at_both_stages_uses_its_own_downstream_curve():
+    doc = _two_measured_doc({"sdr_output": {"points": _pts(SDR_POINTS)},
+                             "amplifier_output": {"points": _pts(AMP_POINTS)}})
+    r = _resolve(doc)
+    assert r.power_for_gain(74.0) == pytest.approx(24.0)   # amp curve, unchanged
+
+
+def test_signal_measured_only_upstream_falls_back_to_that_curve():
+    # amplifier_output is the operating plane but this signal was measured only at
+    # sdr_output → it inherits the sdr curve instead of failing.
+    doc = _two_measured_doc({"sdr_output": {"points": _pts(SDR_POINTS)}})
+    r = _resolve(doc)
+    assert r.power_for_gain(74.0) == pytest.approx(-2.5)   # sdr curve, inherited
+    assert r.max_gain_db == pytest.approx(74.0)            # amp-protection limit still binds
+
+
+def test_fallback_through_passive_hops_uses_upstream_anchor():
+    # Operating at the antenna, but the signal is measured only at sdr_output. EIRP folds
+    # cable+antenna onto the inherited sdr curve; the synthetic amp hop is invisible.
+    doc = _two_measured_doc({"sdr_output": {"points": _pts(SDR_POINTS)}},
+                            operating="antenna_eirp", cable="cable_flat", antenna="ant_flat")
+    r = _resolve(doc)
+    # EIRP @74 = sdr(-2.5) + cable(-1.8) + antenna(+6.0) = 1.7
+    assert r.power_for_gain(74.0) == pytest.approx(1.7)
+    art = r.to_public_dict()
+    assert art["anchor_curve"][-1] == [74.0, -2.5]         # the inherited sdr curve
+    hops = [h["plane"] for h in art["passive_hops"]]
+    assert hops == ["cable_output", "antenna_eirp"]        # no fallback amp hop listed
+
+
+def test_latent_source_stage_still_refuses():
+    # The FIRST stage has nothing upstream to inherit, so a signal with no source curve
+    # is a hard error (not silently resolved).
+    doc = _two_measured_doc({"amplifier_output": {"points": _pts(AMP_POINTS)}},
+                            operating="sdr_output")
+    with pytest.raises(CalibrationError, match="no measured curve"):
+        _resolve(doc)
 
 
 def test_resolve_public_with_catalog_file(tmp_path):
