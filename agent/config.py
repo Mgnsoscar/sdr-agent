@@ -203,7 +203,14 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # same fold calkit does at transmit — instead of showing only the representative-frequency
 # range. Purely additive; a client gates the re-fold on the calibration-summary-artifact
 # capability below.
-AGENT_VERSION = "1.7.2"
+# 1.7.3 emits the v2 artifact fields (anchor_curve / passive_hops / freq_dependent_limits /
+# gain_ceiling_db / center_freq_hz) whenever the operating point moves with frequency — not
+# only when the operating plane sits behind passive hops, but also when a frequency-dependent
+# safety LIMIT tightens the ceiling per frequency while the operating plane is MEASURED (no
+# hops). Without this the artifact was v1-only in that topology and a consumer (the client's
+# form re-fold, or a v2 script) couldn't track the max power as the frequency changed, even
+# though it really moves. Purely additive; no new capability.
+AGENT_VERSION = "1.7.3"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list

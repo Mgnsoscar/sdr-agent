@@ -252,9 +252,13 @@ class ResolvedCalibration:
 
         Always carries the v1 fields (``curve`` folded at the representative frequency,
         gain clamps, amplitude, quantity) so existing scripts keep working unchanged.
-        When the operating plane sits behind passive hops it ALSO carries the v2 fields
-        (``anchor_curve``, ``passive_hops``, the split ceiling) so a frequency-aware
-        consumer can re-fold at its live transmit frequency (docs/calibration-v2.md)."""
+        When the operating point moves with frequency — the operating plane sits behind
+        passive hops, OR a frequency-dependent safety limit tightens the ceiling per
+        frequency — it ALSO carries the v2 fields (``anchor_curve``, ``passive_hops``, the
+        split ceiling) so a frequency-aware consumer can re-fold at its live transmit
+        frequency (docs/calibration-v2.md). A frequency-dependent limit alone (with a
+        MEASURED operating plane, so no passive hops) still needs these: the max power moves
+        with frequency even though the operating curve doesn't."""
         out = {
             "schema_version": SCHEMA_VERSION,
             "signal_id": self.signal_id,
@@ -271,7 +275,7 @@ class ResolvedCalibration:
         if self._gain_step:
             out["gain_step_db"] = self._gain_step
         hops = self.passive_hops()
-        if hops:
+        if hops or self._freq_limits:
             out["anchor_curve"] = self.anchor_curve()
             out["passive_hops"] = hops
             # Each frequency-dependent limit carries its own summed delta from the shared

@@ -148,6 +148,22 @@ def test_regulatory_cap_on_passive_plane_moves_with_frequency():
 
 # ── artifact ─────────────────────────────────────────────────────────────────────
 
+def test_artifact_emits_v2_for_freq_limit_even_with_measured_operating_plane():
+    # Operating plane is MEASURED (amplifier_output) so there are no passive hops, but a
+    # frequency-dependent EIRP limit downstream tightens the ceiling per frequency — the
+    # max power moves with frequency, so the artifact must still export the v2 fields for a
+    # consumer (the client form re-fold, or a v2 script) to track it.
+    limits = [{"plane": "sdr_output", "max_dbm": -2.5, "reason": "amp"},
+              {"plane": "antenna_eirp", "max_dbm": 26.0, "reason": "EIRP cap"}]
+    r = _resolve(_doc(cable="cable_fdep", antenna="ant_fdep", center_freq_hz=1.5e9,
+                      operating="amplifier_output", limits=limits))
+    art = r.to_public_dict()
+    assert art["passive_hops"] == []                     # measured operating plane, no hops
+    assert art["anchor_curve"][-1] == [74.0, 24.0]       # the operating plane's own curve
+    fdl = {l["plane"]: l for l in art["freq_dependent_limits"]}
+    assert "antenna_eirp" in fdl and fdl["antenna_eirp"]["delta_db_by_freq"]
+
+
 def test_artifact_carries_v1_curve_and_v2_fields():
     r = _resolve(_doc(cable="cable_fdep", antenna="ant_fdep", center_freq_hz=1.5e9))
     art = r.to_public_dict()
