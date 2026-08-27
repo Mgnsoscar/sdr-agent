@@ -240,6 +240,20 @@ class ResolvedCalibration:
                 for name, d in _hops(self.operating_plane, self._planes)
                 if not d.fallback]
 
+    def _limit_anchor_curve(self, plane_name: str) -> Optional[list]:
+        """The measured LIMITING curve a frequency-dependent limit inverts against, when it
+        differs from the operating plane's own (observed) anchor — i.e. a REPORTED operating
+        plane, whose observed curve isn't the one the limit gauges on. Returned as a flat
+        ``[[gain, power], …]`` so a consumer inverts the limit against it directly. None when
+        the limit shares the operating anchor (the shared ``anchor_curve`` already serves).
+        The limit's ``delta_db_by_freq`` is valid against this curve too: a reported node and
+        its limiting node are 0 dB apart, so the passive delta from either is identical."""
+        op_anchor = _anchor_plane(self.operating_plane, self._planes)
+        lim_anchor = _anchor_plane(plane_name, self._planes, for_limit=True)
+        if lim_anchor is op_anchor:
+            return None
+        return [[g, lim_anchor.power_at(g)] for g in lim_anchor.gains]
+
     def _plane_delta_table(self, plane_name: str) -> list:
         """The TOTAL passive delta from the measured anchor out to ``plane_name`` as one
         ``[[freq, delta], …]`` table (all its hops summed). A consumer inverts a limit on
@@ -252,9 +266,13 @@ class ResolvedCalibration:
 
         Always carries the v1 fields (``curve`` folded at the representative frequency,
         gain clamps, amplitude, quantity) so existing scripts keep working unchanged.
-        When the operating plane sits behind passive hops it ALSO carries the v2 fields
-        (``anchor_curve``, ``passive_hops``, the split ceiling) so a frequency-aware
-        consumer can re-fold at its live transmit frequency (docs/calibration-v2.md)."""
+        When the operating point moves with frequency — the operating plane sits behind
+        passive hops, OR a frequency-dependent safety limit tightens the ceiling per
+        frequency — it ALSO carries the v2 fields (``anchor_curve``, ``passive_hops``, the
+        split ceiling) so a frequency-aware consumer can re-fold at its live transmit
+        frequency (docs/calibration-v2.md). A frequency-dependent limit alone (with a
+        MEASURED operating plane, so no passive hops) still needs these: the max power moves
+        with frequency even though the operating curve doesn't."""
         out = {
             "schema_version": SCHEMA_VERSION,
             "signal_id": self.signal_id,
@@ -271,16 +289,21 @@ class ResolvedCalibration:
         if self._gain_step:
             out["gain_step_db"] = self._gain_step
         hops = self.passive_hops()
-        if hops:
+        if hops or self._freq_limits:
             out["anchor_curve"] = self.anchor_curve()
             out["passive_hops"] = hops
             # Each frequency-dependent limit carries its own summed delta from the shared
             # anchor, so a consumer inverts it against the same anchor_curve at the live
             # frequency (no plane model needed script-side).
-            out["freq_dependent_limits"] = [
-                {"plane": p, "max_dbm": mx, "reason": rs,
-                 "delta_db_by_freq": self._plane_delta_table(p)}
-                for p, mx, rs in self._freq_limits]
+            fdl = []
+            for p, mx, rs in self._freq_limits:
+                entry = {"plane": p, "max_dbm": mx, "reason": rs,
+                         "delta_db_by_freq": self._plane_delta_table(p)}
+                lac = self._limit_anchor_curve(p)     # its own limiting curve, if it differs
+                if lac is not None:
+                    entry["anchor_curve"] = lac       # invert THIS limit against this curve
+                fdl.append(entry)
+            out["freq_dependent_limits"] = fdl
             if self._gain_ceiling_const != float("inf"):
                 out["gain_ceiling_db"] = self._gain_ceiling_const
             if self._freq_hz is not None:
@@ -617,31 +640,24 @@ def resolve(unit_doc: dict,
         raise CalibrationError("no safety ceiling derivable — refusing to transmit")
     gain_ceiling_const = min(const_caps) if const_caps else float("inf")
 
-    # A frequency-dependent limit is inverted at runtime against the OPERATING plane's
-    # measured anchor (one shared anchor_curve in the artifact). Downstream passive
-    # limits always share that anchor; guard the unusual topology where they wouldn't.
+    # A frequency-dependent limit is inverted at runtime against a measured anchor curve.
+    # The common case shares the operating plane's own anchor. When the operating plane is
+    # REPORTED, its observed anchor (the reported curve) differs from the curve the limit
+    # gauges on (the limiting curve) — but they are the same physical node, so the limit
+    # still inverts cleanly against its own limiting curve, which the artifact publishes
+    # per-limit (to_public_dict). Only refuse when the limit resolves through a genuinely
+    # DIFFERENT measured plane than the operating one (no shared base for its delta).
     if freq_limits:
-        op_anchor = _anchor_plane(operating_plane, planes)            # observed anchor curve
+        op_anchor = _anchor_plane(operating_plane, planes)                    # observed anchor
+        op_lim_anchor = _anchor_plane(operating_plane, planes, for_limit=True)  # its limiting curve
         for plane, _mx, _rs in freq_limits:
-            lim_anchor = _anchor_plane(plane, planes, for_limit=True)  # the limiting curve
-            if lim_anchor is not op_anchor:
-                # A v2 script re-folds a frequency-dependent limit against the operating
-                # plane's published anchor_curve. That only works when the limit gauges on
-                # the same measured curve the operating plane anchors on. A reported
-                # operating plane anchors on its own (reported) curve while the limit
-                # gauges on the limiting one, so the two differ — refuse rather than
-                # publish a mis-referenced delta.
-                if op_anchor.is_reported or _anchor_plane(operating_plane, planes,
-                                                          for_limit=True) is lim_anchor:
-                    raise CalibrationError(
-                        f"frequency-dependent limit on {plane!r} gauges on a 'limiting' "
-                        f"curve, but the operating plane {operating_plane!r} reports on a "
-                        f"different curve; frequency-dependent limits combined with a "
-                        f"'reported' operating plane aren't supported yet")
-                raise CalibrationError(
-                    f"frequency-dependent limit on {plane!r} resolves through a different "
-                    f"measured plane than the operating plane {operating_plane!r}; this "
-                    f"topology isn't supported")
+            lim_anchor = _anchor_plane(plane, planes, for_limit=True)         # the limiting curve
+            if lim_anchor is op_anchor or lim_anchor is op_lim_anchor:
+                continue                                                       # shares a base — OK
+            raise CalibrationError(
+                f"frequency-dependent limit on {plane!r} resolves through a different "
+                f"measured plane than the operating plane {operating_plane!r}; this "
+                f"topology isn't supported")
 
     # A frequency-dependent operating plane or ceiling needs a representative frequency,
     # so the scalar read-outs and the v1-compat artifact curve have a defined operating

@@ -58,6 +58,75 @@ def _doc(operating="main_lobe", planes_extra=None, limits=None, curves_extra=Non
     }
 
 
+# ── Frequency-dependent limit with a reported operating plane (1.7.4) ────────────────
+
+_FREQ_COMP = {"amp_fdep": {"kind": "amplifier",
+                           "delta_db_by_freq": [[1.0e9, 10.0], [2.0e9, 6.0]]}}
+
+
+def _fdep_reported_doc():
+    """Source measured two ways (full-band 'source' limiting + main-lobe 'main_lobe'
+    reported), then a FREQUENCY-DEPENDENT amplifier; the operating plane is the amp output
+    (reads main-lobe EIRP) and the safety limit is the amp's full-band output power."""
+    return {
+        "schema_version": 1, "unit_type": "broadcaster",
+        "chain": {
+            "gain_limits": {"min_gain_db": 0.0, "max_gain_db": 89.75},
+            "operating_plane": "amp_out",
+            "limits": [{"plane": "amp_out", "max_dbm": 5.0, "reason": "amp output"}],
+            "planes": {
+                "source":    {"type": "measured", "role": "limiting",
+                              "quantity": "total in-band power"},
+                "main_lobe": {"type": "measured", "role": "reported", "of": "source",
+                              "quantity": "main-lobe power"},
+                "amp_out":   {"type": "derived", "from": "main_lobe",
+                              "component": "amp_fdep", "quantity": "EIRP"},
+            }},
+        "signals": {"gps": {"amplitude": 0.5, "center_freq_hz": 1.5e9,
+                    "curves": {"source": {"points": _pts(SOURCE_PTS)},
+                               "main_lobe": {"points": _pts(MAINLOBE_PTS)}}}},
+    }
+
+
+def test_reported_operating_plane_with_freq_limit_resolves():
+    # Previously refused ("frequency-dependent limits combined with a 'reported' operating
+    # plane aren't supported yet"). Now it resolves.
+    r = resolve(_fdep_reported_doc(), None, "gps", _FREQ_COMP, freq_hz=1.5e9)
+    assert r.operating_quantity == "EIRP"
+
+
+def test_freq_limit_publishes_its_own_limiting_curve():
+    art = resolve(_fdep_reported_doc(), None, "gps", _FREQ_COMP, freq_hz=1.5e9).to_public_dict()
+    # the operating anchor is the reported (main-lobe) curve …
+    assert art["anchor_curve"][0][1] == pytest.approx(-13.5)       # main_lobe @70
+    fdl = art["freq_dependent_limits"][0]
+    assert fdl["plane"] == "amp_out" and fdl["max_dbm"] == 5.0
+    # … while the limit carries its OWN limiting (full-band source) curve to invert against
+    assert fdl["anchor_curve"][0][1] == pytest.approx(-12.5)       # source @70
+    assert fdl["delta_db_by_freq"] == [[1.0e9, 10.0], [2.0e9, 6.0]]
+
+
+def test_reported_operating_plane_freq_ceiling_moves_with_frequency():
+    lo = resolve(_fdep_reported_doc(), None, "gps", _FREQ_COMP, freq_hz=1.0e9)
+    hi = resolve(_fdep_reported_doc(), None, "gps", _FREQ_COMP, freq_hz=2.0e9)
+    # amp gain 10 dB @1 GHz vs 6 dB @2 GHz → the 5 dBm full-band limit maps to a lower
+    # full-band target (hence more allowed gain) at the higher frequency.
+    assert hi.max_gain_db > lo.max_gain_db
+
+
+def test_freq_limit_through_a_different_measured_plane_still_refuses():
+    # A genuinely different measured base (not the reported/limiting pair of one node) has no
+    # shared delta base, so it stays unsupported.
+    doc = _fdep_reported_doc()
+    doc["chain"]["planes"]["other"] = {"type": "measured", "quantity": "x"}
+    doc["chain"]["planes"]["branch"] = {"type": "derived", "from": "other",
+                                        "component": "amp_fdep"}
+    doc["chain"]["limits"].append({"plane": "branch", "max_dbm": 5.0, "reason": "x"})
+    doc["signals"]["gps"]["curves"]["other"] = {"points": _pts(SOURCE_PTS)}
+    with pytest.raises(CalibrationError, match="different measured plane"):
+        resolve(doc, None, "gps", _FREQ_COMP, freq_hz=1.5e9)
+
+
 # ── The core fix: the amp limit gauges on full-band, --power reports main-lobe ───────
 
 def test_amp_limit_gauges_on_fullband_not_mainlobe():
@@ -172,10 +241,10 @@ def test_invalid_role_is_refused():
         resolve(doc, None, "gps")
 
 
-def test_freq_dependent_limit_with_reported_operating_plane_is_refused():
-    # A frequency-dependent passive hop feeds a v2 re-fold against the operating plane's
-    # published anchor_curve; that path isn't taught the reported→limiting punch-through,
-    # so the combination is refused (clearly) rather than mis-gauged.
+def test_freq_dependent_limit_with_reported_operating_plane_is_supported():
+    # A frequency-dependent limit downstream of a REPORTED operating plane now resolves: the
+    # limit and the operating plane share the same limiting curve (via the reported→limiting
+    # punch-through), which the artifact publishes per-limit so the limit inverts against it.
     components = {"ant": {"delta_db_by_freq": [[1.5e9, 3.0], [1.6e9, 6.0]]}}
     doc = _doc(operating="main_lobe", planes_extra={
         "antenna": {"type": "derived", "from": "cable", "component": "ant",
@@ -184,8 +253,13 @@ def test_freq_dependent_limit_with_reported_operating_plane_is_refused():
         {"plane": "amplifier", "side": "input", "max_dbm": -2.5},
         {"plane": "antenna", "side": "output", "max_dbm": 50.0}]
     doc["signals"]["gps"]["center_freq_hz"] = 1.5754e9
-    with pytest.raises(CalibrationError, match="reported"):
-        resolve(doc, None, "gps", components)
+    r = resolve(doc, None, "gps", components)
+    art = r.to_public_dict()
+    # operating anchor is the reported (main-lobe) curve; the antenna limit publishes its own
+    # limiting (full-band source) curve to invert against.
+    assert art["anchor_curve"][0][1] == pytest.approx(-13.5)       # main_lobe @70
+    ant = next(l for l in art["freq_dependent_limits"] if l["plane"] == "antenna")
+    assert ant["anchor_curve"][0][1] == pytest.approx(-12.5)       # source @70
 
 
 # ── Back-compat: a document with no roles resolves exactly as before ────────────────

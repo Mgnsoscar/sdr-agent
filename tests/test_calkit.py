@@ -131,6 +131,48 @@ def test_powermap_matches_resolver(cable, antenna, center):
             assert pm.gain_for_power(p, freq=f) == pytest.approx(r.gain_for_power(p, freq=f))
 
 
+# ── reported operating plane + freq-dependent limit (per-limit anchor curve) ─────────
+
+def _reported_doc():
+    """Source measured full-band (limiting) + main-lobe (reported) at one node, then a
+    frequency-dependent amplifier; operating plane reads main-lobe EIRP, the limit caps the
+    amp's full-band output. The limit must invert against the full-band curve, not main-lobe."""
+    src = [(40, -6.0), (74, 24.0)]        # full-band power vs gain
+    rep = [(40, -8.0), (74, 21.0)]        # main-lobe (a few dB lower)
+    return {
+        "schema_version": 1, "unit_type": "broadcaster",
+        "chain": {
+            "gain_limits": {"min_gain_db": 0.0, "max_gain_db": 89.75},
+            "operating_plane": "amp_out",
+            "limits": [{"plane": "amp_out", "max_dbm": 5.0, "reason": "amp output"}],
+            "planes": {
+                "source":    {"type": "measured", "role": "limiting", "quantity": "total"},
+                "main_lobe": {"type": "measured", "role": "reported", "of": "source",
+                              "quantity": "main-lobe"},
+                "amp_out":   {"type": "derived", "from": "main_lobe", "component": "amp_fdep",
+                              "quantity": "EIRP"},
+            }},
+        "signals": {"sig": {"amplitude": 0.8, "center_freq_hz": 1.5e9,
+                    "curves": {"source": {"points": _pts(src)},
+                               "main_lobe": {"points": _pts(rep)}}}},
+    }
+
+
+def test_reported_plane_limit_matches_resolver_at_every_frequency():
+    comps = {"amp_fdep": {"kind": "amplifier",
+                          "delta_db_by_freq": [[1.0e9, 10.0], [2.0e9, 6.0]]}}
+    doc = _reported_doc()
+    r = cal.resolve(doc, None, "sig", comps)
+    pm = PowerMap.from_artifact(r.to_public_dict(), fallback_amplitude=0.8)
+    assert pm.freq_dependent
+    for f in (1.0e9, 1.5e9, 2.0e9):
+        # the ceiling (inverting the full-band limit through the SEPARATE limiting curve)
+        # must match the resolver exactly, and the operating point reads main-lobe EIRP.
+        assert pm._ceiling(f) == pytest.approx(r._max_gain_at(f), abs=1e-6)
+        for g in (45.0, 60.0, 70.0):
+            assert pm.power_for_gain(g, freq=f) == pytest.approx(r.power_for_gain(g, freq=f))
+
+
 # ── baked fallback + load ────────────────────────────────────────────────────────
 
 def test_from_linear_baked_unchanged():

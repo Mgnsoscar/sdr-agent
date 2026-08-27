@@ -203,7 +203,22 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # same fold calkit does at transmit — instead of showing only the representative-frequency
 # range. Purely additive; a client gates the re-fold on the calibration-summary-artifact
 # capability below.
-AGENT_VERSION = "1.7.2"
+# 1.7.3 emits the v2 artifact fields (anchor_curve / passive_hops / freq_dependent_limits /
+# gain_ceiling_db / center_freq_hz) whenever the operating point moves with frequency — not
+# only when the operating plane sits behind passive hops, but also when a frequency-dependent
+# safety LIMIT tightens the ceiling per frequency while the operating plane is MEASURED (no
+# hops). Without this the artifact was v1-only in that topology and a consumer (the client's
+# form re-fold, or a v2 script) couldn't track the max power as the frequency changed, even
+# though it really moves. Purely additive; no new capability.
+# 1.7.4 supports a frequency-dependent limit whose OPERATING plane is 'reported' (its observed
+# curve differs from the limiting curve the limit gauges on — same physical node, two
+# quantities, e.g. main-lobe operating point + full-band amp-output limit). Previously refused
+# ("frequency-dependent limits combined with a 'reported' operating plane aren't supported
+# yet"). Now the resolver accepts it and the artifact publishes that limit's own limiting
+# curve (per-limit anchor_curve in freq_dependent_limits) so a consumer inverts the limit
+# against the right curve; calkit (OTA bundle) and the client's PowerFold both honour it. The
+# scalar bounds were always correct; only the save-time refusal and the v2 publish changed.
+AGENT_VERSION = "1.7.4"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -234,6 +249,9 @@ AGENT_CAPABILITIES = [
     "calibration-summary-artifact",      # the /calibration view's per-signal summary carries the
                                          # full resolved artifact, so the client re-folds the
                                          # --power range at the operator's chosen frequency
+    "calibration-freq-limit-reported",   # a frequency-dependent limit is allowed with a
+                                         # 'reported' operating plane: the limit inverts against
+                                         # its own published limiting curve (per-limit anchor)
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
