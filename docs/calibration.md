@@ -195,6 +195,14 @@ amp and the source may climb by the pad while the amp stays protected on full-ba
 // while operating_plane "main_lobe" reports main-lobe power.
 ```
 
+A **frequency-dependent** limit is allowed here too (agent ≥ 1.7.4): when the operating
+plane is `reported`, its observed anchor curve differs from the limiting curve the limit
+gauges on, so the resolved artifact publishes that limit's own limiting curve (a per-limit
+`anchor_curve` in `freq_dependent_limits`) and a consumer inverts the limit against it —
+independent of the operating anchor. (A frequency-dependent limit that resolves through a
+genuinely *different* measured plane than the operating one is still refused: its delta has
+no shared base.)
+
 The validate-on-save summary reports, per limit, the plane and quantity it resolved to
 gauge on (`amp P1dB input → gauged on 'source' (total in-band power)`), so a quantity
 mismatch is visible at save time. `role`/`of` are advertised as the
