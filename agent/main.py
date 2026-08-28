@@ -309,7 +309,11 @@ async def admin_update(bundle: UploadFile = File(...)):
             shutil.copyfileobj(bundle.file, fh)
         # Staging installs deps (can be slow) → run off the event loop.
         to_v = await asyncio.to_thread(up.apply, tmp)
-    except (UpdateError, OSError) as exc:
+    except Exception as exc:   # noqa: BLE001
+        # Any failure — a bad bundle (UpdateError), a filesystem error (OSError), or a
+        # failed restart/deps subprocess (CalledProcessError) — must come back as a
+        # clean ok=False the client can show, never as an unhandled 500. The activate
+        # step, if it ran, left a pending marker, so the confirm timer reverts the unit.
         logger.error("Update failed: %s", exc)
         return UpdateResult(ok=False, from_version=from_v, message=str(exc))
     finally:

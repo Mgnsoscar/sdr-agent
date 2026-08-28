@@ -64,6 +64,30 @@ def test_admin_update_rejects_bad_bundle(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_admin_update_reports_failed_restart_cleanly(tmp_path, monkeypatch):
+    # A failed restart raises subprocess.CalledProcessError from apply(); the endpoint
+    # must return a clean ok=False (not let it escape as an unhandled HTTP 500).
+    import subprocess
+
+    root = tmp_path / "releases"; root.mkdir()
+
+    def boom(_svc):
+        raise subprocess.CalledProcessError(1, ["systemctl", "restart", "sdr-agent"])
+
+    up = Updater(root, tmp_path / "current", service_name="sdr-agent",
+                 deps_install=lambda rel: None, restart=boom)
+    monkeypatch.setattr(main, "_make_updater", lambda: up)
+
+    async def scenario():
+        bundle = UploadFile(filename="b.tar.gz", file=io.BytesIO(_bundle_bytes("1.3.0")))
+        res = await main.admin_update(bundle=bundle)
+        assert res.ok is False and res.message           # a message, not a 500
+        # stage+activate still ran, so the confirm timer can revert the pending release.
+        assert up.pending_version() == "1.3.0"
+
+    asyncio.run(scenario())
+
+
 def test_admin_rollback(tmp_path, monkeypatch):
     calls = {}
     up = _patch_updater(monkeypatch, tmp_path, calls)

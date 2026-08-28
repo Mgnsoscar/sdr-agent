@@ -218,7 +218,7 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # curve (per-limit anchor_curve in freq_dependent_limits) so a consumer inverts the limit
 # against the right curve; calkit (OTA bundle) and the client's PowerFold both honour it. The
 # scalar bounds were always correct; only the save-time refusal and the v2 publish changed.
-AGENT_VERSION = "1.7.4"
+AGENT_VERSION = "1.7.5"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
