@@ -96,3 +96,99 @@ def test_control_missing_numeric_field_is_rejected():
     c = _control(); del c["max_db"]
     with pytest.raises(CalibrationError):
         _resolve(_doc(c))
+
+
+# ── Phase 2: achievable-level resolver ───────────────────────────────────────────
+
+def test_extended_range_matches_the_spec_example():
+    # SDR −40..0 dBm + a 0..95 dB attenuator ⇒ effective −135..0 dBm.
+    r = _resolve(_doc(_control()))
+    assert r.min_power_dbm == pytest.approx(-135.0)
+    assert r.max_power_dbm == pytest.approx(0.0)
+
+
+def test_sdr_first_keeps_attenuator_at_rest_above_the_floor():
+    r = _resolve(_doc(_control(engage_pct=0.0)))
+    # From 0 down to −40 the SDR carries it and the attenuator stays at rest.
+    for p, g in [(0.0, 40.0), (-20.0, 20.0), (-40.0, 0.0)]:
+        out = r.realize(p)
+        assert out["sdr_gain_db"] == pytest.approx(g)
+        assert out["settings"][0]["value"] == pytest.approx(0.0)
+    # Below the floor the SDR is pinned and the attenuator fills the rest.
+    out = r.realize(-100.0)
+    assert out["sdr_gain_db"] == pytest.approx(0.0)
+    assert out["settings"][0]["value"] == pytest.approx(60.0)   # 60 dB attenuation
+
+
+def test_engage_threshold_keeps_sdr_higher():
+    r = _resolve(_doc(_control(engage_pct=50.0)))
+    # Threshold at the midpoint (−20): the SDR never drops below gain 20.
+    assert r.min_power_dbm == pytest.approx(-115.0)             # −20 − 95
+    out = r.realize(-60.0)
+    assert out["sdr_gain_db"] == pytest.approx(20.0)
+    assert out["settings"][0]["value"] == pytest.approx(40.0)
+
+
+def test_snap_only_returns_achievable_levels():
+    r = _resolve(_doc(_control()))
+    # SDR grid is 1 dB; attenuator is 0.25 dB. Mid-range values snap to the combined grid.
+    assert r.snap_power(-19.5) == pytest.approx(-19.5)          # SDR −19 + 0.5 dB atten
+    assert r.snap_power(-19.1) == pytest.approx(-19.0)          # nearest achievable
+    assert r.snap_power(-55.3) == pytest.approx(-55.25)         # attenuator-only region
+    # everything realize() offers is reproducible by realize() itself (idempotent)
+    for p in (-3.3, -41.7, -88.9, -134.4):
+        sp = r.snap_power(p)
+        assert r.snap_power(sp) == pytest.approx(sp)
+
+
+def test_quantize_uses_the_finest_achievable_step():
+    r = _resolve(_doc(_control()))
+    # A fine 0.25 dB attenuator trims the fraction between the SDR's 1 dB grid points, so
+    # the achievable resolution is the 0.25 dB attenuator step across the whole range —
+    # even at the top, where the SDR sits at max gain and the attenuator adds the trim.
+    assert r.quantize_down(-55.0) == pytest.approx(-55.25)
+    assert r.quantize_up(-55.0) == pytest.approx(-54.75)
+    assert r.quantize_down(0.0) == pytest.approx(-0.25)
+    # With NO active component the step follows the SDR's own 1 dB gain grid.
+    passive = _resolve(_doc(control=None))
+    assert passive.quantize_down(0.0) == pytest.approx(-1.0)
+
+
+def test_no_active_component_leaves_range_unchanged():
+    # A plain SDR+attenuator-shaped chain but with NO control resolves exactly as a
+    # passive chain: min/max power come straight from the gain grid.
+    r = _resolve(_doc(control=None))
+    assert r.min_power_dbm == pytest.approx(-40.0)
+    assert r.max_power_dbm == pytest.approx(0.0)
+    assert r.has_active is False
+    assert "active_components" not in r.to_public_dict()
+
+
+def test_artifact_carries_active_components():
+    art = _resolve(_doc(_control(engage_pct=10.0))).to_public_dict()
+    acs = art["active_components"]
+    assert len(acs) == 1
+    ac = acs[0]
+    assert ac["task"] == "atten_set" and ac["param"] == "attenuation"
+    assert ac["sense"] == "attenuation" and ac["step_db"] == 0.25
+    assert ac["min_db"] == 0.0 and ac["max_db"] == 95.0 and ac["engage_pct"] == 10.0
+    assert art["min_power_dbm"] == pytest.approx(-131.0)        # −36 − 95, T at 10%
+
+
+def test_two_active_components_with_different_steps_combine():
+    # A coarse 1 dB attenuator (0..30) in series with a fine 0.1 dB one (0..5): the
+    # combined reduction budget is 35 dB and both steps are realizable.
+    doc = _doc(None)
+    doc["chain"]["planes"]["atten_out"] = {
+        "type": "derived", "from": "sdr_output", "delta_db": 0.0,
+        "control": _control(max_db=30.0, step_db=1.0)}
+    doc["chain"]["planes"]["fine"] = {
+        "type": "derived", "from": "atten_out", "delta_db": 0.0,
+        "control": {"task": "fine_set", "param": "att", "sense": "attenuation",
+                    "min_db": 0.0, "max_db": 5.0, "step_db": 0.1, "engage_pct": 0.0}}
+    doc["chain"]["operating_plane"] = "fine"
+    r = resolve(doc, None, "sig", {})
+    assert r.min_power_dbm == pytest.approx(-75.0)              # −40 − 35
+    out = r.realize(-52.3)                                      # needs 12.3 dB below −40
+    assert out["power_dbm"] == pytest.approx(-52.3)
+    assert len(out["settings"]) == 2
