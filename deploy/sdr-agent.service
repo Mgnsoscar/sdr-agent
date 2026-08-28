@@ -13,9 +13,17 @@ Environment=PYTHONPATH=/opt/sdr-agent
 Environment=SDR_STATE_DIR=/opt/sdr-agent-shared
 Environment=SDR_RELEASES_DIR=/opt/sdr-agent-releases
 Environment=SDR_CURRENT_LINK=/opt/sdr-agent
-ExecStart=/usr/bin/python3 -m uvicorn agent.main:app --host 0.0.0.0 --port 8765
+# --timeout-graceful-shutdown bounds uvicorn's "waiting for connections to close" on
+# SIGTERM. Without it, a restart (as an OTA update triggers) hangs indefinitely while a
+# client holds keep-alive connections open and keeps polling — so the old process only
+# dies at TimeoutStopSec, past the OTA health-confirm grace, and the new release gets
+# rolled back before it can even start. 10s is ample for real in-flight requests.
+ExecStart=/usr/bin/python3 -m uvicorn agent.main:app --host 0.0.0.0 --port 8765 --timeout-graceful-shutdown 10
 Restart=on-failure
 RestartSec=5
+# Backstop the graceful shutdown so a stuck restart can never outlast the OTA
+# confirm grace (kept well under it, and above the graceful-shutdown timeout above).
+TimeoutStopSec=20
 
 # Set a shared secret so /admin/* (and the rest of the API) require it.
 # Environment=SDR_API_KEY=changeme
