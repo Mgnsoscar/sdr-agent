@@ -192,3 +192,32 @@ def test_two_active_components_with_different_steps_combine():
     out = r.realize(-52.3)                                      # needs 12.3 dB below −40
     assert out["power_dbm"] == pytest.approx(-52.3)
     assert len(out["settings"]) == 2
+
+
+# ── Phase 3: the transmit-script consumer (calkit) agrees via the artifact ────────
+
+def test_calkit_matches_resolver_via_artifact():
+    from paramkit.calkit import PowerMap
+    doc = _doc(_control(engage_pct=0.0))
+    doc["defaults"] = {"amplitude": 0.5}
+    r = resolve(doc, None, "sig", {})
+    pm = PowerMap.from_artifact(r.to_public_dict(), fallback_amplitude=0.5)
+    assert pm.min_power_dbm == pytest.approx(r.min_power_dbm)
+    assert pm.max_power_dbm == pytest.approx(r.max_power_dbm)
+    for p in (0.0, -13.3, -20.0, -41.7, -88.9, -134.9, -200.0):
+        rr, pk = r.realize(p), pm.realize(p)
+        # The SDR gain the script sets matches the resolver…
+        assert pm.gain_for_power(p) == pytest.approx(rr["sdr_gain_db"])
+        assert pk["sdr_gain_db"] == pytest.approx(rr["sdr_gain_db"])
+        # …and the attenuator value the host will command matches too.
+        assert pk["settings"][0]["value"] == pytest.approx(rr["settings"][0]["value"])
+        assert pk["power_dbm"] == pytest.approx(rr["power_dbm"])
+
+
+def test_calkit_power_field_kwargs_uses_extended_range():
+    from paramkit.calkit import PowerMap
+    doc = _doc(_control()); doc["defaults"] = {"amplitude": 0.5}
+    pm = PowerMap.from_artifact(resolve(doc, None, "sig", {}).to_public_dict(),
+                                fallback_amplitude=0.5)
+    kw = pm.power_field_kwargs()
+    assert kw["min"] == pytest.approx(-135.0) and kw["max"] == pytest.approx(0.0)

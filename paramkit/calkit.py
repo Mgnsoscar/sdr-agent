@@ -75,6 +75,22 @@ def _table_at(freqs: list, deltas: list, freq: Optional[float]) -> float:
     return _interp(freq, freqs, deltas)
 
 
+def _active_applied(a: dict) -> tuple:
+    """(applied_hi, applied_lo) — the applied gain (signed dB) range of an active component.
+    An attenuator's parameter subtracts power, a gain block's adds it."""
+    lo, hi = float(a["min_db"]), float(a["max_db"])
+    if a.get("sense", "attenuation") == "attenuation":
+        return (-lo, -hi)
+    return (hi, lo)
+
+
+def _active_param_value(a: dict, applied: float) -> float:
+    """The parameter value to command on the component's task for a given applied gain."""
+    lo, hi = float(a["min_db"]), float(a["max_db"])
+    v = -applied if a.get("sense", "attenuation") == "attenuation" else applied
+    return min(max(v, lo), hi)
+
+
 class PowerMap:
     """Maps a requested delivered/radiated power (dBm) to a commanded SDR gain (dB) and
     back, over a monotonic measured anchor curve, with any frequency-dependent passive
@@ -83,7 +99,7 @@ class PowerMap:
 
     def __init__(self, gains, powers, min_gain_db, ceiling_const, amplitude,
                  source, label, hops=(), freq_limits=(), center_freq=None,
-                 gain_step_db=None):
+                 gain_step_db=None, actives=()):
         if not gains or len(gains) != len(powers):
             raise ValueError("calibration curve is empty or malformed")
         # keep gain-sorted; agent guarantees strict monotonicity, verify defensively
@@ -125,6 +141,10 @@ class PowerMap:
                 ag = ap = None
             self._freq_limits.append((float(mx), fs, ds, ag, ap))
         self._center_freq = None if center_freq is None else float(center_freq)
+        # Active components (programmable gain/attenuation): each carries its own applied-gain
+        # grid on top of its passive baseline (already folded into the hops). Empty = a plain
+        # passive chain (v1/v2 behaviour unchanged).
+        self._actives = [dict(a) for a in (actives or [])]
 
     # ── frequency-dependent internals ────────────────────────────────────────────
     def _eff(self, freq: Optional[float]) -> Optional[float]:
@@ -167,16 +187,60 @@ class PowerMap:
             g = math.ceil(lo / step) * step
         return round(g, 6)
 
+    # ── active-component achievable-level resolver ───────────────────────────────
+    def _achievable(self, freq: Optional[float]):
+        """Build the shared achievable-power resolver at ``freq`` (returns the grid and the
+        active descriptors). The SDR power map (components at baseline) feeds it; the grid
+        adds the components' applied-gain ranges. Empty actives ⇒ a plain SDR grid."""
+        from paramkit.achievable import AchievableGrid, Active
+        f = self._eff(freq)
+        od = self._op_delta(f)
+        actives = []
+        for a in self._actives:
+            hi, lo = _active_applied(a)
+            actives.append(Active(hi, lo, a["step_db"], a.get("engage_pct", 0.0), meta=a))
+        grid = AchievableGrid(
+            power_for_gain=lambda g: _interp(g, self._gains, self._powers) + od,
+            gain_for_power=lambda p: _interp(p - od, self._powers, self._gains),
+            min_gain=self.min_gain_db, ceiling=self._ceiling(f),
+            gain_step=self._gain_step, actives=actives)
+        return grid, actives
+
+    def realize(self, delivered_dbm: float, freq: Optional[float] = None) -> dict:
+        """SDR-first realization of a requested delivered power with active components:
+        ``{power_dbm, sdr_gain_db, settings}`` where settings names each component's task,
+        parameter and the value to command on it. (The SDR side sets ``sdr_gain_db``; the
+        host commands the component tasks to their values.)"""
+        if not self.has_absolute:
+            raise NoAbsoluteScale("uncalibrated: no absolute power scale for this signal")
+        grid, actives = self._achievable(freq)
+        res = grid.realize(float(delivered_dbm))
+        settings = []
+        for act, applied in zip(actives, res["applied"]):
+            a = act.meta
+            settings.append({"plane": a.get("plane"), "task": a["task"], "param": a["param"],
+                             "applied_db": applied,
+                             "value": round(_active_param_value(a, applied), 6)})
+        return {"power_dbm": res["power_dbm"], "sdr_gain_db": res["sdr_gain_db"],
+                "settings": settings}
+
+    def snap_power(self, delivered_dbm: float, freq: Optional[float] = None) -> float:
+        return self._achievable(freq)[0].snap(float(delivered_dbm))
+
     # ── the two functions the script calls ──────────────────────────────────────
     def gain_for_power(self, delivered_dbm: float, freq: Optional[float] = None) -> float:
-        """Commanded gain (dB) for a requested power at ``freq`` (defaults to the
-        artifact's representative frequency), clamped to [min, ceiling(freq)]. Upward is
-        clamped to the ceiling, never extrapolated past it."""
+        """Commanded SDR gain (dB) for a requested delivered power at ``freq`` (defaults to
+        the artifact's representative frequency), clamped to [min, ceiling(freq)]. With an
+        active component the gain comes from the SDR-first realization (the SDR carries the
+        signal; the component fills below the engagement threshold) — the host commands the
+        component to the matching value so together they deliver the requested power."""
         if not self.has_absolute:
             raise NoAbsoluteScale(
                 "this signal is not calibrated on this unit — absolute --power (dBm) has "
                 "no meaning here; provide --gain (raw dB) instead")
         f = self._eff(freq)
+        if self._actives:
+            return self._achievable(freq)[0].realize(float(delivered_dbm))["sdr_gain_db"]
         g = self._invert(float(delivered_dbm) - self._op_delta(f))
         return self._snap(g, f)
 
@@ -196,12 +260,21 @@ class PowerMap:
 
     @property
     def max_power_dbm(self):
-        """Top of the delivered-power range, or None when uncalibrated (no dBm scale)."""
-        return self.power_for_gain(self.max_gain_db) if self.has_absolute else None
+        """Top of the delivered-power range, or None when uncalibrated (no dBm scale).
+        With active components this is the extended range."""
+        if not self.has_absolute:
+            return None
+        if self._actives:
+            return self._achievable(None)[0].bounds()[1]
+        return self.power_for_gain(self.max_gain_db)
 
     @property
     def min_power_dbm(self):
-        return self.power_for_gain(self.min_gain_db) if self.has_absolute else None
+        if not self.has_absolute:
+            return None
+        if self._actives:
+            return self._achievable(None)[0].bounds()[0]
+        return self.power_for_gain(self.min_gain_db)
 
     def power_field_kwargs(self) -> dict:
         """paramkit ``.number()`` bounds for a script's --power field: min/max/default from the
@@ -250,6 +323,7 @@ class PowerMap:
         self._freq_limits = []
         self._center_freq = None
         self._gain_step = None
+        self._actives = []
         self.has_absolute = False
         return self
 
@@ -264,6 +338,7 @@ class PowerMap:
         label = f"{quantity}, at {plane}" if plane else quantity
 
         step = art.get("gain_step_db")
+        actives = art.get("active_components") or ()
         anchor = art.get("anchor_curve")
         if anchor:                                    # v2: fold passive hops at frequency
             gains = [pt[0] for pt in anchor]
@@ -278,13 +353,15 @@ class PowerMap:
             return cls(gains, powers, art.get("min_gain_db"), ceiling_const, amp,
                        source="calibration file", label=label,
                        hops=hops, freq_limits=freq_limits,
-                       center_freq=art.get("center_freq_hz"), gain_step_db=step)
+                       center_freq=art.get("center_freq_hz"), gain_step_db=step,
+                       actives=actives)
 
         curve = art.get("curve") or []                # v1: pre-flattened operating curve
         gains = [pt[0] for pt in curve]
         powers = [pt[1] for pt in curve]
         return cls(gains, powers, art.get("min_gain_db"), art.get("max_gain_db"), amp,
-                   source="calibration file", label=label, gain_step_db=step)
+                   source="calibration file", label=label, gain_step_db=step,
+                   actives=actives)
 
     @classmethod
     def load(cls, baked: "PowerMap", env_var: str = CALIBRATION_FILE_ENV) -> "PowerMap":

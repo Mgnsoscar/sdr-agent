@@ -319,142 +319,47 @@ class ResolvedCalibration:
     def has_active(self) -> bool:
         return bool(self._active_hops())
 
-    def _grid_gain(self, g: float, freq: Optional[float], mode: str = "nearest") -> float:
-        """Snap a gain to the hardware grid (like _snap) but choosing floor/ceil/nearest,
-        kept within [min_gain, ceiling]."""
-        lo, hi = self.min_gain_db, self._max_gain_at(freq)
-        g = min(max(float(g), lo), hi)
-        step = self._gain_step
-        if not step:
-            return g
-        q = math.floor(g / step) if mode == "floor" else \
-            math.ceil(g / step) if mode == "ceil" else round(g / step)
-        gg = q * step
-        if gg > hi:
-            gg = math.floor(hi / step) * step
-        if gg < lo:
-            gg = math.ceil(lo / step) * step
-        return round(gg, 6)
-
-    def _snap_reduction(self, x: float, active: list) -> tuple:
-        """Snap a desired reduction ``x`` dB (≥0) to what the active components can produce,
-        distributed greedily in chain order. Returns (total_reduction, {plane: applied_db})."""
-        remaining = max(0.0, float(x))
-        applied: dict = {}
-        total = 0.0
-        for name, d in active:
-            c = d.control
-            take = min(remaining, c.span_db)
-            r = min(max(round(take / c.step_db) * c.step_db, 0.0), c.span_db)
-            applied[name] = round(c.applied_hi - r, 6)
-            total += r
-            remaining -= r
-        return round(total, 6), applied
+    def _achievable(self, freq: Optional[float]):
+        """Build the shared achievable-power resolver at ``freq`` (returns the grid and the
+        active-hop list so callers can map each applied gain back to a task/param setting)."""
+        from paramkit.achievable import AchievableGrid, Active
+        f = self._eff_freq(freq)
+        op, planes = self.operating_plane, self._planes
+        hops = self._active_hops()
+        actives = [Active(d.control.applied_hi, d.control.applied_lo,
+                          d.control.step_db, d.control.engage_pct, meta=(n, d))
+                   for n, d in hops]
+        grid = AchievableGrid(
+            power_for_gain=lambda g: _power_on(op, g, planes, f),
+            gain_for_power=lambda p: _gain_for_power_on(p, op, planes, f),
+            min_gain=self.min_gain_db, ceiling=self._max_gain_at(f),
+            gain_step=self._gain_step, actives=actives)
+        return grid, actives
 
     def realize(self, power: float, freq: Optional[float] = None) -> dict:
         """SDR-first realization of a requested delivered power. Returns the nearest
         ACHIEVABLE power and the device settings that produce it: the SDR gain, and per
-        active component its applied gain and the parameter value to command on its task.
-        Powers between grid points are reached by nudging the SDR up one step and trimming
-        back down with the active component(s) — so the offered value is always realizable."""
-        f = self._eff_freq(freq)
-        active = self._active_hops()
-        sum_hi = sum(d.control.applied_hi for _, d in active)
-        span = sum(d.control.span_db for _, d in active)
-        op, planes = self.operating_plane, self._planes
-
-        def p_base(g: float) -> float:
-            return _power_on(op, g, planes, f) + sum_hi
-
-        lo_g = self._snap(self.min_gain_db, f)
-        hi_g = self._snap(self._max_gain_at(f), f)
-        s_lo, s_hi = p_base(lo_g), p_base(hi_g)
-        engage = max((d.control.engage_pct for _, d in active), default=0.0)
-        thr = s_lo + engage / 100.0 * (s_hi - s_lo) if s_hi > s_lo else s_lo
-        target = min(max(float(power), thr - span), s_hi)
-
-        # SDR floor gain: the lowest grid gain the SDR is allowed to use (≥ threshold).
-        g_thr = self._grid_gain(
-            _gain_for_power_on(thr - sum_hi, op, planes, f), f, "ceil")
-        if self._gain_step and p_base(g_thr) < thr - 1e-9:
-            g_thr = self._grid_gain(g_thr + self._gain_step, f, "ceil")
-        g_thr = min(max(g_thr, lo_g), hi_g)
-
-        # SDR-first: the highest grid gain whose base power doesn't exceed the target, plus
-        # the next step up (base power above the target, trimmed down with the components).
-        g_for = _gain_for_power_on(target - sum_hi, op, planes, f)
-        g_floor = self._grid_gain(g_for, f, "floor")
-        candidates = {g_floor, g_thr, hi_g}
-        if self._gain_step:
-            candidates.add(self._grid_gain(g_floor + self._gain_step, f, "ceil"))
-        best = None
-        for g in candidates:
-            g = min(max(g, g_thr), hi_g)
-            pb = p_base(g)
-            resid = pb - target
-            if resid >= -1e-9:
-                red, applied = self._snap_reduction(resid, active)
-            else:                                    # undershoots; can't trim upward
-                red, applied = 0.0, {n: d.control.applied_hi for n, d in active}
-            achieved = pb - red
-            # Nearest to target; then SDR-first — least attenuation (components nearest
-            # rest), so the SDR carries the signal and the attenuator only fills below the
-            # threshold, rather than the SDR sitting high with the attenuator doing the work.
-            key = (abs(achieved - target), red)
-            if best is None or key < best[0]:
-                best = (key, g, achieved, applied)
-        _, g, achieved, applied = best
-        settings = [{"plane": n, "task": d.control.task, "param": d.control.param,
-                     "applied_db": applied[n],
-                     "value": round(d.control.param_for_applied(applied[n]), 6)}
-                    for n, d in active]
-        return {"power_dbm": round(achieved, 6), "sdr_gain_db": round(g, 6),
+        active component its applied gain and the parameter value to command on its task."""
+        grid, actives = self._achievable(freq)
+        res = grid.realize(power)
+        settings = []
+        for a, applied in zip(actives, res["applied"]):
+            name, d = a.meta
+            settings.append({"plane": name, "task": d.control.task,
+                             "param": d.control.param, "applied_db": applied,
+                             "value": round(d.control.param_for_applied(applied), 6)})
+        return {"power_dbm": res["power_dbm"], "sdr_gain_db": res["sdr_gain_db"],
                 "settings": settings}
 
     def snap_power(self, power: float, freq: Optional[float] = None) -> float:
         """The nearest achievable delivered power to ``power``."""
-        return self.realize(power, freq)["power_dbm"]
-
-    def _nominal_step(self, power: float, freq: Optional[float]) -> float:
-        """The finest achievable resolution near ``power`` — the smaller of the local SDR
-        power step and the active components' finest step. Drives arrow/scroll stepping."""
-        f = self._eff_freq(freq)
-        active = self._active_hops()
-        cands = [d.control.step_db for _, d in active]
-        if self._gain_step:
-            r = self.realize(power, f)
-            sum_hi = sum(d.control.applied_hi for _, d in active)
-            g = r["sdr_gain_db"]
-            p0 = _power_on(self.operating_plane, g, self._planes, f) + sum_hi
-            gup = self._grid_gain(g + self._gain_step, f)
-            p1 = _power_on(self.operating_plane, gup, self._planes, f) + sum_hi
-            if abs(p1 - p0) > 1e-9:
-                cands.append(abs(p1 - p0))
-        return min(cands) if cands else 0.1
+        return self._achievable(freq)[0].snap(power)
 
     def quantize_up(self, power: float, freq: Optional[float] = None) -> float:
-        f = self._eff_freq(freq)
-        cur = self.snap_power(power, f)
-        n = self._nominal_step(cur, f)
-        step = n
-        for _ in range(64):
-            cand = self.snap_power(cur + step, f)
-            if cand > cur + 1e-6:
-                return cand
-            step += n
-        return cur
+        return self._achievable(freq)[0].quantize_up(power)
 
     def quantize_down(self, power: float, freq: Optional[float] = None) -> float:
-        f = self._eff_freq(freq)
-        cur = self.snap_power(power, f)
-        n = self._nominal_step(cur, f)
-        step = n
-        for _ in range(64):
-            cand = self.snap_power(cur - step, f)
-            if cand < cur - 1e-6:
-                return cand
-            step += n
-        return cur
+        return self._achievable(freq)[0].quantize_down(power)
 
     def active_components(self) -> list:
         """Public descriptors for each active component (for the artifact + UI)."""
