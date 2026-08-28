@@ -82,6 +82,92 @@ class _Measured:
 
 
 @dataclass
+class _ActiveControl:
+    """The dynamic-control descriptor of an ACTIVE component (e.g. a programmable
+    attenuator). On top of a derived plane's passive baseline table (its behaviour at
+    0 dB applied), an active component can apply a variable gain/attenuation set through
+    ``param`` of ``task``. ``min_db``/``max_db`` are that parameter's own value range and
+    ``step_db`` its resolution; ``sense`` says whether the parameter adds gain or removes
+    it. ``engage_pct`` is where, as a percentage of the SDR-only dynamic range, the
+    component starts contributing (0 ⇒ only once the SDR is exhausted at its bottom;
+    higher ⇒ engage sooner, keeping the SDR in its upper/optimal region).
+
+    Everything is expressed in *applied gain* (signed dB the component adds to the chain):
+    ``applied_hi`` is its max-power / rest state, ``applied_lo`` its max-reduction state."""
+    task: str
+    param: str
+    sense: str                 # "attenuation" (param removes power) | "gain" (param adds it)
+    min_db: float              # the parameter's own min value
+    max_db: float              # the parameter's own max value
+    step_db: float             # the parameter's resolution
+    engage_pct: float = 0.0    # % of the SDR dynamic range below which it engages
+
+    @property
+    def applied_hi(self) -> float:
+        """Max applied gain (rest / max-power state)."""
+        return -self.min_db if self.sense == "attenuation" else self.max_db
+
+    @property
+    def applied_lo(self) -> float:
+        """Min applied gain (max-reduction state)."""
+        return -self.max_db if self.sense == "attenuation" else self.min_db
+
+    @property
+    def span_db(self) -> float:
+        """How much power this component can remove below its rest state (≥ 0)."""
+        return self.applied_hi - self.applied_lo
+
+    def param_for_applied(self, applied: float) -> float:
+        """The parameter value to command for a given applied gain (clamped to range)."""
+        v = -applied if self.sense == "attenuation" else applied
+        return min(max(v, self.min_db), self.max_db)
+
+    def to_public_dict(self, plane: str, baseline: list) -> dict:
+        return {"plane": plane, "task": self.task, "param": self.param,
+                "sense": self.sense, "min_db": self.min_db, "max_db": self.max_db,
+                "step_db": self.step_db, "engage_pct": self.engage_pct,
+                "baseline_delta_by_freq": [[f, db] for f, db in baseline]}
+
+
+def _parse_control(spec: object, name: str) -> "_ActiveControl":
+    """Validate a plane's ``control`` block and build an _ActiveControl (fail-safe: any
+    defect raises, so a broken active component can never silently transmit)."""
+    if not isinstance(spec, dict):
+        raise CalibrationError(f"plane {name!r} 'control' must be an object")
+    task, param = spec.get("task"), spec.get("param")
+    if not isinstance(task, str) or not task.strip():
+        raise CalibrationError(
+            f"active plane {name!r} 'control.task' must be a non-empty string")
+    if not isinstance(param, str) or not param.strip():
+        raise CalibrationError(
+            f"active plane {name!r} 'control.param' must be a non-empty string")
+    sense = spec.get("sense", "attenuation")
+    if sense not in ("attenuation", "gain"):
+        raise CalibrationError(
+            f"active plane {name!r} 'control.sense' must be 'attenuation' or 'gain'")
+    try:
+        min_db = float(spec["min_db"]); max_db = float(spec["max_db"])
+        step_db = float(spec["step_db"])
+    except (KeyError, TypeError, ValueError):
+        raise CalibrationError(
+            f"active plane {name!r} 'control' needs numeric min_db, max_db, step_db")
+    if not max_db > min_db:
+        raise CalibrationError(
+            f"active plane {name!r} 'control.max_db' ({max_db}) must exceed min_db ({min_db})")
+    if not step_db > 0:
+        raise CalibrationError(
+            f"active plane {name!r} 'control.step_db' must be > 0")
+    try:
+        engage = float(spec.get("engage_pct", 0.0))
+    except (TypeError, ValueError):
+        raise CalibrationError(f"active plane {name!r} 'control.engage_pct' must be numeric")
+    if not 0.0 <= engage <= 100.0:
+        raise CalibrationError(
+            f"active plane {name!r} 'control.engage_pct' must be between 0 and 100")
+    return _ActiveControl(task.strip(), param.strip(), sense, min_db, max_db, step_db, engage)
+
+
+@dataclass
 class _Derived:
     """A derived plane: a passive dB hop from a parent plane (cable loss, antenna gain,
     a pad). The hop is a ``delta_db``-vs-frequency table (signed: negative = loss); a
@@ -100,6 +186,11 @@ class _Derived:
     quantity: str = ""
     description: str = ""
     fallback: bool = False
+    control: Optional["_ActiveControl"] = None   # set ⇒ an ACTIVE component (dynamic gain/atten)
+
+    @property
+    def is_active(self) -> bool:
+        return self.control is not None
 
     @property
     def is_freq_dependent(self) -> bool:
@@ -916,8 +1007,11 @@ def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
                                     f"component {comp_id!r}")
             else:
                 table = [(0.0, float(spec["delta_db"]))]   # constant, frequency-independent
+            # An ACTIVE component adds a `control` block on top of its passive baseline.
+            control = _parse_control(spec["control"], name) if "control" in spec else None
             planes[name] = _Derived(frm=frm, table=table, component=comp_id,
-                                    quantity=quantity, description=description)
+                                    quantity=quantity, description=description,
+                                    control=control)
             prev_name = name
         else:
             raise CalibrationError(f"plane {name!r} has invalid type {ptype!r}")
