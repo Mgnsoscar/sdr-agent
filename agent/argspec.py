@@ -224,6 +224,14 @@ def _num(v) -> Optional[float]:
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
+def _choice_token(v) -> str:
+    """Mirror paramkit._choice_token: the canonical CLI/JSON string for a choice
+    value (the value's real type is recovered from choice_values)."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+
+
 def _uses_paramkit(source: str) -> bool:
     return "paramkit" in source
 
@@ -276,16 +284,22 @@ def extract_paramkit_spec(source: str) -> Dict[str, Any]:
         unit = kw["unit"].value if "unit" in kw and isinstance(kw["unit"], ast.Constant) else ""
         presets = _presets_to_list(_literal(kw["presets"], consts)) if "presets" in kw else []
         raw_choices = _literal(kw["options"], consts) if "options" in kw else None
-        # options may be a [value, ...] sequence or a {value: label} mapping.
+        # options may be a [value, ...] sequence or a {label: value} mapping — the
+        # latter mirrors presets: display label → the value the script receives (kept
+        # in its Python type). See paramkit.Script.choice / _choice_token.
         if isinstance(raw_choices, dict):
-            choices = [str(c) for c in raw_choices]
-            choice_labels = {str(k): str(v) for k, v in raw_choices.items()}
+            pairs = [(str(label), value) for label, value in raw_choices.items()]
+            choices = [_choice_token(v) for _lbl, v in pairs]
+            choice_labels = {tok: lbl for (lbl, _v), tok in zip(pairs, choices)}
+            choice_values = {tok: v for (_lbl, v), tok in zip(pairs, choices)}
         elif raw_choices:
             choices = [str(c) for c in raw_choices]
             choice_labels = None
+            choice_values = None
         else:
             choices = None
             choice_labels = None
+            choice_values = None
         multiple = bool(_literal(kw["multiple"], consts)) if "multiple" in kw else False
         required = bool(_literal(kw["required"], consts)) if "required" in kw else False
         live = bool(_literal(kw["live"], consts)) if "live" in kw else False
@@ -312,6 +326,7 @@ def extract_paramkit_spec(source: str) -> Dict[str, Any]:
             "default": default,
             "choices": choices,
             "choice_labels": choice_labels,
+            "choice_values": choice_values,
             "is_flag": kind == "flag",
             "nargs": "+" if multiple else None,
             "help": _joined_help(kw["help"], consts) if "help" in kw else "",

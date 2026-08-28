@@ -41,7 +41,9 @@ script = (
             required=True, help="Center frequency.")
     .number("-g", "--gain", unit="dB", min=0, max=89, default=40)
     .choice("--antenna", options=["TX/RX", "RX2"], default="TX/RX")
-    .choice("--otw", options={"sc8": "8-bit (halves USB)", "sc16": "16-bit"}, default="sc8")
+    .choice("--otw", options={"8-bit (halves USB)": "sc8", "16-bit": "sc16"}, default="sc8")
+    .choice("--band", options={"1575.42 MHz": 1.57542e9, "1227.6 MHz": 1.2276e9},
+            unit="Hz", default=1.57542e9)
     .flag("-v", "--verbose")
 )
 args = script.parse()
@@ -65,7 +67,7 @@ def main() -> int:
     check(spec.get("calibration_freq_param") == "freq",
           "CAL_FREQ_PARAM surfaced as calibration_freq_param")
     by = {p["name"]: p for p in spec["params"]}
-    check(set(by) == {"freq", "gain", "antenna", "otw", "verbose"}, "all params found")
+    check(set(by) == {"freq", "gain", "antenna", "otw", "band", "verbose"}, "all params found")
 
     f = by["freq"]
     check(f["kind"] == "number", "freq kind=number")
@@ -89,11 +91,23 @@ def main() -> int:
     ant = by["antenna"]
     check(ant["kind"] == "choice" and ant["choices"] == ["TX/RX", "RX2"], "choice options")
     check(ant["choice_labels"] is None, "list-choice has no labels")
+    check(ant["choice_values"] is None, "list-choice has no typed values")
 
     otw = by["otw"]
-    check(otw["choices"] == ["sc8", "sc16"], "dict-choice values extracted statically")
+    check(otw["choices"] == ["sc8", "sc16"], "dict-choice value tokens extracted statically")
     check(otw["choice_labels"] == {"sc8": "8-bit (halves USB)", "sc16": "16-bit"},
           "dict-choice labels extracted statically")
+    check(otw["choice_values"] == {"sc8": "sc8", "sc16": "sc16"},
+          "string-valued dict-choice values extracted statically")
+
+    band = by["band"]
+    check(band["choices"] == ["1575420000.0", "1227600000.0"],
+          "numeric dict-choice value tokens extracted statically")
+    check(band["choice_labels"] == {"1575420000.0": "1575.42 MHz", "1227600000.0": "1227.6 MHz"},
+          "numeric dict-choice labels extracted statically")
+    check(band["choice_values"] == {"1575420000.0": 1.57542e9, "1227600000.0": 1.2276e9},
+          "numeric dict-choice typed values extracted statically")
+    check(band["unit"] == "Hz", "choice unit extracted statically")
 
     v = by["verbose"]
     check(v["kind"] == "flag" and v["is_flag"] is True and v["default"] is False,

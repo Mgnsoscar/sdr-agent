@@ -89,11 +89,23 @@ def slug(text: str) -> str:
 PresetsInput = Union[Mapping[str, Any], Sequence[Any], None]
 
 # Choice options may be a plain sequence of values — ["sc8", "sc16"] — or a
-# {value: label} mapping pairing each value with a human-facing placeholder for a
-# GUI — {"sc8": "8-bit (halves USB)", "sc16": "16-bit"}. The value the script
-# receives is always the option value (the dict key); labels are display-only.
-# A plain sequence behaves exactly as before, so this is backwards compatible.
-ChoiceInput = Union[Sequence[str], Mapping[str, str]]
+# {label: value} mapping pairing a human-facing label with the value the script
+# should receive when it's chosen — {"1575.42 MHz": 1.57542e9}. This mirrors
+# ``presets={label: value}`` so the two feel the same: a GUI shows the label; the
+# script receives the value (kept in its Python type — int/float/str). A plain
+# sequence uses each entry as both value and label, exactly as before, so it's
+# backwards compatible.
+ChoiceInput = Union[Sequence[Any], Mapping[str, Any]]
+
+
+def _choice_token(v: Any) -> str:
+    """The canonical CLI/JSON string for a choice value. It's what travels on the
+    command line and keys the schema's label/value maps; the value's real Python
+    type is recovered from ``choice_values``. Kept round-trippable for numbers
+    (str(1.57542e9) == '1575420000.0' → float parses back)."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
 
 
 def _normalise_presets(presets: PresetsInput) -> List[Preset]:
@@ -150,7 +162,8 @@ class Param:
     max: Optional[float] = None
     step: Optional[float] = None
     choices: Optional[List[str]] = None
-    choice_labels: Optional[Dict[str, str]] = None  # {value: display label}, GUI only
+    choice_labels: Optional[Dict[str, str]] = None  # {token: display label}, GUI only
+    choice_values: Optional[Dict[str, Any]] = None  # {token: typed value the script gets}
     presets: List[Preset] = field(default_factory=list)
     default: Any = None
     required: bool = False
@@ -175,6 +188,7 @@ class Param:
             "step": self.step,
             "choices": list(self.choices) if self.choices else None,
             "choice_labels": dict(self.choice_labels) if self.choice_labels else None,
+            "choice_values": dict(self.choice_values) if self.choice_values else None,
             "presets": [p.to_dict() for p in self.presets],
             "default": self.default,
             "required": self.required,
@@ -221,6 +235,31 @@ def _make_resolver(param: Param, cast: Callable[[str], Any]) -> Callable[[str], 
                 f"{param.max}{unit}"
             )
         return value
+
+    return resolve
+
+
+def _make_choice_resolver(param: Param) -> Callable[[str], Any]:
+    """Build the argparse ``type`` callable for a labelled choice.
+
+    Accepts either the option's token (its canonical value string) or its display
+    label, and returns the value in its real Python type (so the script gets
+    ``1.57542e9``, not the string ``'1575420000.0'`` or the label). Raising
+    argparse.ArgumentTypeError gives a clean, choices-listing CLI error."""
+    by_token = dict(param.choice_values or {})
+    by_label = {str(lbl).strip().lower(): by_token.get(tok)
+                for tok, lbl in (param.choice_labels or {}).items()}
+
+    def resolve(token: str) -> Any:
+        s = str(token).strip()
+        if s in by_token:
+            return by_token[s]
+        if s.lower() in by_label:
+            return by_label[s.lower()]
+        known = ", ".join(param.choices or [])
+        raise argparse.ArgumentTypeError(
+            f"invalid choice: {token!r} for {param.display_name} (choose from {known})"
+        )
 
     return resolve
 
@@ -307,30 +346,57 @@ class Script:
         ))
 
     def choice(self, *flags: str, options: ChoiceInput, name: Optional[str] = None,
-               help: str = "", default: Optional[str] = None,
+               help: str = "", unit: str = "", default: Any = None,
                required: bool = False, live: bool = False) -> "Script":
-        """A string parameter restricted to a fixed set of options (a GUI dropdown).
+        """A parameter restricted to a fixed set of options (a GUI dropdown).
 
-        ``options`` is either a plain sequence of values —
-        ``["sc8", "sc16"]`` — or a ``{value: label}`` mapping that pairs each value
-        with a human-facing placeholder for a GUI —
-        ``{"sc8": "8-bit (halves USB)", "sc16": "16-bit"}``. Either way the value the
-        script receives (and the CLI accepts) is the option value — the dict key;
-        the labels are display-only. A plain sequence behaves exactly as before, so
-        existing scripts are unaffected. See number() for the live= flag."""
+        ``options`` is either a plain sequence of values — ``["sc8", "sc16"]`` — or a
+        ``{label: value}`` mapping that pairs a human-facing label with the value the
+        script should receive — ``{"1575.42 MHz": 1.57542e9}``. This mirrors
+        ``presets={label: value}``: a GUI shows the label; the script (and CLI)
+        receive the value, kept in its Python type (int/float/str). A plain sequence
+        uses each entry as both value and label, exactly as before, so existing
+        scripts are unaffected. ``unit`` is a display-only suffix (like the other
+        input types). See number() for the live= flag."""
         n, flags = self._derive_name(flags, name)
         if isinstance(options, Mapping):
-            opts = [str(k) for k in options]
-            labels = {str(k): str(v) for k, v in options.items()}
+            # {label: value} — display label → the value the script receives.
+            pairs = [(str(label), value) for label, value in options.items()]
+            opts = [_choice_token(v) for _lbl, v in pairs]
+            labels = {tok: lbl for (lbl, _v), tok in zip(pairs, opts)}
+            values = {tok: v for (_lbl, v), tok in zip(pairs, opts)}
         else:
             opts = [str(o) for o in options]
             labels = None
-        if default is not None and str(default) not in opts:
-            raise ValueError(f"default {default!r} is not one of the options {opts}")
+            values = None
+        default = self._resolve_choice_default(default, opts, labels, values)
         return self._add(Param(
-            name=n, flags=flags, kind=CHOICE, help=help, choices=opts,
-            choice_labels=labels, default=default, required=required, live=live,
+            name=n, flags=flags, kind=CHOICE, help=help, unit=unit, choices=opts,
+            choice_labels=labels, choice_values=values, default=default,
+            required=required, live=live,
         ))
+
+    @staticmethod
+    def _resolve_choice_default(default: Any, opts: List[str],
+                                labels: Optional[Dict[str, str]],
+                                values: Optional[Dict[str, Any]]) -> Any:
+        """Validate a choice default and return it in canonical form: the typed value
+        for a labelled ``{label: value}`` choice (accepting the value, its token, or
+        its label), or the value string for a plain-sequence choice."""
+        if default is None:
+            return None
+        if values is not None:
+            tok = _choice_token(default)
+            if tok in values:
+                return values[tok]
+            if labels:
+                for t, lbl in labels.items():
+                    if str(default).strip().lower() == str(lbl).strip().lower():
+                        return values[t]
+            raise ValueError(f"default {default!r} is not one of the options {opts}")
+        if str(default) not in opts:
+            raise ValueError(f"default {default!r} is not one of the options {opts}")
+        return str(default)
 
     def text(self, *flags: str, name: Optional[str] = None, help: str = "",
              default: Optional[str] = None, required: bool = False,
@@ -383,8 +449,14 @@ class Script:
             elif p.kind == INTEGER:
                 kwargs["type"] = _make_resolver(p, lambda s: int(s, 0))
             elif p.kind == CHOICE:
-                kwargs["choices"] = p.choices
-                kwargs["type"] = str
+                if p.choice_values:
+                    # Labelled/typed choice: a resolver maps the token or label to the
+                    # real typed value. (argparse `choices=` can't validate against
+                    # typed values here, so the resolver does it and lists the options.)
+                    kwargs["type"] = _make_choice_resolver(p)
+                else:
+                    kwargs["choices"] = p.choices
+                    kwargs["type"] = str
             else:  # TEXT
                 kwargs["type"] = str
 

@@ -111,24 +111,37 @@ def main() -> int:
     doc = json.loads(out.getvalue())
     check(doc["params"][0]["name"] == "freq", "--describe-params prints schema JSON")
 
-    print("labelled choices ({value: label} mapping):")
+    print("labelled choices ({label: value} mapping, like presets):")
     sc = (Script("y")
-          .choice("--otw", options={"sc8": "8-bit (halves USB)", "sc16": "16-bit"},
+          .choice("--freq", options={"1575.42 MHz": 1.57542e9, "1227.6 MHz": 1.2276e9},
+                  unit="Hz", default=1.57542e9)
+          .choice("--otw", options={"8-bit (halves USB)": "sc8", "16-bit": "sc16"},
                   default="sc8")
           .choice("--band", options=["L1", "L2"], default="L1"))  # plain list, unchanged
     schema = {p["name"]: p for p in sc.describe()["params"]}
-    check(schema["otw"]["choices"] == ["sc8", "sc16"], "dict-choice values become choices")
-    check(schema["otw"]["choice_labels"] == {"sc8": "8-bit (halves USB)", "sc16": "16-bit"},
+    check(schema["freq"]["choices"] == ["1575420000.0", "1227600000.0"],
+          "dict-choice value tokens become choices")
+    check(schema["freq"]["choice_labels"] == {"1575420000.0": "1575.42 MHz",
+                                              "1227600000.0": "1227.6 MHz"},
           "dict-choice labels captured in schema")
+    check(schema["freq"]["choice_values"] == {"1575420000.0": 1.57542e9,
+                                              "1227600000.0": 1.2276e9},
+          "dict-choice typed values captured in schema")
+    check(schema["freq"]["unit"] == "Hz", "choice supports a unit")
     check(schema["band"]["choice_labels"] is None, "list-choice keeps choice_labels=None")
-    a = sc.parse(["--otw", "sc16"]); check(a.otw == "sc16", "CLI uses the value (dict key)")
-    expect_exit(lambda: sc.parse(["--otw", "8-bit (halves USB)"]),
-                "label is not accepted as a CLI value")
+    check(schema["band"]["choice_values"] is None, "list-choice keeps choice_values=None")
+    # The script receives the VALUE in its real type — selectable by token or by label.
+    a = sc.parse(["--freq", "1575420000.0"]); check(a.freq == 1.57542e9, "CLI token → typed value")
+    a = sc.parse(["--freq", "1227.6 MHz"]); check(a.freq == 1.2276e9, "CLI label → typed value")
+    a = sc.parse(["--otw", "sc16"]); check(a.otw == "sc16", "string-valued choice by value")
+    a = sc.parse(["--otw", "16-bit"]); check(a.otw == "sc16", "string-valued choice by label")
+    a = sc.parse([]); check(a.freq == 1.57542e9, "choice default resolves to the typed value")
+    expect_exit(lambda: sc.parse(["--freq", "bogus"]), "invalid choice rejected")
     try:
-        Script("z").choice("--w", options={"a": "A", "b": "B"}, default="Q")
-        check(False, "bad default (not a value) should raise")
+        Script("z").choice("--w", options={"A": "a", "B": "b"}, default="Q")
+        check(False, "bad default (not a value/label) should raise")
     except ValueError:
-        check(True, "dict-choice default still validated against values")
+        check(True, "dict-choice default still validated")
 
     print("presets as list of Preset / tuples:")
     s2 = Script("x").number("--f", presets=[Preset("a", "Alpha", 1.0), ("Beta", 2.0)])
