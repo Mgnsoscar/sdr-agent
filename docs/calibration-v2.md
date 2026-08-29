@@ -516,19 +516,30 @@ gain), and `R ≥ 0` is a reduction the components spend on their own discrete g
 ### 12.3 Auto-command both — the SDR *and* the component
 
 Requesting a calibrated `--power` drives BOTH the SDR (the transmit script maps its own SDR
-gain via the active-aware `PowerMap`) and each linked component (set to the realization's
-value). The component is always commanded **first** so the SDR never briefly transmits with
-the attenuator at rest.
+gain via the active-aware `PowerMap`) and each linked component. The component is set to the
+realization's value **first** — and awaited — so the SDR never briefly transmits with the
+attenuator still at rest.
 
-- **Live paths (client).** Run (`ui/run_task_dialog.py`, incl. quick-play) and Tune
-  (`ui/live_tune_dialog.py`) call `state/power_fold.py:active_settings(...)` and
-  `set_task_params` each linked control task alongside starting/tuning the transmit task.
-- **Unattended paths (agent).** The `SequenceRunner` resolves the active components at fire
-  time (`ProcessManager.active_settings`) and retunes each linked control task just before
-  every `start` / `run` / `tune` step that sets an absolute `--power`. Because ramps expand
-  into run/tune steps, a power-sweeping ramp is covered by the same hook. The control task
-  must be running (start it in an earlier step, or keep it always-on); a component that isn't
-  running is logged into the run and skipped, never fatal.
+The firing is **centralized in the agent**, at the single chokepoint every transmit launch
+passes through, so the operator never has to think about the attenuator and it works
+uniformly for Run, quick-play, sequences, ramps, and any direct API caller. The client just
+sends `--power` as it always has.
+
+- **One-shot, not a running task.** A component is set by firing its control task as a
+  fire-and-exit **one-shot** (`atten_set --attenuation N`, exits — the hardware holds the
+  setting). Nothing has to be started or kept running; this is the "set and forget" model —
+  the achievable `--power` range behaves like the SDR's own, and the attenuator is invisible.
+- **The chokepoint.** `ProcessManager._precommand_active` runs at the top of `start`,
+  `restart`, `run_oneshot` and `set_params`: it reads the absolute `--power` from the launch
+  command (or the tuned `power` value), resolves the active components
+  (`ProcessManager.active_settings` → the SDR-first realization), resolves each control
+  `param` to its CLI flag from the control task's argspec (cached), and awaits a one-shot
+  `atten_set <flag> <value>` **before** the transmit process starts / retunes. Because
+  sequence steps and ramps go through these same methods (`start` / `run_oneshot` /
+  `set_params`), they are covered with no sequence-specific code.
+- **Safety / failure.** A one-shot that fails or times out (`_ACTIVE_SET_TIMEOUT_S`) is logged
+  and the transmit still proceeds — the script clamps its own SDR gain to a safe range
+  regardless. (A future option could make an attenuator-set failure refuse the transmit.)
 
 ### 12.4 Editor / capability
 
@@ -540,10 +551,9 @@ existing component gate.
 
 ### 12.5 Status — done
 
-Agent core + resolver (`agent/calibration.py`, `paramkit/achievable.py`,
-`tests/test_calibration_active.py`), transmit-script consumer (`paramkit/calkit.py`), client
-fold + universal achievable slider (`state/power_fold.py`, `state/achievable.py`,
-`ui/param_form.py`), runtime auto-commanding (client Run/Tune + agent sequences/ramps), and the
-calibration-panel active-stage editor. Covered across `test_calibration_active`,
-`test_power_fold`, `test_achievable_levels`, `test_active_autocommand` (client) and
-`test_calibration_active`, `test_sequence_active` (agent).
+Agent core + resolver (`agent/calibration.py`, `paramkit/achievable.py`), transmit-script
+consumer (`paramkit/calkit.py`), client fold + universal achievable slider
+(`state/power_fold.py`, `state/achievable.py`, `ui/param_form.py`), agent-centralized one-shot
+auto-commanding (`agent/process_manager.py`), and the calibration-panel active-stage editor.
+Covered across `test_calibration_active`, `test_power_fold`, `test_achievable_levels` (client)
+and `test_calibration_active`, `test_active_autocommand` (agent).
