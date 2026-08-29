@@ -198,6 +198,26 @@ def test_active_baseline_input_loss_is_folded_on_top_of_the_programmable_range()
     assert lo["power_dbm"] == pytest.approx(-50.0)
 
 
+def test_active_component_baseline_folds_per_frequency():
+    # A frequency-dependent insertion loss is a component (Δ dB(f) table) baseline on the
+    # active plane: it folds into the range AND the SDR/attenuation split at each frequency,
+    # with the programmable attenuation on top.
+    comps = {"atten_loss": {"kind": "attenuator",
+                            "delta_db_by_freq": [[1.0e9, -4.0], [2.0e9, -6.0]]}}
+    doc = _doc(_control())
+    doc["chain"]["planes"]["atten_out"] = {
+        "type": "derived", "from": "sdr_output", "component": "atten_loss",
+        "control": _control()}
+    r1 = resolve(doc, None, "sig", comps, freq_hz=1.0e9)
+    r2 = resolve(doc, None, "sig", comps, freq_hz=2.0e9)
+    assert r1.max_power_dbm == pytest.approx(-4.0)     # 4 dB insertion loss @ 1 GHz
+    assert r2.max_power_dbm == pytest.approx(-6.0)     # 6 dB @ 2 GHz
+    # The commanded PROGRAMMABLE attenuation adapts per frequency to keep −50 dBm exact:
+    # 1 GHz → 4 dB baseline + 6 dB programmable; 2 GHz → 6 dB baseline + 4 dB programmable.
+    assert r1.realize(-50.0, freq=1.0e9)["settings"][0]["value"] == pytest.approx(6.0)
+    assert r2.realize(-50.0, freq=2.0e9)["settings"][0]["value"] == pytest.approx(4.0)
+
+
 def test_two_active_components_with_different_steps_combine():
     # A coarse 1 dB attenuator (0..30) in series with a fine 0.1 dB one (0..5): the
     # combined reduction budget is 35 dB and both steps are realizable.

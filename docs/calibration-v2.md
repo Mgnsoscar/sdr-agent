@@ -556,9 +556,12 @@ sends `--power` as it always has.
 
 The Calibration tab's chain builder adds an **Active component** stage (an ACTIVE badge, a
 set-task / set-param picker fed from the unit's tasks and each task's `/scripts/{name}/params`,
-a sense selector, and min/max/step/engage fields). Saving an active-component document is gated
-on the agent's `calibration-active-components` capability (agent ≥ 1.8.0), mirroring the
-existing component gate.
+a sense selector, and min/max/step/engage fields). Its **baseline** (the fixed insertion loss)
+is chosen in the editor as either a **constant Δ dB** (flat) or a **component** — a Δ dB(f)
+table from the component library, plotted inline — so a frequency-dependent insertion loss
+folds into the range and the SDR/attenuation split at each signal's frequency. Saving an
+active-component document is gated on the agent's `calibration-active-components` capability
+(agent ≥ 1.8.0), mirroring the existing component gate.
 
 ### 12.5 Status — done
 
