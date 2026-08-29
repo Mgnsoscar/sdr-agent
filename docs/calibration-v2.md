@@ -490,6 +490,17 @@ Validation (`agent/calibration.py:_parse_control`, mirrored in the client's
 `step_db > 0`, `0 ≤ engage_pct ≤ 100`. A defective block raises `CalibrationError` (refuse),
 never a silent fall-back.
 
+**Baseline vs. programmable range — the plane's `delta_db` is the part that's always there.**
+The plane's `delta_db` (or component baseline table) is its behaviour at **0 dB applied** —
+i.e. a real attenuator's **fixed insertion loss**. The `control` range (`min_db..max_db`) is
+the *programmable* attenuation on top of that. The resolver folds the baseline into the range
+(so it shifts the whole achievable range down — e.g. a 5 dB insertion loss caps the top at
+5 dB below the SDR's own maximum) and the SDR-first split, then commands the device with the
+**programmable part only** (its insertion loss is inherent, never commanded). So an attenuator
+with 5 dB insertion loss set to `--attenuation 1` delivers 6 dB of loss, and `delta_db: -5`
+makes the maths — and the presented `--power` range — reflect exactly that. Use a component
+baseline (freq table) instead of a constant when the insertion loss varies with frequency.
+
 ### 12.2 The achievable-level resolver (shared, pure)
 
 `paramkit/achievable.py` (`AchievableGrid` + `Active`) is imported by BOTH the agent resolver

@@ -175,6 +175,29 @@ def test_artifact_carries_active_components():
     assert art["min_power_dbm"] == pytest.approx(-131.0)        # −36 − 95, T at 10%
 
 
+def test_active_baseline_input_loss_is_folded_on_top_of_the_programmable_range():
+    # A real attenuator has a fixed insertion loss on TOP of its programmable range. Put that
+    # loss in the active plane's baseline delta_db: it shifts the whole achievable range down,
+    # and the value COMMANDED to the device is the PROGRAMMABLE part only (the device's own
+    # insertion loss is inherent, never commanded).
+    doc = _doc(_control())
+    doc["chain"]["planes"]["atten_out"]["delta_db"] = -5.0          # 5 dB fixed input loss
+    r = resolve(doc, None, "sig", {})
+    # Even at rest (0 dB programmable) the attenuator eats 5 dB, so the top drops 5 dB…
+    assert r.max_power_dbm == pytest.approx(-5.0)
+    # …and the floor is −40 (SDR) − 5 (baseline) − 95 (programmable) = −140.
+    assert r.min_power_dbm == pytest.approx(-140.0)
+    # −20 dBm is still in the SDR's own (shifted) range: SDR carries it, device at rest.
+    hi = r.realize(-20.0)
+    assert hi["sdr_gain_db"] == pytest.approx(25.0) and hi["settings"][0]["value"] == pytest.approx(0.0)
+    # −50 dBm: SDR pinned at its floor (−40 − 5 = −45), device set to 5 dB PROGRAMMABLE →
+    # 5 (baseline) + 5 (commanded) = 10 dB effective, delivering −50.
+    lo = r.realize(-50.0)
+    assert lo["sdr_gain_db"] == pytest.approx(0.0)
+    assert lo["settings"][0]["value"] == pytest.approx(5.0)         # programmable part only
+    assert lo["power_dbm"] == pytest.approx(-50.0)
+
+
 def test_two_active_components_with_different_steps_combine():
     # A coarse 1 dB attenuator (0..30) in series with a fine 0.1 dB one (0..5): the
     # combined reduction budget is 35 dB and both steps are realizable.
