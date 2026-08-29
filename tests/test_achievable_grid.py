@@ -79,3 +79,16 @@ def test_engage_threshold_keeps_sdr_higher_with_odd_steps():
     assert g.bounds()[0] == pytest.approx(-50.0)      # −20 − 30
     r = g.realize(-35.0)
     assert r["sdr_gain_db"] == pytest.approx(20.0)    # SDR pinned at the threshold gain
+
+
+def test_threshold_gain_is_robust_to_inverse_float_noise():
+    # A frequency-dependent baseline can make the SDR floor power invert (gain_for_power) with
+    # a hair of float noise; a naive ceil-snap of the threshold gain then overshoots by one
+    # step and DROPS the minimum gain — reporting the floor one SDR step too high. The
+    # threshold-gain walk must be immune to that.
+    pfg = lambda x: x - 64.225                         # min-gain power = −64.225 (fractional)
+    gfp = lambda p: (p + 64.225) + 1e-7               # inverse with deliberate +float noise
+    g = AchievableGrid(pfg, gfp, 0.0, 89.75, 0.25, [Active(0.0, -95.0, 0.2, 0.0)])
+    floor = pfg(0.0) - 95.0                            # min gain + full attenuation
+    assert g.bounds()[0] == pytest.approx(floor)      # not one 0.25 dB step too high
+    assert g.realize(floor)["sdr_gain_db"] == pytest.approx(0.0)   # gain 0 is usable

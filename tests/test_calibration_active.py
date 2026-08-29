@@ -245,6 +245,29 @@ def test_derived_plane_rejects_more_than_one_baseline_source():
         resolve(doc, None, "sig", {})
 
 
+def test_nonlinear_curve_with_fractional_freq_baseline_floor_is_correct():
+    # A NONLINEAR measured SDR curve (compressed near the top) + a frequency-dependent
+    # attenuator insertion loss that interpolates to a FRACTIONAL dB at the transmit frequency
+    # (−4.225 dB at 2.5 GHz). This used to make the SDR floor power invert with float noise,
+    # drop the SDR's minimum gain, and report the range floor one 0.25 dB step too high.
+    doc = _doc(_control())
+    doc["chain"]["gain_limits"]["gain_step_db"] = 0.25
+    doc["chain"]["gain_limits"]["max_gain_db"] = 89.75
+    doc["chain"]["planes"]["atten_out"] = {
+        "type": "derived", "from": "sdr_output",
+        "delta_db_by_freq": [[1.0e9, -3.0], [2.0e9, -3.8], [4.0e9, -5.5], [6.0e9, -8.2]],
+        "control": _control()}
+    doc["signals"]["sig"]["curves"]["sdr_output"]["points"] = [
+        {"gain_db": g, "power_dbm": p} for g, p in
+        [(0, -60.0), (20, -38.0), (40, -21.0), (60, -8.0), (80, -1.0), (89.75, 0.0)]]
+    r = resolve(doc, None, "sig", {}, freq_hz=2.5e9)
+    grid, _ = r._achievable(2.5e9)
+    floor = round(grid._p_base(0.0) - 95.0, 6)         # min gain (0) + full 95 dB attenuation
+    assert grid.bounds()[0] == pytest.approx(floor)
+    assert r.min_power_dbm == pytest.approx(floor, abs=1e-4)
+    assert grid.realize(floor)["sdr_gain_db"] == pytest.approx(0.0)   # gain 0 usable
+
+
 def test_two_active_components_with_different_steps_combine():
     # A coarse 1 dB attenuator (0..30) in series with a fine 0.1 dB one (0..5): the
     # combined reduction budget is 35 dB and both steps are realizable.

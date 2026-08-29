@@ -34,6 +34,8 @@ import bisect
 import math
 
 _EPS = 1e-9
+_TOL = 1e-5               # a neighbour must be at least this far (dB) to count as a distinct
+                         # level — below it is float noise / sub-hardware-resolution phantoms
 _SCAN_CAP = 200000        # guard: never iterate more than this many grid points at once
 
 
@@ -80,10 +82,17 @@ class AchievableGrid:
         self._thr = (self._s_lo + engage / 100.0 * (self._s_hi - self._s_lo)
                      if self._s_hi > self._s_lo else self._s_lo)
         # The lowest SDR grid gain the SDR is allowed to use (its power ≥ the threshold): at or
-        # below the threshold the SDR is pinned here and the components fill the rest.
-        gt = self._grid(self._gfp(self._thr - self._sum_hi), "ceil")
-        if self._step and self._p_base(gt) < self._thr - _EPS:
-            gt = self._grid(gt + self._step, "ceil")
+        # below the threshold the SDR is pinned here and the components fill the rest. Inverting
+        # the threshold power through the curve carries float noise (worse with a fractional
+        # frequency-dependent baseline), so don't trust a single ceil-snap — walk to the true
+        # smallest grid gain whose baseline power still meets the threshold (tolerant of ~1
+        # step of error either way). _p_base is monotonic in gain, so this converges.
+        gt = self._grid(self._gfp(self._thr - self._sum_hi))
+        if self._step:
+            while gt > self._lo_g and self._p_base(round(gt - self._step, 6)) >= self._thr - _EPS:
+                gt = round(gt - self._step, 6)
+            while gt < self._hi_g and self._p_base(gt) < self._thr - _EPS:
+                gt = round(gt + self._step, 6)
         self._g_thr = min(max(gt, self._lo_g), self._hi_g)
 
     # ── gain grid ────────────────────────────────────────────────────────────────
@@ -198,8 +207,10 @@ class AchievableGrid:
         whose baseline can land in range (``lo ≤ P_base(g) ≤ hi + span``) and reductions in
         ``[P_base(g)−hi, P_base(g)−lo]`` are considered, so the scan stays bounded."""
         reductions = self._reduction_values()
-        g_a = self._grid(self._gfp(lo - self._sum_hi), "ceil")
-        g_b = self._grid(self._gfp(hi + self._span - self._sum_hi), "floor")
+        # Widen the gain window inclusively (floor below, ceil above) so float noise in the
+        # inverse can't drop a boundary gain; the level filter below keeps only in-range ones.
+        g_a = self._grid(self._gfp(lo - self._sum_hi), "floor")
+        g_b = self._grid(self._gfp(hi + self._span - self._sum_hi), "ceil")
         out = set()
         for g in self._gain_points(g_a, g_b):
             pb = self._p_base(g)
@@ -225,9 +236,9 @@ class AchievableGrid:
 
     def quantize_up(self, power):
         cur = self.snap(power)
-        win = self._window()
+        win = max(self._window(), _TOL * 4)
         for _ in range(8):
-            above = [l for l in self._levels_in(cur - _EPS, cur + win) if l > cur + 1e-6]
+            above = [l for l in self._levels_in(cur - _EPS, cur + win) if l > cur + _TOL]
             if above:
                 return min(above)
             win *= 4
@@ -235,9 +246,9 @@ class AchievableGrid:
 
     def quantize_down(self, power):
         cur = self.snap(power)
-        win = self._window()
+        win = max(self._window(), _TOL * 4)
         for _ in range(8):
-            below = [l for l in self._levels_in(cur - win, cur + _EPS) if l < cur - 1e-6]
+            below = [l for l in self._levels_in(cur - win, cur + _EPS) if l < cur - _TOL]
             if below:
                 return max(below)
             win *= 4
