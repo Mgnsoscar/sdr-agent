@@ -455,3 +455,95 @@ Each stage is shippable and leaves the system working (v1 docs valid throughout)
   - *Remaining:* the client setting `SDR_CAL_FREQ_HZ` on a task from the script's
     `CAL_FREQ_PARAM` (task-creation wiring) — with the script now reading its own `--freq`,
     this only pins the agent's representative fold for the v1-compat scalar read-outs.
+
+
+## 12. Active components — a task-controlled gain/attenuation stage
+
+v2's derived planes are **passive**: a fixed Δ dB(f) baseline. An **active component**
+extends a derived plane with a `control` block so the stage can *dynamically* apply
+gain/attenuation through a controllable parameter of a task (e.g. a step attenuator's
+`attenuation`). It keeps the passive baseline (its behaviour at 0 dB applied) and layers a
+programmable offset on top — extending the achievable power range and changing the achievable
+*resolution* across it (attenuator-only at the bottom, SDR-only at the top, combined in the
+middle). Example: an SDR that delivers −40..0 dBm plus a 0..95 dB / 0.25 dB step attenuator
+gives an effective −135..0 dBm, and the operator asks for any power using only `--power`.
+
+### 12.1 Wire format — a `control` block on a derived plane
+
+Backward compatible: a derived plane is *active* iff it carries `control`; without it, it's
+passive exactly as before.
+
+```jsonc
+"attenuator_out": {
+  "type": "derived", "from": "sdr_output", "delta_db": 0.0,   // (or a component baseline)
+  "control": {
+    "task": "atten_set", "param": "attenuation",  // the task + one of its params to drive
+    "sense": "attenuation",                        // "attenuation" (param subtracts) | "gain" (adds)
+    "min_db": 0.0, "max_db": 95.0, "step_db": 0.25, // the param's own range + resolution
+    "engage_pct": 0.0                              // % of the SDR's dynamic range below which it engages
+  }
+}
+```
+
+Validation (`agent/calibration.py:_parse_control`, mirrored in the client's
+`_control_issues`): `task`/`param` non-empty, `sense ∈ {attenuation, gain}`, `min_db < max_db`,
+`step_db > 0`, `0 ≤ engage_pct ≤ 100`. A defective block raises `CalibrationError` (refuse),
+never a silent fall-back.
+
+### 12.2 The achievable-level resolver (shared, pure)
+
+`paramkit/achievable.py` (`AchievableGrid` + `Active`) is imported by BOTH the agent resolver
+and the transmit script, and mirrored **byte-identically** in the client
+(`sdr-client/state/achievable.py`). Model: `P = P_base(g) − R`, where `P_base(g)` is the
+delivered power with the SDR at grid gain `g` and every active component at rest (max applied
+gain), and `R ≥ 0` is a reduction the components spend on their own discrete grids.
+
+- **SDR-first.** The SDR carries the signal down to an engagement threshold
+  `T = S_lo + engage_pct/100 · (S_hi − S_lo)`; below `T` the SDR pins and the components fill
+  the rest (keeps the SDR out of its unstable low-gain region). `engage_pct = 0` ⇒ the SDR
+  uses its full range and the attenuator only extends below `S_lo`.
+- **Universal achievable snapping.** Because a fine component trims the fraction between the
+  SDR's coarse grid points, the achievable resolution is the finest device step across the
+  whole range. `snap` / `quantize_up` / `quantize_down` return only realizable levels — and
+  this holds for a plain SDR-only chain too (it snaps to the real gain grid).
+- **realize(power)** returns `{power_dbm, sdr_gain_db, settings}` where `settings` names each
+  component's `task`, `param` and the value to command on it. Multiple components with
+  different steps combine via a greedy chain-order realizer (no exponential enumeration).
+
+`ResolvedCalibration` exposes `has_active`, `realize`, `snap_power`, `quantize_*`, and emits an
+`active_components` list in the artifact; `min/max_power_dbm` come from the extended range.
+
+### 12.3 Auto-command both — the SDR *and* the component
+
+Requesting a calibrated `--power` drives BOTH the SDR (the transmit script maps its own SDR
+gain via the active-aware `PowerMap`) and each linked component (set to the realization's
+value). The component is always commanded **first** so the SDR never briefly transmits with
+the attenuator at rest.
+
+- **Live paths (client).** Run (`ui/run_task_dialog.py`, incl. quick-play) and Tune
+  (`ui/live_tune_dialog.py`) call `state/power_fold.py:active_settings(...)` and
+  `set_task_params` each linked control task alongside starting/tuning the transmit task.
+- **Unattended paths (agent).** The `SequenceRunner` resolves the active components at fire
+  time (`ProcessManager.active_settings`) and retunes each linked control task just before
+  every `start` / `run` / `tune` step that sets an absolute `--power`. Because ramps expand
+  into run/tune steps, a power-sweeping ramp is covered by the same hook. The control task
+  must be running (start it in an earlier step, or keep it always-on); a component that isn't
+  running is logged into the run and skipped, never fatal.
+
+### 12.4 Editor / capability
+
+The Calibration tab's chain builder adds an **Active component** stage (an ACTIVE badge, a
+set-task / set-param picker fed from the unit's tasks and each task's `/scripts/{name}/params`,
+a sense selector, and min/max/step/engage fields). Saving an active-component document is gated
+on the agent's `calibration-active-components` capability (agent ≥ 1.8.0), mirroring the
+existing component gate.
+
+### 12.5 Status — done
+
+Agent core + resolver (`agent/calibration.py`, `paramkit/achievable.py`,
+`tests/test_calibration_active.py`), transmit-script consumer (`paramkit/calkit.py`), client
+fold + universal achievable slider (`state/power_fold.py`, `state/achievable.py`,
+`ui/param_form.py`), runtime auto-commanding (client Run/Tune + agent sequences/ramps), and the
+calibration-panel active-stage editor. Covered across `test_calibration_active`,
+`test_power_fold`, `test_achievable_levels`, `test_active_autocommand` (client) and
+`test_calibration_active`, `test_sequence_active` (agent).
