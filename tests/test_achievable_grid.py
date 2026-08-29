@@ -74,6 +74,18 @@ def test_no_active_component_snaps_to_the_sdr_gain_grid():
     assert g.quantize_down(-20.0) == pytest.approx(-21.0)   # the real 1 dB gain grid
 
 
+def test_no_active_threshold_gain_robust_to_inverse_float_noise():
+    # The threshold/float-overshoot fix must apply to a plain SDR-only (no-active) chain too:
+    # a fractional operating-plane floor whose inverse carries float noise must not drop the
+    # minimum SDR gain from the achievable set.
+    pfg = lambda x: x - 63.7                           # min-gain power = −63.7 (fractional)
+    gfp = lambda p: (p + 63.7) + 1e-7                 # inverse with +float noise
+    g = AchievableGrid(pfg, gfp, 0.0, 89.75, 0.25, [])   # NO active components
+    assert g.bounds()[0] == pytest.approx(pfg(0.0))   # floor is the min-gain level, not one up
+    assert g.realize(pfg(0.0))["sdr_gain_db"] == pytest.approx(0.0)
+    assert g.quantize_up(pfg(0.0)) == pytest.approx(pfg(0.25))   # next real gain-grid level
+
+
 def test_engage_threshold_keeps_sdr_higher_with_odd_steps():
     g = _grid(1.0, 0.3, engage_pct=50.0)              # threshold at −20 dBm
     assert g.bounds()[0] == pytest.approx(-50.0)      # −20 − 30
