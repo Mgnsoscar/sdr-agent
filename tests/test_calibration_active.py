@@ -218,6 +218,33 @@ def test_active_component_baseline_folds_per_frequency():
     assert r2.realize(-50.0, freq=2.0e9)["settings"][0]["value"] == pytest.approx(4.0)
 
 
+def test_active_inline_table_baseline_folds_per_frequency():
+    # The active component's OWN inline Δ dB(f) baseline table (not a shared component ref):
+    # a frequency-dependent insertion loss that folds into the range and the split per freq.
+    doc = _doc(_control())
+    doc["chain"]["planes"]["atten_out"] = {
+        "type": "derived", "from": "sdr_output",
+        "delta_db_by_freq": [[1.0e9, -4.0], [2.0e9, -6.0]], "control": _control()}
+    r1 = resolve(doc, None, "sig", {}, freq_hz=1.0e9)
+    r2 = resolve(doc, None, "sig", {}, freq_hz=2.0e9)
+    assert r1.max_power_dbm == pytest.approx(-4.0) and r2.max_power_dbm == pytest.approx(-6.0)
+    assert r1.realize(-50.0, freq=1.0e9)["settings"][0]["value"] == pytest.approx(6.0)
+    assert r2.realize(-50.0, freq=2.0e9)["settings"][0]["value"] == pytest.approx(4.0)
+    # the inline table rides the artifact's passive_hops so a consumer folds it too
+    art = r1.to_public_dict()
+    hop = next(h for h in art["passive_hops"] if h["plane"] == "atten_out")
+    assert hop["delta_db_by_freq"] == [[1.0e9, -4.0], [2.0e9, -6.0]] and hop["component"] is None
+
+
+def test_derived_plane_rejects_more_than_one_baseline_source():
+    doc = _doc(None)
+    doc["chain"]["planes"]["atten_out"] = {
+        "type": "derived", "from": "sdr_output", "delta_db": 0.0,
+        "delta_db_by_freq": [[1.0e9, -4.0]]}
+    with pytest.raises(CalibrationError):
+        resolve(doc, None, "sig", {})
+
+
 def test_two_active_components_with_different_steps_combine():
     # A coarse 1 dB attenuator (0..30) in series with a fine 0.1 dB one (0..5): the
     # combined reduction budget is 35 dB and both steps are realizable.

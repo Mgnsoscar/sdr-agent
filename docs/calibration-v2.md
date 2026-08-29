@@ -490,16 +490,20 @@ Validation (`agent/calibration.py:_parse_control`, mirrored in the client's
 `step_db > 0`, `0 ≤ engage_pct ≤ 100`. A defective block raises `CalibrationError` (refuse),
 never a silent fall-back.
 
-**Baseline vs. programmable range — the plane's `delta_db` is the part that's always there.**
-The plane's `delta_db` (or component baseline table) is its behaviour at **0 dB applied** —
-i.e. a real attenuator's **fixed insertion loss**. The `control` range (`min_db..max_db`) is
-the *programmable* attenuation on top of that. The resolver folds the baseline into the range
-(so it shifts the whole achievable range down — e.g. a 5 dB insertion loss caps the top at
-5 dB below the SDR's own maximum) and the SDR-first split, then commands the device with the
-**programmable part only** (its insertion loss is inherent, never commanded). So an attenuator
-with 5 dB insertion loss set to `--attenuation 1` delivers 6 dB of loss, and `delta_db: -5`
-makes the maths — and the presented `--power` range — reflect exactly that. Use a component
-baseline (freq table) instead of a constant when the insertion loss varies with frequency.
+**Baseline vs. programmable range — the plane's baseline is the part that's always there.**
+An active plane's baseline is its behaviour at **0 dB applied** — i.e. a real attenuator's
+**fixed insertion loss** — and it belongs to the component itself. It comes from exactly one
+of: `delta_db` (a flat constant), `delta_db_by_freq` (the component's **own inline Δ dB(f)
+table**, for a frequency-dependent insertion loss), or `component` (a shared catalog part, when
+you deliberately want to reuse one). The `control` range (`min_db..max_db`) is the
+*programmable* attenuation on top. The resolver folds the baseline into the range (so it shifts
+the whole achievable range down — e.g. a 5 dB insertion loss caps the top at 5 dB below the
+SDR's own maximum, and a frequency-dependent loss shifts it per frequency) and into the
+SDR-first split, then commands the device with the **programmable part only** (its insertion
+loss is inherent, never commanded). So an attenuator with 5 dB insertion loss set to
+`--attenuation 1` delivers 6 dB of loss, and `"delta_db_by_freq": [[1e9,-5],[6e9,-8]]` makes
+the maths — and the presented `--power` range — track that across the band. Whichever form the
+baseline takes, it rides the artifact's `passive_hops` so the script and client fold it too.
 
 ### 12.2 The achievable-level resolver (shared, pure)
 
@@ -557,9 +561,10 @@ sends `--power` as it always has.
 The Calibration tab's chain builder adds an **Active component** stage (an ACTIVE badge, a
 set-task / set-param picker fed from the unit's tasks and each task's `/scripts/{name}/params`,
 a sense selector, and min/max/step/engage fields). Its **baseline** (the fixed insertion loss)
-is chosen in the editor as either a **constant Δ dB** (flat) or a **component** — a Δ dB(f)
-table from the component library, plotted inline — so a frequency-dependent insertion loss
-folds into the range and the SDR/attenuation split at each signal's frequency. Saving an
+is chosen in the editor as either a **constant Δ dB** (flat) or the component's **own inline
+Δ dB(f) table** — entered as a grid on the active stage and plotted inline (it belongs to the
+component, not the shared library) — so a frequency-dependent insertion loss folds into the
+range and the SDR/attenuation split at each signal's frequency. Saving an
 active-component document is gated on the agent's `calibration-active-components` capability
 (agent ≥ 1.8.0), mirroring the existing component gate.
 

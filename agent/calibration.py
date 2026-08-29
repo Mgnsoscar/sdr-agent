@@ -1056,13 +1056,16 @@ def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
                 raise CalibrationError(f"derived plane {name!r} has no 'from'")
             has_comp = "component" in spec
             has_delta = "delta_db" in spec
-            if has_comp and has_delta:
+            has_table = "delta_db_by_freq" in spec        # inline Δ dB(f) table (owns its own)
+            n_baseline = has_comp + has_delta + has_table
+            if n_baseline > 1:
                 raise CalibrationError(
-                    f"derived plane {name!r} has both 'component' and 'delta_db' "
-                    f"(use one)")
-            if not has_comp and not has_delta:
+                    f"derived plane {name!r} has more than one of 'component', 'delta_db', "
+                    f"'delta_db_by_freq' (use exactly one)")
+            if n_baseline == 0:
                 raise CalibrationError(
-                    f"derived plane {name!r} has neither 'component' nor 'delta_db'")
+                    f"derived plane {name!r} has none of 'component', 'delta_db', "
+                    f"'delta_db_by_freq'")
             comp_id = ""
             if has_comp:
                 comp_id = spec["component"]
@@ -1073,6 +1076,8 @@ def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
                         f"{comp_id!r}")
                 table = _freq_table(comp.get("delta_db_by_freq"),
                                     f"component {comp_id!r}")
+            elif has_table:                               # the plane's OWN frequency table
+                table = _freq_table(spec["delta_db_by_freq"], f"plane {name!r}")
             else:
                 table = [(0.0, float(spec["delta_db"]))]   # constant, frequency-independent
             # An ACTIVE component adds a `control` block on top of its passive baseline.
