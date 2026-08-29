@@ -712,6 +712,42 @@ class ProcessManager:
         """Read a running task's current + applied live-parameter values."""
         return await self._get(name).get_params()
 
+    def active_settings(self, task_name: str, power: Optional[float],
+                        freq_hz: Optional[float] = None) -> List[dict]:
+        """The active-component commands to issue alongside an absolute ``power`` (dBm) on
+        ``task_name`` — the agent-side half of 'auto-command both' for sequences/plans. Each
+        is ``{plane, task, param, applied_db, value}`` from the SDR-first realization, naming
+        a linked control task (e.g. a step attenuator), its parameter, and the value to set so
+        the SDR + the component together deliver ``power``. Empty when the task didn't opt into
+        calibration, the unit isn't calibrated for its signal, the chain has no active
+        components, or ``power`` is None. Never raises — a resolution problem yields []."""
+        if power is None:
+            return []
+        try:
+            cfg = self._get(task_name).config
+        except KeyError:
+            return []
+        signal_id = cfg.env.get(_agentcfg.CAL_SIGNAL_ID_ENV)
+        if not signal_id:
+            return []
+        if freq_hz is None:
+            raw = cfg.env.get(_agentcfg.CAL_FREQ_HZ_ENV)
+            if raw:
+                try:
+                    freq_hz = float(raw)
+                except (TypeError, ValueError):
+                    freq_hz = None
+        try:
+            resolved = _calib.resolve_from_files(
+                _agentcfg.CALIBRATION_DOC, _agentcfg.CALIBRATION_DEFAULTS, signal_id,
+                components_path=_agentcfg.CALIBRATION_COMPONENTS, freq_hz=freq_hz)
+        except _calib.CalibrationError as exc:
+            logger.warning("Active components for '%s': %s", task_name, exc)
+            return []
+        if resolved is None or not resolved.has_active:
+            return []
+        return resolved.realize(float(power), freq_hz)["settings"]
+
     async def restart(self, name: str, request: Optional[StartRequest] = None,
                       source: str = "manual") -> ProcessStatus:
         proc = self._get(name)

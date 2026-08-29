@@ -88,6 +88,31 @@ def _run_id() -> str:
     return "run_" + secrets.token_hex(4)
 
 
+# The absolute-power flags the fleet's transmit scripts use (mirrors the client's
+# ui.param_form._POWER_FLAGS); a step setting one drives the active components too.
+_POWER_FLAGS = ("--power", "-Power")
+
+
+def _step_power(step: "StepFire") -> Optional[float]:
+    """The absolute --power (dBm) a step sets, or None. A start/run step carries it as a
+    trailing CLI arg; a tune step carries it as the live param ``power``."""
+    if step.action == "tune":
+        v = (step.params or {}).get("power")
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+    args = list(step.args or [])
+    val = None
+    for i, a in enumerate(args):
+        if a in _POWER_FLAGS and i + 1 < len(args):
+            try:
+                val = float(args[i + 1])
+            except (TypeError, ValueError):
+                pass
+    return val
+
+
 def _fmt_ramp_value(value: float, integer: bool) -> str:
     """A ramp point's value as a CLI argument string: whole integers (and int-typed
     params) render without a decimal so `type=int` argparse accepts them."""
@@ -780,6 +805,11 @@ class SequenceRunner:
             if step.action in ("start", "run"):
                 rl.watch_task(step.task_name)   # collect this task's output from here
 
+        # Auto-command both: an absolute --power this step sets on a calibrated transmit
+        # task also drives its linked active components (e.g. a step attenuator). Done
+        # BEFORE the transmit action so the component is in position first.
+        await self._command_active(step, rl)
+
         try:
             if step.action == "start":
                 # Start with any resume-offset injection PLUS this step's own extra
@@ -840,6 +870,36 @@ class SequenceRunner:
             logger.info("Run %s completed", run.id)
         elif run.open_ended and all(s.fired_actual is not None for s in run.steps):
             logger.info("Run %s now fully on-air (open-ended; awaiting abort)", run.id)
+
+    async def _command_active(self, step: StepFire, rl) -> None:
+        """Command each linked active component (attenuator, …) for an absolute --power this
+        step sets on a calibrated transmit task — the agent-side half of 'auto-command both'.
+        The component's control task is retuned live (it must be running — start it in an
+        earlier step, or keep it always-on). Best-effort: a component that isn't running or
+        rejects is logged into the run and skipped, never derailing the transmit."""
+        power = _step_power(step)
+        if power is None:
+            return
+        try:
+            settings = self._manager.active_settings(step.task_name, power)
+        except Exception as exc:                         # active_settings shouldn't raise
+            logger.warning("Run %s: active components for '%s' failed: %s",
+                           step.task_name, step.task_name, exc)
+            return
+        for s in settings:
+            task, values = s.get("task"), {s.get("param"): s.get("value")}
+            try:
+                result = await self._manager.set_params(task, values, wait=0.0)
+            except Exception as exc:
+                if rl is not None:
+                    rl.annotate(f"   ⚠ component '{task}' not set ({exc}) — is it running?")
+                logger.warning("Run: active component '%s' not set: %s", task, exc)
+                continue
+            if rl is not None:
+                rl.annotate(f"   ◈ component {task} {s.get('param')}={s.get('value')}")
+                if isinstance(result, dict) and result.get("rejected"):
+                    rl.annotate("   ⚠ component tune rejected: " + "; ".join(
+                        f"{k} ({v})" for k, v in result["rejected"].items()))
 
     # ── Abort ──────────────────────────────────────────────────────────────────
 
