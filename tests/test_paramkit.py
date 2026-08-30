@@ -163,6 +163,33 @@ def main() -> int:
     print("slug:")
     check(slug("WiFi ch1 (2.4 GHz)") == "wifi_ch1_2_4_ghz", "slug normalises label")
 
+    print("conditional visibility (show_when) + derived fields:")
+    sm = (Script("bandmode")
+          .choice("-Band-mode", "--band-mode",
+                  options={"Centre + width": "center_bw", "Start / stop": "start_stop"},
+                  default="center_bw")
+          .number("-Center", "--freq", unit="MHz", default=1575.42,
+                  show_when={"band_mode": "center_bw"})
+          .number("-Start", "--start", unit="MHz", min=70, max=6000,
+                  show_when={"band_mode": "start_stop"})
+          .number("-Stop", "--stop", unit="MHz", min=70, max=6000,
+                  show_when={"band_mode": "start_stop"})
+          .derived("-Sweep-width", name="band_span", unit="MHz",
+                   formula={"span": ["start", "stop"]}, min=0.001, max=55.0,
+                   show_when={"band_mode": "start_stop"})
+          .derived("-Carrier", name="band_center", unit="MHz", is_freq=True,
+                   formula={"center": ["start", "stop"]},
+                   show_when={"band_mode": "start_stop"}))
+    smd = {p["name"]: p for p in sm.describe()["params"]}
+    check(smd["freq"]["show_when"] == {"band_mode": "center_bw"}, "show_when on a number surfaces")
+    check(smd["band_span"]["kind"] == "derived", "derived kind surfaces")
+    check(smd["band_span"]["formula"] == {"span": ["start", "stop"]}, "derived formula surfaces")
+    check(smd["band_center"]["is_freq"] is True, "derived is_freq surfaces")
+    ns = sm.parse(["--band-mode", "start_stop", "--start", "1570", "--stop", "1580"])
+    check(getattr(ns, "band_mode") == "start_stop", "mode selector parses")
+    check(not hasattr(ns, "band_span") and not hasattr(ns, "band_center"),
+          "derived fields are never CLI arguments")
+
     print()
     if _failures:
         print(f"{len(_failures)} FAILURE(S)")

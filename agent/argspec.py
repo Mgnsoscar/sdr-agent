@@ -184,10 +184,11 @@ _BUILDERS = {
     "text": "text",
     "choice": "choice",
     "flag": "flag",
+    "derived": "derived",
 }
 # kind → classic argparse "type" (for backward-compatible consumers)
 _KIND_TYPE = {"number": "float", "integer": "int", "text": "str",
-              "choice": "str", "flag": None}
+              "choice": "str", "flag": None, "derived": "float"}
 
 
 def _slug(text: str) -> str:
@@ -305,6 +306,15 @@ def extract_paramkit_spec(source: str) -> Dict[str, Any]:
         live = bool(_literal(kw["live"], consts)) if "live" in kw else False
         default = (_literal(kw["default"], consts) if "default" in kw
                    else (False if kind == "flag" else None))
+        # Conditional visibility / derived-value metadata (see paramkit.Param). None
+        # (or False) when absent, so every param dict carries the keys uniformly.
+        show_when = _literal(kw["show_when"], consts) if "show_when" in kw else None
+        if not isinstance(show_when, dict):
+            show_when = None
+        formula = _literal(kw["formula"], consts) if "formula" in kw else None
+        if not isinstance(formula, dict):
+            formula = None
+        is_freq = bool(_literal(kw["is_freq"], consts)) if "is_freq" in kw else False
 
         params.append({
             # rich (paramkit) fields
@@ -330,6 +340,10 @@ def extract_paramkit_spec(source: str) -> Dict[str, Any]:
             "is_flag": kind == "flag",
             "nargs": "+" if multiple else None,
             "help": _joined_help(kw["help"], consts) if "help" in kw else "",
+            # conditional visibility / derived-value metadata
+            "show_when": show_when,
+            "formula": formula,
+            "is_freq": is_freq,
         })
     # A calibration-aware script declares a stable CAL_SIGNAL_ID module constant; a
     # task opts into power calibration by setting SDR_CAL_SIGNAL_ID to it. Surface it

@@ -144,6 +144,30 @@ def main() -> int:
     spec3 = extract_params("import paramkit\n")
     check(spec3.get("params") == [], "no params, no crash")
 
+    print("show_when / derived metadata extracts statically:")
+    bsrc = (
+        "from paramkit import Script\n"
+        "MAXW = 55.0\n"
+        "script = (Script('band')\n"
+        "  .choice('-Band-mode','--band-mode',"
+        " options={'Centre + width':'center_bw','Start / stop':'start_stop'}, default='center_bw')\n"
+        "  .number('-Center','--freq', unit='MHz', default=1575.42, show_when={'band_mode':'center_bw'})\n"
+        "  .number('-Start','--start', unit='MHz', min=70, max=6000, show_when={'band_mode':'start_stop'})\n"
+        "  .number('-Stop','--stop', unit='MHz', min=70, max=6000, show_when={'band_mode':'start_stop'})\n"
+        "  .derived('-Sweep-width', name='band_span', unit='MHz',"
+        " formula={'span':['start','stop']}, min=0.001, max=MAXW, show_when={'band_mode':'start_stop'})\n"
+        "  .derived('-Carrier', name='band_center', unit='MHz', is_freq=True,"
+        " formula={'center':['start','stop']}, show_when={'band_mode':'start_stop'}))\n"
+    )
+    bspec = extract_params(bsrc)
+    bby = {p["name"]: p for p in bspec["params"]}
+    check(bby["freq"]["show_when"] == {"band_mode": "center_bw"}, "show_when extracted on a number")
+    check(bby["band_span"]["kind"] == "derived", "derived kind extracted")
+    check(bby["band_span"]["formula"] == {"span": ["start", "stop"]}, "derived formula extracted")
+    check(bby["band_span"]["max"] == 55.0, "derived bound (named const MAXW) resolves")
+    check(bby["band_center"]["is_freq"] is True, "derived is_freq extracted")
+    check(bby["band_mode"].get("show_when") is None, "a field without show_when carries None")
+
     print()
     if _failures:
         print(f"{len(_failures)} FAILURE(S)")
