@@ -199,15 +199,15 @@ def test_unknown_component_refuses():
 
 def test_component_and_delta_together_refuses():
     doc = _doc(cable="cable_flat")
-    doc["chain"]["planes"]["cable_output"]["delta_db"] = -1.0   # both → error
-    with pytest.raises(CalibrationError, match="both"):
+    doc["chain"]["planes"]["cable_output"]["delta_db"] = -1.0   # more than one → error
+    with pytest.raises(CalibrationError, match="more than one"):
         _resolve(doc)
 
 
 def test_derived_plane_with_neither_refuses():
     doc = _doc(cable="cable_flat")
     doc["chain"]["planes"]["cable_output"] = {"type": "derived", "from": "amplifier_output"}
-    with pytest.raises(CalibrationError, match="neither"):
+    with pytest.raises(CalibrationError, match="none of"):
         _resolve(doc)
 
 

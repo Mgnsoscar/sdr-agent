@@ -147,15 +147,16 @@ INTEGER = "integer" # int; same as number but whole values
 TEXT = "text"       # free string
 CHOICE = "choice"   # one of a fixed set of strings → dropdown
 FLAG = "flag"       # boolean switch → checkbox
+DERIVED = "derived" # read-only value computed from other fields (never a CLI argument)
 
 
 @dataclass
 class Param:
     """One declared parameter. You normally create these via Script's builder
-    methods (number/integer/text/choice/flag) rather than directly."""
+    methods (number/integer/text/choice/flag/derived) rather than directly."""
     name: str                       # dest / canonical name
     flags: List[str]                # CLI flags, e.g. ["-f", "--freq"]; empty = positional
-    kind: str                       # one of NUMBER/INTEGER/TEXT/CHOICE/FLAG
+    kind: str                       # one of NUMBER/INTEGER/TEXT/CHOICE/FLAG/DERIVED
     help: str = ""
     unit: str = ""
     min: Optional[float] = None
@@ -169,6 +170,18 @@ class Param:
     required: bool = False
     multiple: bool = False          # accept more than one value (argparse nargs="+")
     live: bool = False              # tunable while the script runs (see Script.live_control)
+    # Conditional visibility: {controller_name: value | [values]}. A GUI shows this
+    # field only when EVERY named controller's current value is (one of) the given
+    # value(s). None ⇒ always shown. Purely presentational — the CLI is unaffected.
+    show_when: Optional[Dict[str, Any]] = None
+    # DERIVED only: how the read-only value is computed from other fields. A small
+    # spec the GUI evaluates, e.g. {"center": ["start", "stop"]} = (start+stop)/2 or
+    # {"span": ["start", "stop"]} = |stop-start|.
+    formula: Optional[Dict[str, Any]] = None
+    # Marks a field as the calibration fold frequency (see CAL_FREQ_PARAM). Used when
+    # the real frequency field is hidden by a mode — the GUI folds --power at the
+    # visible is_freq field instead (e.g. a derived centre = midpoint of start/stop).
+    is_freq: bool = False
 
     @property
     def display_name(self) -> str:
@@ -194,6 +207,9 @@ class Param:
             "required": self.required,
             "multiple": self.multiple,
             "live": self.live,
+            "show_when": dict(self.show_when) if self.show_when else None,
+            "formula": dict(self.formula) if self.formula else None,
+            "is_freq": self.is_freq,
         }
 
 
@@ -318,36 +334,40 @@ class Script:
                unit: str = "", min: Optional[float] = None, max: Optional[float] = None,
                step: Optional[float] = None, presets: PresetsInput = None,
                default: Optional[float] = None, required: bool = False,
-               multiple: bool = False, live: bool = False) -> "Script":
+               multiple: bool = False, live: bool = False,
+               show_when: Optional[Dict[str, Any]] = None) -> "Script":
         """A floating-point parameter with optional unit, range, and named presets.
 
         Pass live=True to mark it tunable while the script runs — a GUI can then
         offer a control that applies changes mid-run (the script reads updates via
-        Script.live_control)."""
+        Script.live_control). Pass show_when={controller: value} to reveal the field
+        only in a given mode (see Param.show_when)."""
         n, flags = self._derive_name(flags, name)
         return self._add(Param(
             name=n, flags=flags, kind=NUMBER, help=help, unit=unit, min=min, max=max,
             step=step, presets=_normalise_presets(presets), default=default,
-            required=required, multiple=multiple, live=live,
+            required=required, multiple=multiple, live=live, show_when=show_when,
         ))
 
     def integer(self, *flags: str, name: Optional[str] = None, help: str = "",
                 unit: str = "", min: Optional[int] = None, max: Optional[int] = None,
                 step: Optional[int] = None, presets: PresetsInput = None,
                 default: Optional[int] = None, required: bool = False,
-                multiple: bool = False, live: bool = False) -> "Script":
+                multiple: bool = False, live: bool = False,
+                show_when: Optional[Dict[str, Any]] = None) -> "Script":
         """A whole-number parameter. Like number() but values are ints. See number()
-        for the live= flag."""
+        for the live= and show_when= flags."""
         n, flags = self._derive_name(flags, name)
         return self._add(Param(
             name=n, flags=flags, kind=INTEGER, help=help, unit=unit, min=min, max=max,
             step=step, presets=_normalise_presets(presets), default=default,
-            required=required, multiple=multiple, live=live,
+            required=required, multiple=multiple, live=live, show_when=show_when,
         ))
 
     def choice(self, *flags: str, options: ChoiceInput, name: Optional[str] = None,
                help: str = "", unit: str = "", default: Any = None,
-               required: bool = False, live: bool = False) -> "Script":
+               required: bool = False, live: bool = False,
+               show_when: Optional[Dict[str, Any]] = None) -> "Script":
         """A parameter restricted to a fixed set of options (a GUI dropdown).
 
         ``options`` is either a plain sequence of values — ``["sc8", "sc16"]`` — or a
@@ -373,7 +393,7 @@ class Script:
         return self._add(Param(
             name=n, flags=flags, kind=CHOICE, help=help, unit=unit, choices=opts,
             choice_labels=labels, choice_values=values, default=default,
-            required=required, live=live,
+            required=required, live=live, show_when=show_when,
         ))
 
     @staticmethod
@@ -400,21 +420,43 @@ class Script:
 
     def text(self, *flags: str, name: Optional[str] = None, help: str = "",
              default: Optional[str] = None, required: bool = False,
-             multiple: bool = False, live: bool = False) -> "Script":
-        """A free-form string parameter. See number() for the live= flag."""
+             multiple: bool = False, live: bool = False,
+             show_when: Optional[Dict[str, Any]] = None) -> "Script":
+        """A free-form string parameter. See number() for the live= and show_when= flags."""
         n, flags = self._derive_name(flags, name)
         return self._add(Param(
             name=n, flags=flags, kind=TEXT, help=help, default=default,
-            required=required, multiple=multiple, live=live,
+            required=required, multiple=multiple, live=live, show_when=show_when,
         ))
 
     def flag(self, *flags: str, name: Optional[str] = None, help: str = "",
-             default: bool = False, live: bool = False) -> "Script":
+             default: bool = False, live: bool = False,
+             show_when: Optional[Dict[str, Any]] = None) -> "Script":
         """A boolean on/off switch (a GUI checkbox). Present on the CLI ⇒ True.
-        See number() for the live= flag."""
+        See number() for the live= and show_when= flags."""
         n, flags = self._derive_name(flags, name)
         return self._add(Param(
             name=n, flags=flags, kind=FLAG, help=help, default=bool(default), live=live,
+            show_when=show_when,
+        ))
+
+    def derived(self, *flags: str, name: Optional[str] = None, help: str = "",
+                unit: str = "", min: Optional[float] = None, max: Optional[float] = None,
+                formula: Optional[Dict[str, Any]] = None, is_freq: bool = False,
+                show_when: Optional[Dict[str, Any]] = None) -> "Script":
+        """A read-only value COMPUTED from other fields — never a CLI argument, so the
+        script builds the same quantity itself. A GUI shows it live and, if min/max are
+        given, flags when it falls outside them (e.g. a sweep width that exceeds the
+        maximum). ``formula`` is a small spec the GUI evaluates over other params' names,
+        e.g. ``{"center": ["start", "stop"]}`` = (start+stop)/2 or
+        ``{"span": ["start", "stop"]}`` = |stop-start|. Pass is_freq=True to make it the
+        calibration fold frequency when the real frequency field is hidden by a mode (the
+        GUI folds --power here instead). Use a single display-only pseudo-flag for the
+        label and an explicit name=, e.g. ``.derived("-Sweep-width", name="band_span", …)``."""
+        n, flags = self._derive_name(flags, name)
+        return self._add(Param(
+            name=n, flags=flags, kind=DERIVED, help=help, unit=unit, min=min, max=max,
+            formula=formula, is_freq=is_freq, show_when=show_when,
         ))
 
     # ── argparse construction ────────────────────────────────────────────────
@@ -431,6 +473,8 @@ class Script:
                 help="print this script's parameter schema as JSON and exit",
             )
         for p in self._params:
+            if p.kind == DERIVED:
+                continue          # display-only; the script computes it, never the CLI
             self._add_to_parser(parser, p)
         return parser
 

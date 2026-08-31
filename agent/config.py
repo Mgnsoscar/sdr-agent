@@ -218,7 +218,7 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # curve (per-limit anchor_curve in freq_dependent_limits) so a consumer inverts the limit
 # against the right curve; calkit (OTA bundle) and the client's PowerFold both honour it. The
 # scalar bounds were always correct; only the save-time refusal and the v2 publish changed.
-AGENT_VERSION = "1.7.5"
+AGENT_VERSION = "1.8.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -252,6 +252,10 @@ AGENT_CAPABILITIES = [
     "calibration-freq-limit-reported",   # a frequency-dependent limit is allowed with a
                                          # 'reported' operating plane: the limit inverts against
                                          # its own published limiting curve (per-limit anchor)
+    "calibration-active-components",     # a derived plane may carry a 'control' block — a
+                                         # task-driven gain/attenuation stage (e.g. a step
+                                         # attenuator) that extends the achievable power range
+                                         # and is auto-commanded alongside the SDR
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

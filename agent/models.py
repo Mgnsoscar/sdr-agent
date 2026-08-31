@@ -493,18 +493,23 @@ class SetTimeResult(BaseModel):
 # definitions only — a running task or an active run is never disturbed.
 
 class LibraryScript(BaseModel):
-    name: str                          # script filename, e.g. "freq.py"
+    name: str                          # script filename, e.g. "freq.py" — its identity
     content: str = ""                  # the script's source
     params: list[dict] = []            # argparse/paramkit schema (as /scripts/{name}/params)
     # Unit types this script targets; empty = shared/all. Round-tripped for the
     # client's library scoping (the agent does not act on it).
     types: list[str] = []
+    # Organizational folder — a real subdirectory under the scripts dir at deploy.
+    # The name stays the identity (tasks reference the basename), so the agent
+    # resolves a basename to its nested path when it launches or serves a script.
+    folder: str = ""
 
 
 class Library(BaseModel):
     scripts: list[LibraryScript] = []
     tasks: list[TaskConfig] = []
     sequences: list[Sequence] = []
+    folders: list[str] = []            # declared folder paths, so an empty folder persists
 
 
 class DeployLibraryRequest(BaseModel):

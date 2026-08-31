@@ -27,6 +27,7 @@ from typing import Deque, Dict, List, Optional
 
 from . import config as _agentcfg   # module import; container methods use a local `cfg`
 from . import calibration as _calib
+from .argspec import extract_params
 from .log_manager import LogManager
 from .models import (
     CrashEvent, ExitRecord, ProcessState, ProcessStatus,
@@ -143,6 +144,25 @@ def _script_prefix(command: list) -> list:
     return list(command[:1])
 
 
+def _resolve_script_path(cmd: list) -> list:
+    """If a task's script argument no longer sits directly in the scripts dir (it was
+    filed into an organizational subfolder), find it there by basename. Scripts keep
+    their basename identity, so a launch command needn't change when a script moves."""
+    out = list(cmd)
+    for i, a in enumerate(out):
+        if isinstance(a, str) and a.endswith(".py"):
+            if not os.path.isfile(a):
+                base = os.path.basename(a)
+                root = os.path.dirname(a) or "."
+                if os.path.isdir(root):
+                    for dirpath, _dirs, files in os.walk(root):
+                        if base in files:
+                            out[i] = os.path.join(dirpath, base)
+                            break
+            break
+    return out
+
+
 def _build_command(command: list, args: list, replace: bool) -> list:
     """Build the launch command. replace=True → [interpreter, script, *args]
     (args are the complete set); replace=False → command + args (append)."""
@@ -150,7 +170,34 @@ def _build_command(command: list, args: list, replace: bool) -> list:
         cmd = _script_prefix(command) + list(args)
     else:
         cmd = list(command) + list(args)
-    return _resolve_exe(cmd)
+    return _resolve_script_path(_resolve_exe(cmd))
+
+
+# Absolute-power flags the fleet's transmit scripts use (mirror of the client's
+# ui.param_form._POWER_FLAGS); a launch/tune setting one drives the active components too.
+_POWER_FLAGS = ("--power", "-Power")
+# How long to wait for a one-shot active-component set (e.g. an attenuator) to finish before
+# letting the transmit proceed — so the component is in position first, without a hung set
+# blocking a whole test campaign.
+_ACTIVE_SET_TIMEOUT_S = 5.0
+
+
+def _power_from_command(cmd) -> Optional[float]:
+    """The absolute --power (dBm) a launch command sets, or None."""
+    val = None
+    for i, a in enumerate(cmd or []):
+        if a in _POWER_FLAGS and i + 1 < len(cmd):
+            try:
+                val = float(cmd[i + 1])
+            except (TypeError, ValueError):
+                pass
+    return val
+
+
+def _fmt_num(v: float) -> str:
+    """A numeric CLI argument value: whole numbers without a trailing .0 so int-typed
+    argparse params accept them (e.g. 60.0 → '60', 0.25 → '0.25')."""
+    return f"{float(v):g}"
 
 
 def _resolve_exe(cmd: list) -> list:
@@ -553,6 +600,8 @@ class ProcessManager:
         # "already running" collision. Keyed by a monotonic id → (proc, fh, run_id).
         self._oneshots: Dict[int, tuple] = {}
         self._oneshot_seq = 0
+        # Active-component control-param → CLI flag, cached per script (see _active_flag).
+        self._active_flags: Dict[str, dict] = {}
 
     def _make_proc(self, cfg: TaskConfig) -> ManagedProcess:
         return ManagedProcess(
@@ -629,6 +678,9 @@ class ProcessManager:
         mp = self._get(name)
         cfg = mp.config
         cmd = _build_command(cfg.command, list(args), replace=True)
+        # Auto-command both: a one-shot transmit run that sets an absolute --power also drives
+        # its linked active components (attenuator, …) first.
+        await self._precommand_active(name, _power_from_command(cmd))
         env = {**os.environ, **cfg.env}
         env.setdefault("PYTHONUNBUFFERED", "1")   # flush print()/stdout live, like logging
         try:
@@ -689,6 +741,12 @@ class ProcessManager:
     async def start(self, name: str, request: Optional[StartRequest] = None,
                     source: str = "manual") -> ProcessStatus:
         proc = self._get(name)
+        # Auto-command both: if this launch sets an absolute --power on a calibrated transmit
+        # task with active components, position each linked component (attenuator, …) first —
+        # as a one-shot, so nothing has to be running and the operator never sees it.
+        req = request or StartRequest()
+        cmd = _build_command(proc.config.command, req.args, req.replace_args)
+        await self._precommand_active(name, _power_from_command(cmd))
         await proc.start(request)
         status = proc.status()
         if source == "manual":
@@ -706,15 +764,144 @@ class ProcessManager:
     async def set_params(self, name: str, values: dict, wait: float = 1.0) -> dict:
         """Retune a running task's live parameters. Raises KeyError (unknown task)
         or RuntimeError (not running / no live params)."""
+        # A live retune of an absolute --power on a calibrated transmit task also repositions
+        # its linked active components (attenuator, …) first.
+        p = values.get("power")
+        await self._precommand_active(name, p if isinstance(p, (int, float)) else None)
         return await self._get(name).set_params(values, wait)
 
     async def get_params(self, name: str) -> dict:
         """Read a running task's current + applied live-parameter values."""
         return await self._get(name).get_params()
 
+    def active_settings(self, task_name: str, power: Optional[float],
+                        freq_hz: Optional[float] = None) -> List[dict]:
+        """The active-component commands to issue alongside an absolute ``power`` (dBm) on
+        ``task_name`` — driven automatically whenever the task is launched/tuned (Run, quick
+        play, sequences, ramps, the API). Each is ``{plane, task, param, applied_db, value}``
+        from the SDR-first realization, naming
+        a linked control task (e.g. a step attenuator), its parameter, and the value to set so
+        the SDR + the component together deliver ``power``. Empty when the task didn't opt into
+        calibration, the unit isn't calibrated for its signal, the chain has no active
+        components, or ``power`` is None. Never raises — a resolution problem yields []."""
+        if power is None:
+            return []
+        try:
+            cfg = self._get(task_name).config
+        except KeyError:
+            return []
+        signal_id = cfg.env.get(_agentcfg.CAL_SIGNAL_ID_ENV)
+        if not signal_id:
+            return []
+        if freq_hz is None:
+            raw = cfg.env.get(_agentcfg.CAL_FREQ_HZ_ENV)
+            if raw:
+                try:
+                    freq_hz = float(raw)
+                except (TypeError, ValueError):
+                    freq_hz = None
+        try:
+            resolved = _calib.resolve_from_files(
+                _agentcfg.CALIBRATION_DOC, _agentcfg.CALIBRATION_DEFAULTS, signal_id,
+                components_path=_agentcfg.CALIBRATION_COMPONENTS, freq_hz=freq_hz)
+        except _calib.CalibrationError as exc:
+            logger.warning("Active components for '%s': %s", task_name, exc)
+            return []
+        if resolved is None or not resolved.has_active:
+            return []
+        return resolved.realize(float(power), freq_hz)["settings"]
+
+    def _active_flag(self, task_name: str, param: str) -> str:
+        """The CLI flag for an active component's control ``param``, read from its task's
+        script argspec (cached per script). Falls back to ``--<param>`` when the script can't
+        be read or declares no such parameter."""
+        fallback = f"--{param}"
+        try:
+            cfg = self._get(task_name).config
+        except KeyError:
+            return fallback
+        script = next((a for a in cfg.command
+                       if isinstance(a, str) and a.endswith(".py")), None)
+        if not script:
+            return fallback
+        if script not in self._active_flags:
+            flags: dict = {}
+            p = Path(script)
+            if not p.is_absolute() and cfg.working_dir:
+                p = Path(cfg.working_dir) / script
+            try:
+                source = p.read_text(encoding="utf-8", errors="replace")
+                for s in (extract_params(source) or {}).get("params", []):
+                    opts = [f for f in (s.get("flags") or []) if f.startswith("--")] \
+                        or (s.get("flags") or [])
+                    if s.get("dest") and opts:
+                        flags[s["dest"]] = opts[0]
+            except OSError:
+                flags = {}
+            self._active_flags[script] = flags
+        return self._active_flags[script].get(param, fallback)
+
+    async def _launch_oneshot_wait(self, name: str, args: List[str],
+                                   timeout: float = _ACTIVE_SET_TIMEOUT_S) -> Optional[int]:
+        """Launch a task's command as a transient process and AWAIT its exit (with a timeout),
+        appending its output to the task's log. Used to set an active component (e.g. an
+        attenuator) to a value and have it exit — no long-running control task needed."""
+        mp = self._get(name)
+        cfg = mp.config
+        cmd = _build_command(cfg.command, list(args), replace=True)
+        env = {**os.environ, **cfg.env}
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        try:
+            fh = mp.log.current.open("ab")
+        except OSError:
+            fh = None
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=fh, stderr=fh, cwd=cfg.working_dir, env=env, start_new_session=True)
+        logger.info("Active-set '%s' (pid=%s): %s", name, proc.pid, cmd)
+        code: Optional[int] = None
+        try:
+            code = await asyncio.wait_for(proc.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Active-set '%s' did not finish within %ss — proceeding",
+                           name, timeout)
+        finally:
+            if fh is not None:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+        if code not in (0, None):
+            logger.warning("Active-set '%s' exited with code %s", name, code)
+        return code
+
+    async def _precommand_active(self, name: str, power: Optional[float],
+                                 freq_hz: Optional[float] = None) -> None:
+        """Set each linked active component (e.g. a step attenuator) for an absolute ``power``
+        BEFORE the transmit task ``name`` emits — as a one-shot, so no long-running control
+        task is needed and the operator never has to think about it. Awaited so the component
+        is physically in position first. Best-effort: a failed/timed-out set is logged, not
+        fatal (the transmit script still clamps its own SDR gain to a safe range). A no-op for
+        a task without active components or without an absolute power (relative-gain mode)."""
+        for s in self.active_settings(name, power, freq_hz):
+            atask, param, value = s.get("task"), s.get("param"), s.get("value")
+            if not atask or param is None or value is None:
+                continue
+            args = [self._active_flag(atask, param), _fmt_num(value)]
+            # Constant params (e.g. the attenuator's serial port) travel on every set — the
+            # driving param alone isn't enough for the script to run.
+            for cdest, cval in (s.get("consts") or {}).items():
+                args += [self._active_flag(atask, cdest), str(cval)]
+            try:
+                await self._launch_oneshot_wait(atask, args)
+            except Exception as exc:                     # never let a set derail the transmit
+                logger.warning("Active component '%s' set failed: %s", atask, exc)
+
     async def restart(self, name: str, request: Optional[StartRequest] = None,
                       source: str = "manual") -> ProcessStatus:
         proc = self._get(name)
+        req = request or StartRequest()
+        cmd = _build_command(proc.config.command, req.args, req.replace_args)
+        await self._precommand_active(name, _power_from_command(cmd))
         if proc.state == ProcessState.RUNNING:
             await proc.stop()
         await proc.start(request)

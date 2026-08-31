@@ -82,6 +82,115 @@ class _Measured:
 
 
 @dataclass
+class _ActiveControl:
+    """The dynamic-control descriptor of an ACTIVE component (e.g. a programmable
+    attenuator). On top of a derived plane's passive baseline table (its behaviour at
+    0 dB applied), an active component can apply a variable gain/attenuation set through
+    ``param`` of ``task``. ``min_db``/``max_db`` are that parameter's own value range and
+    ``step_db`` its resolution; ``sense`` says whether the parameter adds gain or removes
+    it. ``engage_pct`` is where, as a percentage of the SDR-only dynamic range, the
+    component starts contributing (0 ⇒ only once the SDR is exhausted at its bottom;
+    higher ⇒ engage sooner, keeping the SDR in its upper/optimal region).
+
+    Everything is expressed in *applied gain* (signed dB the component adds to the chain):
+    ``applied_hi`` is its max-power / rest state, ``applied_lo`` its max-reduction state."""
+    task: str
+    param: str
+    sense: str                 # "attenuation" (param removes power) | "gain" (param adds it)
+    min_db: float              # the parameter's own min value
+    max_db: float              # the parameter's own max value
+    step_db: float             # the parameter's resolution
+    engage_pct: float = 0.0    # % of the SDR dynamic range below which it engages
+    # Other params of the SAME task that must be sent on every set but don't vary with power
+    # (e.g. an attenuator's serial ``port``): {param_dest: value_string}. Passed verbatim
+    # alongside the driving ``param`` so the one-shot has everything the script needs.
+    consts: dict = field(default_factory=dict)
+
+    @property
+    def applied_hi(self) -> float:
+        """Max applied gain (rest / max-power state)."""
+        return -self.min_db if self.sense == "attenuation" else self.max_db
+
+    @property
+    def applied_lo(self) -> float:
+        """Min applied gain (max-reduction state)."""
+        return -self.max_db if self.sense == "attenuation" else self.min_db
+
+    @property
+    def span_db(self) -> float:
+        """How much power this component can remove below its rest state (≥ 0)."""
+        return self.applied_hi - self.applied_lo
+
+    def param_for_applied(self, applied: float) -> float:
+        """The parameter value to command for a given applied gain (clamped to range)."""
+        v = -applied if self.sense == "attenuation" else applied
+        return min(max(v, self.min_db), self.max_db)
+
+    def to_public_dict(self, plane: str, baseline: list) -> dict:
+        return {"plane": plane, "task": self.task, "param": self.param,
+                "sense": self.sense, "min_db": self.min_db, "max_db": self.max_db,
+                "step_db": self.step_db, "engage_pct": self.engage_pct,
+                "consts": dict(self.consts),
+                "baseline_delta_by_freq": [[f, db] for f, db in baseline]}
+
+
+def _parse_control(spec: object, name: str) -> "_ActiveControl":
+    """Validate a plane's ``control`` block and build an _ActiveControl (fail-safe: any
+    defect raises, so a broken active component can never silently transmit)."""
+    if not isinstance(spec, dict):
+        raise CalibrationError(f"plane {name!r} 'control' must be an object")
+    task, param = spec.get("task"), spec.get("param")
+    if not isinstance(task, str) or not task.strip():
+        raise CalibrationError(
+            f"active plane {name!r} 'control.task' must be a non-empty string")
+    if not isinstance(param, str) or not param.strip():
+        raise CalibrationError(
+            f"active plane {name!r} 'control.param' must be a non-empty string")
+    sense = spec.get("sense", "attenuation")
+    if sense not in ("attenuation", "gain"):
+        raise CalibrationError(
+            f"active plane {name!r} 'control.sense' must be 'attenuation' or 'gain'")
+    try:
+        min_db = float(spec["min_db"]); max_db = float(spec["max_db"])
+        step_db = float(spec["step_db"])
+    except (KeyError, TypeError, ValueError):
+        raise CalibrationError(
+            f"active plane {name!r} 'control' needs numeric min_db, max_db, step_db")
+    if not max_db > min_db:
+        raise CalibrationError(
+            f"active plane {name!r} 'control.max_db' ({max_db}) must exceed min_db ({min_db})")
+    if not step_db > 0:
+        raise CalibrationError(
+            f"active plane {name!r} 'control.step_db' must be > 0")
+    try:
+        engage = float(spec.get("engage_pct", 0.0))
+    except (TypeError, ValueError):
+        raise CalibrationError(f"active plane {name!r} 'control.engage_pct' must be numeric")
+    if not 0.0 <= engage <= 100.0:
+        raise CalibrationError(
+            f"active plane {name!r} 'control.engage_pct' must be between 0 and 100")
+    # Constant params: other params of the same task, sent unchanged on every set (e.g. the
+    # attenuator's serial ``port``). {dest: value}; the driving param can't also be a const.
+    consts_spec = spec.get("consts") or {}
+    if not isinstance(consts_spec, dict):
+        raise CalibrationError(f"active plane {name!r} 'control.consts' must be an object")
+    consts: dict = {}
+    for key, val in consts_spec.items():
+        if not isinstance(key, str) or not key.strip():
+            raise CalibrationError(
+                f"active plane {name!r} 'control.consts' keys must be non-empty strings")
+        if key.strip() == param.strip():
+            raise CalibrationError(
+                f"active plane {name!r} 'control.consts' must not include the driving "
+                f"param {param.strip()!r}")
+        sval = "" if val is None else str(val)
+        if sval.strip() != "":
+            consts[key.strip()] = sval
+    return _ActiveControl(task.strip(), param.strip(), sense, min_db, max_db, step_db, engage,
+                          consts=consts)
+
+
+@dataclass
 class _Derived:
     """A derived plane: a passive dB hop from a parent plane (cable loss, antenna gain,
     a pad). The hop is a ``delta_db``-vs-frequency table (signed: negative = loss); a
@@ -100,6 +209,11 @@ class _Derived:
     quantity: str = ""
     description: str = ""
     fallback: bool = False
+    control: Optional["_ActiveControl"] = None   # set ⇒ an ACTIVE component (dynamic gain/atten)
+
+    @property
+    def is_active(self) -> bool:
+        return self.control is not None
 
     @property
     def is_freq_dependent(self) -> bool:
@@ -203,11 +317,78 @@ class ResolvedCalibration:
 
     @property
     def max_power_dbm(self) -> float:
-        return self.power_for_gain(self.max_gain_db)
+        return self.realize(float("inf"))["power_dbm"]
 
     @property
     def min_power_dbm(self) -> float:
-        return self.power_for_gain(self.min_gain_db)
+        return self.realize(float("-inf"))["power_dbm"]
+
+    # ── Active components (programmable gain/attenuation) ─────────────────────────
+    #
+    # An active component (e.g. a programmable attenuator) sits on a derived plane with a
+    # `control` block. On top of its passive baseline delta (already folded by _power_on at
+    # 0 dB applied) it adds a variable applied gain on its own grid. We model the whole
+    # chain as P = P_base(g) − R, where P_base(g) is the delivered power with every active
+    # component at its rest state (max applied gain) and R ≥ 0 is a "reduction budget" the
+    # active components spend on their grids. SDR-first: keep the SDR as high as possible
+    # (≥ an engagement threshold that keeps it out of its unstable low-gain region) and let
+    # the active components trim the rest. Only realizable powers are ever produced.
+
+    def _active_hops(self) -> list:
+        """The active derived hops (anchor → operating), in chain order."""
+        return [(n, d) for n, d in _hops(self.operating_plane, self._planes) if d.is_active]
+
+    @property
+    def has_active(self) -> bool:
+        return bool(self._active_hops())
+
+    def _achievable(self, freq: Optional[float]):
+        """Build the shared achievable-power resolver at ``freq`` (returns the grid and the
+        active-hop list so callers can map each applied gain back to a task/param setting)."""
+        from paramkit.achievable import AchievableGrid, Active
+        f = self._eff_freq(freq)
+        op, planes = self.operating_plane, self._planes
+        hops = self._active_hops()
+        actives = [Active(d.control.applied_hi, d.control.applied_lo,
+                          d.control.step_db, d.control.engage_pct, meta=(n, d))
+                   for n, d in hops]
+        grid = AchievableGrid(
+            power_for_gain=lambda g: _power_on(op, g, planes, f),
+            gain_for_power=lambda p: _gain_for_power_on(p, op, planes, f),
+            min_gain=self.min_gain_db, ceiling=self._max_gain_at(f),
+            gain_step=self._gain_step, actives=actives)
+        return grid, actives
+
+    def realize(self, power: float, freq: Optional[float] = None) -> dict:
+        """SDR-first realization of a requested delivered power. Returns the nearest
+        ACHIEVABLE power and the device settings that produce it: the SDR gain, and per
+        active component its applied gain and the parameter value to command on its task."""
+        grid, actives = self._achievable(freq)
+        res = grid.realize(power)
+        settings = []
+        for a, applied in zip(actives, res["applied"]):
+            name, d = a.meta
+            settings.append({"plane": name, "task": d.control.task,
+                             "param": d.control.param, "applied_db": applied,
+                             "value": round(d.control.param_for_applied(applied), 6),
+                             "consts": dict(d.control.consts)})
+        return {"power_dbm": res["power_dbm"], "sdr_gain_db": res["sdr_gain_db"],
+                "settings": settings}
+
+    def snap_power(self, power: float, freq: Optional[float] = None) -> float:
+        """The nearest achievable delivered power to ``power``."""
+        return self._achievable(freq)[0].snap(power)
+
+    def quantize_up(self, power: float, freq: Optional[float] = None) -> float:
+        return self._achievable(freq)[0].quantize_up(power)
+
+    def quantize_down(self, power: float, freq: Optional[float] = None) -> float:
+        return self._achievable(freq)[0].quantize_down(power)
+
+    def active_components(self) -> list:
+        """Public descriptors for each active component (for the artifact + UI)."""
+        return [d.control.to_public_dict(name, list(d.table))
+                for name, d in self._active_hops()]
 
     def banner_label(self) -> str:
         """e.g. 'EIRP, at antenna_eirp' — so the --power number is never ambiguous."""
@@ -288,6 +469,8 @@ class ResolvedCalibration:
         }
         if self._gain_step:
             out["gain_step_db"] = self._gain_step
+        if self.has_active:
+            out["active_components"] = self.active_components()
         hops = self.passive_hops()
         if hops or self._freq_limits:
             out["anchor_curve"] = self.anchor_curve()
@@ -897,13 +1080,16 @@ def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
                 raise CalibrationError(f"derived plane {name!r} has no 'from'")
             has_comp = "component" in spec
             has_delta = "delta_db" in spec
-            if has_comp and has_delta:
+            has_table = "delta_db_by_freq" in spec        # inline Δ dB(f) table (owns its own)
+            n_baseline = has_comp + has_delta + has_table
+            if n_baseline > 1:
                 raise CalibrationError(
-                    f"derived plane {name!r} has both 'component' and 'delta_db' "
-                    f"(use one)")
-            if not has_comp and not has_delta:
+                    f"derived plane {name!r} has more than one of 'component', 'delta_db', "
+                    f"'delta_db_by_freq' (use exactly one)")
+            if n_baseline == 0:
                 raise CalibrationError(
-                    f"derived plane {name!r} has neither 'component' nor 'delta_db'")
+                    f"derived plane {name!r} has none of 'component', 'delta_db', "
+                    f"'delta_db_by_freq'")
             comp_id = ""
             if has_comp:
                 comp_id = spec["component"]
@@ -914,10 +1100,15 @@ def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
                         f"{comp_id!r}")
                 table = _freq_table(comp.get("delta_db_by_freq"),
                                     f"component {comp_id!r}")
+            elif has_table:                               # the plane's OWN frequency table
+                table = _freq_table(spec["delta_db_by_freq"], f"plane {name!r}")
             else:
                 table = [(0.0, float(spec["delta_db"]))]   # constant, frequency-independent
+            # An ACTIVE component adds a `control` block on top of its passive baseline.
+            control = _parse_control(spec["control"], name) if "control" in spec else None
             planes[name] = _Derived(frm=frm, table=table, component=comp_id,
-                                    quantity=quantity, description=description)
+                                    quantity=quantity, description=description,
+                                    control=control)
             prev_name = name
         else:
             raise CalibrationError(f"plane {name!r} has invalid type {ptype!r}")
