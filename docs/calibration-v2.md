@@ -477,18 +477,26 @@ passive exactly as before.
 "attenuator_out": {
   "type": "derived", "from": "sdr_output", "delta_db": 0.0,   // (or a component baseline)
   "control": {
-    "task": "atten_set", "param": "attenuation",  // the task + one of its params to drive
+    "task": "atten_set", "param": "attenuation",  // the task + the ONE param that drives it
     "sense": "attenuation",                        // "attenuation" (param subtracts) | "gain" (adds)
     "min_db": 0.0, "max_db": 95.0, "step_db": 0.25, // the param's own range + resolution
-    "engage_pct": 0.0                              // % of the SDR's dynamic range below which it engages
+    "engage_pct": 0.0,                             // % of the SDR's dynamic range below which it engages
+    "consts": { "port": "/dev/ttyACM0" }           // other params of the SAME task, sent on every set
   }
 }
 ```
 
+`param` is the single parameter driven from the requested power. A control task usually needs
+**other** params too that don't vary with power — a step attenuator's serial `port`, a channel
+select, a fixed mode. Those go in **`consts`** (`{dest: value}`) and are passed verbatim on every
+set alongside the driven param; the one-shot would otherwise run with the driven param only and
+the script's other required args missing. The editor's parameter form lists every param of the
+set-task: you pick which numeric one drives the attenuation and give the rest constant values.
+
 Validation (`agent/calibration.py:_parse_control`, mirrored in the client's
 `_control_issues`): `task`/`param` non-empty, `sense ∈ {attenuation, gain}`, `min_db < max_db`,
-`step_db > 0`, `0 ≤ engage_pct ≤ 100`. A defective block raises `CalibrationError` (refuse),
-never a silent fall-back.
+`step_db > 0`, `0 ≤ engage_pct ≤ 100`, `consts` an object that does **not** re-list the driving
+`param`. A defective block raises `CalibrationError` (refuse), never a silent fall-back.
 
 **Baseline vs. programmable range — the plane's baseline is the part that's always there.**
 An active plane's baseline is its behaviour at **0 dB applied** — i.e. a real attenuator's
@@ -549,7 +557,9 @@ sends `--power` as it always has.
   command (or the tuned `power` value), resolves the active components
   (`ProcessManager.active_settings` → the SDR-first realization), resolves each control
   `param` to its CLI flag from the control task's argspec (cached), and awaits a one-shot
-  `atten_set <flag> <value>` **before** the transmit process starts / retunes. Because
+  `atten_set <flag> <value> [<const-flag> <const-value>…]` **before** the transmit process
+  starts / retunes — each `consts` entry resolved to its flag the same way and appended, so
+  the attenuator's `--port` (and any other fixed param) rides along. Because
   sequence steps and ramps go through these same methods (`start` / `run_oneshot` /
   `set_params`), they are covered with no sequence-specific code.
 - **Safety / failure.** A one-shot that fails or times out (`_ACTIVE_SET_TIMEOUT_S`) is logged

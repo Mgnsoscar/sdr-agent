@@ -33,10 +33,15 @@ ATTEN_SCRIPT = (
     "import argparse\n"
     "p = argparse.ArgumentParser()\n"
     "p.add_argument('--attenuation', type=float, default=0.0)\n"
+    "p.add_argument('--port', default='/dev/ttyACM0')\n"
     "p.parse_args()\n")
 
 
-def _write_cal(tmp_path):
+def _write_cal(tmp_path, consts=None):
+    control = {"task": "atten_set", "param": "attenuation", "sense": "attenuation",
+               "min_db": 0.0, "max_db": 95.0, "step_db": 0.25, "engage_pct": 0.0}
+    if consts is not None:
+        control["consts"] = consts
     doc = {
         "schema_version": 1, "unit_type": "broadcaster",
         "chain": {
@@ -45,9 +50,7 @@ def _write_cal(tmp_path):
             "planes": {
                 "sdr_output": {"type": "measured", "quantity": "power"},
                 "atten_out": {"type": "derived", "from": "sdr_output", "delta_db": 0.0,
-                              "control": {"task": "atten_set", "param": "attenuation",
-                                          "sense": "attenuation", "min_db": 0.0,
-                                          "max_db": 95.0, "step_db": 0.25, "engage_pct": 0.0}},
+                              "control": control},
             },
         },
         "signals": {"sig": {"curves": {"sdr_output": {"points": [
@@ -59,8 +62,8 @@ def _write_cal(tmp_path):
     (tmp_path / "atten.py").write_text(ATTEN_SCRIPT)
 
 
-def _mgr(tmp_path, monkeypatch, signal="sig"):
-    _write_cal(tmp_path)
+def _mgr(tmp_path, monkeypatch, signal="sig", consts=None):
+    _write_cal(tmp_path, consts=consts)
     monkeypatch.setattr(pm._agentcfg, "CALIBRATION_DOC", tmp_path / "calibration.json")
     monkeypatch.setattr(pm._agentcfg, "CALIBRATION_DEFAULTS", tmp_path / "defaults.yaml")
     monkeypatch.setattr(pm._agentcfg, "CALIBRATION_COMPONENTS", tmp_path / "components.yaml")
@@ -80,7 +83,7 @@ def test_active_settings_realizes_the_attenuator_value(tmp_path, monkeypatch):
     mgr = _mgr(tmp_path, monkeypatch)
     s = mgr.active_settings("tx", -100.0)
     assert s == [{"plane": "atten_out", "task": "atten_set", "param": "attenuation",
-                  "applied_db": -60.0, "value": 60.0}]
+                  "applied_db": -60.0, "value": 60.0, "consts": {}}]
     assert mgr.active_settings("tx", -20.0)[0]["value"] == 0.0     # SDR carries it, atten at rest
     assert mgr.active_settings("tx", None) == []                   # relative-gain mode
     assert mgr.active_settings("atten_set", -100.0) == []          # not a calibrated transmit task
@@ -92,6 +95,38 @@ def test_active_flag_resolves_from_the_scripts_argspec(tmp_path, monkeypatch):
     mgr = _mgr(tmp_path, monkeypatch)
     assert mgr._active_flag("atten_set", "attenuation") == "--attenuation"
     assert mgr._active_flag("atten_set", "nonesuch") == "--nonesuch"   # fallback
+
+
+# ── constant params (e.g. a serial port) ride along on every set ─────────────────────
+
+def test_active_settings_carry_the_constant_params(tmp_path, monkeypatch):
+    mgr = _mgr(tmp_path, monkeypatch, consts={"port": "/dev/ttyACM0"})
+    s = mgr.active_settings("tx", -100.0)
+    assert s[0]["consts"] == {"port": "/dev/ttyACM0"}
+
+
+def test_oneshot_passes_constant_params_with_the_driver(tmp_path, monkeypatch):
+    # The port isn't the driving param, but the attenuator script needs it every time — the
+    # one-shot must carry --port alongside the computed --attenuation.
+    mgr = _mgr(tmp_path, monkeypatch, consts={"port": "/dev/ttyACM0"})
+    fired = _capture_oneshots(mgr, monkeypatch)
+    _stub_transmit(mgr, monkeypatch)
+    asyncio.run(mgr.start("tx", StartRequest(args=["--power", "-100"], replace_args=True),
+                          source="sequence"))
+    assert fired == [("atten_set",
+                      ["--attenuation", "60", "--port", "/dev/ttyACM0"])]
+
+
+def test_control_const_cannot_shadow_the_driving_param():
+    # A const that duplicates the driving param is a config error — reject it at parse.
+    from agent import calibration as _calib
+    good = {"task": "atten_set", "param": "attenuation", "sense": "attenuation",
+            "min_db": 0.0, "max_db": 95.0, "step_db": 0.25, "consts": {"port": "/dev/ttyACM0"}}
+    ctrl = _calib._parse_control(good, "atten_out")
+    assert ctrl.consts == {"port": "/dev/ttyACM0"}
+    bad = dict(good, consts={"attenuation": "10"})
+    with pytest.raises(_calib.CalibrationError):
+        _calib._parse_control(bad, "atten_out")
 
 
 # ── the one-shot is fired before the transmit, on every launch/tune path ─────────────

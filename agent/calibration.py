@@ -101,6 +101,10 @@ class _ActiveControl:
     max_db: float              # the parameter's own max value
     step_db: float             # the parameter's resolution
     engage_pct: float = 0.0    # % of the SDR dynamic range below which it engages
+    # Other params of the SAME task that must be sent on every set but don't vary with power
+    # (e.g. an attenuator's serial ``port``): {param_dest: value_string}. Passed verbatim
+    # alongside the driving ``param`` so the one-shot has everything the script needs.
+    consts: dict = field(default_factory=dict)
 
     @property
     def applied_hi(self) -> float:
@@ -126,6 +130,7 @@ class _ActiveControl:
         return {"plane": plane, "task": self.task, "param": self.param,
                 "sense": self.sense, "min_db": self.min_db, "max_db": self.max_db,
                 "step_db": self.step_db, "engage_pct": self.engage_pct,
+                "consts": dict(self.consts),
                 "baseline_delta_by_freq": [[f, db] for f, db in baseline]}
 
 
@@ -164,7 +169,25 @@ def _parse_control(spec: object, name: str) -> "_ActiveControl":
     if not 0.0 <= engage <= 100.0:
         raise CalibrationError(
             f"active plane {name!r} 'control.engage_pct' must be between 0 and 100")
-    return _ActiveControl(task.strip(), param.strip(), sense, min_db, max_db, step_db, engage)
+    # Constant params: other params of the same task, sent unchanged on every set (e.g. the
+    # attenuator's serial ``port``). {dest: value}; the driving param can't also be a const.
+    consts_spec = spec.get("consts") or {}
+    if not isinstance(consts_spec, dict):
+        raise CalibrationError(f"active plane {name!r} 'control.consts' must be an object")
+    consts: dict = {}
+    for key, val in consts_spec.items():
+        if not isinstance(key, str) or not key.strip():
+            raise CalibrationError(
+                f"active plane {name!r} 'control.consts' keys must be non-empty strings")
+        if key.strip() == param.strip():
+            raise CalibrationError(
+                f"active plane {name!r} 'control.consts' must not include the driving "
+                f"param {param.strip()!r}")
+        sval = "" if val is None else str(val)
+        if sval.strip() != "":
+            consts[key.strip()] = sval
+    return _ActiveControl(task.strip(), param.strip(), sense, min_db, max_db, step_db, engage,
+                          consts=consts)
 
 
 @dataclass
@@ -347,7 +370,8 @@ class ResolvedCalibration:
             name, d = a.meta
             settings.append({"plane": name, "task": d.control.task,
                              "param": d.control.param, "applied_db": applied,
-                             "value": round(d.control.param_for_applied(applied), 6)})
+                             "value": round(d.control.param_for_applied(applied), 6),
+                             "consts": dict(d.control.consts)})
         return {"power_dbm": res["power_dbm"], "sdr_gain_db": res["sdr_gain_db"],
                 "settings": settings}
 

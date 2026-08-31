@@ -886,9 +886,13 @@ class ProcessManager:
             atask, param, value = s.get("task"), s.get("param"), s.get("value")
             if not atask or param is None or value is None:
                 continue
+            args = [self._active_flag(atask, param), _fmt_num(value)]
+            # Constant params (e.g. the attenuator's serial port) travel on every set — the
+            # driving param alone isn't enough for the script to run.
+            for cdest, cval in (s.get("consts") or {}).items():
+                args += [self._active_flag(atask, cdest), str(cval)]
             try:
-                await self._launch_oneshot_wait(atask, [self._active_flag(atask, param),
-                                                         _fmt_num(value)])
+                await self._launch_oneshot_wait(atask, args)
             except Exception as exc:                     # never let a set derail the transmit
                 logger.warning("Active component '%s' set failed: %s", atask, exc)
 
