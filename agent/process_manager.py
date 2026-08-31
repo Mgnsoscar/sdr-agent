@@ -144,6 +144,25 @@ def _script_prefix(command: list) -> list:
     return list(command[:1])
 
 
+def _resolve_script_path(cmd: list) -> list:
+    """If a task's script argument no longer sits directly in the scripts dir (it was
+    filed into an organizational subfolder), find it there by basename. Scripts keep
+    their basename identity, so a launch command needn't change when a script moves."""
+    out = list(cmd)
+    for i, a in enumerate(out):
+        if isinstance(a, str) and a.endswith(".py"):
+            if not os.path.isfile(a):
+                base = os.path.basename(a)
+                root = os.path.dirname(a) or "."
+                if os.path.isdir(root):
+                    for dirpath, _dirs, files in os.walk(root):
+                        if base in files:
+                            out[i] = os.path.join(dirpath, base)
+                            break
+            break
+    return out
+
+
 def _build_command(command: list, args: list, replace: bool) -> list:
     """Build the launch command. replace=True → [interpreter, script, *args]
     (args are the complete set); replace=False → command + args (append)."""
@@ -151,7 +170,7 @@ def _build_command(command: list, args: list, replace: bool) -> list:
         cmd = _script_prefix(command) + list(args)
     else:
         cmd = list(command) + list(args)
-    return _resolve_exe(cmd)
+    return _resolve_script_path(_resolve_exe(cmd))
 
 
 # Absolute-power flags the fleet's transmit scripts use (mirror of the client's

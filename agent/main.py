@@ -65,7 +65,7 @@ import sys
 from contextlib import asynccontextmanager
 
 from fastapi import (
-    Depends, FastAPI, File, HTTPException, Request,
+    Depends, FastAPI, File, Form, HTTPException, Request,
     Query, UploadFile, WebSocket, WebSocketDisconnect, status,
 )
 from fastapi.responses import StreamingResponse
@@ -560,9 +560,9 @@ SCRIPTS_DIR = cfg.BASE_DIR / "scripts"
 
 
 @app.post("/scripts/upload", tags=["scripts"], dependencies=[Depends(verify_key)])
-async def upload_script(file: UploadFile = File(...)):
+async def upload_script(file: UploadFile = File(...), folder: str = Form("")):
     """
-    Upload a .py script to /opt/sdr-agent/scripts/.
+    Upload a .py script to /opt/sdr-agent/scripts/ (optionally into a subfolder).
     After uploading, edit tasks.yaml and call POST /reload to register it.
     """
     if not file.filename or not file.filename.endswith(".py"):
@@ -571,39 +571,72 @@ async def upload_script(file: UploadFile = File(...)):
     if "/" in file.filename or "\\" in file.filename or file.filename in (".", ".."):
         raise HTTPException(status_code=400, detail="Invalid filename")
 
-    dest = SCRIPTS_DIR / file.filename
+    sub = _safe_folder(folder)
+    dest_dir = SCRIPTS_DIR / sub if sub else SCRIPTS_DIR
+    dest = dest_dir / file.filename
     content = await file.read()
 
     try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(content)
         dest.chmod(0o755)
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {exc}")
 
-    logger.info("Script uploaded: %s (%d bytes)", file.filename, len(content))
+    logger.info("Script uploaded: %s (%d bytes)", dest.relative_to(SCRIPTS_DIR), len(content))
     return {"saved": file.filename, "path": str(dest), "size": len(content)}
 
 
 @app.get("/scripts", tags=["scripts"], dependencies=[Depends(verify_key)])
 async def list_scripts():
-    """List all .py files currently in the scripts directory."""
-    return sorted(p.name for p in SCRIPTS_DIR.glob("*.py"))
+    """List all .py files under the scripts directory (recursively). Names are
+    basenames — a script's identity — regardless of the subfolder it sits in."""
+    return sorted(p.name for p in SCRIPTS_DIR.rglob("*.py") if p.is_file())
 
 
-def _safe_script_path(name: str):
-    """Resolve a script name to a path inside SCRIPTS_DIR, rejecting traversal."""
+def _safe_script_name(name: str) -> str:
+    """Validate a script basename (no path components), or 400."""
     if "/" in name or "\\" in name or name in (".", ".."):
         raise HTTPException(status_code=400, detail="Invalid filename")
     if not name.endswith(".py"):
         raise HTTPException(status_code=400, detail="Only .py files are accepted")
-    return SCRIPTS_DIR / name
+    return name
+
+
+def _safe_folder(folder: str) -> str:
+    """Sanitize an organizational folder to a safe relative subdir under SCRIPTS_DIR.
+    Rejects absolute paths and traversal; '' is the scripts-dir root."""
+    folder = (folder or "").strip().strip("/")
+    if not folder:
+        return ""
+    parts = []
+    for seg in folder.split("/"):
+        seg = seg.strip()
+        if not seg or seg in (".", "..") or "\\" in seg:
+            raise HTTPException(status_code=400, detail=f"Invalid folder: {folder}")
+        parts.append(seg)
+    return "/".join(parts)
+
+
+def _resolve_script(name: str):
+    """Locate a script by basename anywhere under SCRIPTS_DIR — scripts may live in
+    organizational subfolders, but a script keeps its basename identity, so a task
+    that references the basename still finds it. Returns the Path, or None."""
+    _safe_script_name(name)
+    flat = SCRIPTS_DIR / name
+    if flat.is_file():
+        return flat
+    for p in SCRIPTS_DIR.rglob(name):
+        if p.is_file() and p.name == name:
+            return p
+    return None
 
 
 @app.get("/scripts/{name}", tags=["scripts"], dependencies=[Depends(verify_key)])
 async def get_script(name: str):
     """Return the contents of a script in the scripts directory."""
-    path = _safe_script_path(name)
-    if not path.is_file():
+    path = _resolve_script(name)
+    if path is None:
         raise HTTPException(status_code=404, detail=f"No such script: {name}")
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
@@ -615,8 +648,8 @@ async def get_script(name: str):
 @app.delete("/scripts/{name}", tags=["scripts"], dependencies=[Depends(verify_key)])
 async def delete_script(name: str):
     """Delete a script from the scripts directory."""
-    path = _safe_script_path(name)
-    if not path.is_file():
+    path = _resolve_script(name)
+    if path is None:
         raise HTTPException(status_code=404, detail=f"No such script: {name}")
     try:
         path.unlink()
@@ -841,8 +874,8 @@ async def script_params(name: str):
 
     Returns the rich paramkit schema (kind/unit/min/max/presets) when the script
     uses paramkit, otherwise the classic argparse schema."""
-    path = _safe_script_path(name)
-    if not path.is_file():
+    path = _resolve_script(name)
+    if path is None:
         raise HTTPException(status_code=404, detail=f"No such script: {name}")
     try:
         source = path.read_text(encoding="utf-8", errors="replace")
@@ -1273,7 +1306,9 @@ async def delete_sequence(seq_id: str, runner: SequenceRunner = Depends(get_runn
 
 def _library_scripts() -> list[LibraryScript]:
     out: list[LibraryScript] = []
-    for path in sorted(SCRIPTS_DIR.glob("*.py")):
+    for path in sorted(SCRIPTS_DIR.rglob("*.py")):
+        if not path.is_file():
+            continue
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -1282,8 +1317,18 @@ def _library_scripts() -> list[LibraryScript]:
             params = (extract_params(content) or {}).get("params", [])
         except Exception:  # noqa: BLE001 — a script we can't parse still belongs
             params = []
-        out.append(LibraryScript(name=path.name, content=content, params=params))
+        rel = path.parent.relative_to(SCRIPTS_DIR)
+        folder = "" if str(rel) == "." else str(rel).replace("\\", "/")
+        out.append(LibraryScript(name=path.name, content=content, params=params,
+                                 folder=folder))
     return out
+
+
+def _library_folders() -> list[str]:
+    """Every subdirectory under the scripts dir (so an empty folder round-trips)."""
+    out = {str(d.relative_to(SCRIPTS_DIR)).replace("\\", "/")
+           for d in SCRIPTS_DIR.rglob("*") if d.is_dir()}
+    return sorted(f for f in out if f)
 
 
 @app.get("/library", response_model=Library, tags=["library"],
@@ -1294,7 +1339,7 @@ async def get_library(runner: SequenceRunner = Depends(get_runner)):
     library to detect drift."""
     tasks = list(cfg.load_tasks().values())
     return Library(scripts=_library_scripts(), tasks=tasks,
-                   sequences=runner.list_sequences())
+                   sequences=runner.list_sequences(), folders=_library_folders())
 
 
 @app.put("/library", response_model=DeployLibraryResult, tags=["library"],
@@ -1311,28 +1356,55 @@ async def deploy_library(
     lib = req.library
     result = DeployLibraryResult()
 
-    # 1) Scripts — write each; prune removes .py files the library omits.
+    # 1) Scripts — write each into its organizational folder (a real subdir); prune
+    #    removes .py files the library omits, wherever they sit. A script keeps its
+    #    basename identity, so a task that references the basename still launches it.
     wanted_scripts = {}
     for s in lib.scripts:
         if "/" in s.name or "\\" in s.name or not s.name.endswith(".py"):
             raise HTTPException(status_code=400, detail=f"Invalid script name: {s.name}")
         wanted_scripts[s.name] = s
     for name, s in wanted_scripts.items():
-        dest = SCRIPTS_DIR / name
+        sub = _safe_folder(getattr(s, "folder", "") or "")
+        dest_dir = SCRIPTS_DIR / sub if sub else SCRIPTS_DIR
+        # A script moved between folders: drop any stale copy elsewhere first, so it
+        # ends up in exactly one place (basenames are unique).
+        for old in SCRIPTS_DIR.rglob(name):
+            if old.is_file() and old != dest_dir / name:
+                old.unlink(missing_ok=True)
+        dest = dest_dir / name
         try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
             dest.write_text(s.content, encoding="utf-8")
             dest.chmod(0o755)
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"Failed to write {name}: {exc}")
         result.scripts_written.append(name)
+    # Declared (possibly empty) folders exist on the unit too.
+    for f in getattr(lib, "folders", []) or []:
+        try:
+            (SCRIPTS_DIR / _safe_folder(f)).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("deploy: could not create folder %s: %s", f, exc)
     if req.prune:
-        for path in sorted(SCRIPTS_DIR.glob("*.py")):
-            if path.name not in wanted_scripts:
+        for path in sorted(SCRIPTS_DIR.rglob("*.py")):
+            if path.is_file() and path.name not in wanted_scripts:
                 try:
                     path.unlink()
                     result.scripts_deleted.append(path.name)
                 except OSError as exc:
                     logger.warning("deploy: could not delete script %s: %s", path.name, exc)
+        # Tidy away now-empty subdirectories the library no longer declares.
+        declared = {_safe_folder(f) for f in (getattr(lib, "folders", []) or [])}
+        declared |= {_safe_folder(getattr(s, "folder", "") or "") for s in lib.scripts}
+        for d in sorted((p for p in SCRIPTS_DIR.rglob("*") if p.is_dir()),
+                        key=lambda p: len(p.parts), reverse=True):
+            rel = str(d.relative_to(SCRIPTS_DIR)).replace("\\", "/")
+            if rel not in declared and not any(d.iterdir()):
+                try:
+                    d.rmdir()
+                except OSError:
+                    pass
 
     # 2) Tasks — rewrite tasks.yaml to the library (merged if not pruning) and
     #    reload. reload() keeps running tasks alive; any it couldn't remove because
