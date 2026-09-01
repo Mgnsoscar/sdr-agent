@@ -359,6 +359,17 @@ def extract_paramkit_spec(source: str) -> Dict[str, Any]:
     cal_freq_param = consts.get("CAL_FREQ_PARAM")
     if isinstance(cal_freq_param, str) and cal_freq_param:
         out["calibration_freq_param"] = cal_freq_param
+    # A signal may declare power-quantity conversion laws (CAL_POWER_LAWS) — how a reported or
+    # limiting power reading derives from the measured one (docs/calibration-v2.md §13). They
+    # are surfaced raw (a pass-through of the declared dicts) so the calibration editor can
+    # offer them in its "declared by this signal" bridge picker; the chosen law is validated
+    # and embedded into the unit's calibration doc there, so the resolver and transmit script
+    # never read this metadata. Kept dependency-free so this stays byte-identical across repos.
+    cal_power_laws = consts.get("CAL_POWER_LAWS")
+    if isinstance(cal_power_laws, (list, tuple)) and cal_power_laws:
+        laws = [dict(x) for x in cal_power_laws if isinstance(x, dict)]
+        if laws:
+            out["calibration_power_laws"] = laws
     return out
 
 

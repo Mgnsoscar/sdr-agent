@@ -29,6 +29,10 @@ from paramkit import Script
 
 CAL_SIGNAL_ID = "demo_sig"
 CAL_FREQ_PARAM = "freq"
+CAL_POWER_LAWS = [
+    {"id": "fbw", "name": "Full-bandwidth power", "in": "density", "out": "abs",
+     "param": "bw", "coeff": 10.0, "ref": 1.0, "rep": 1e7},
+]
 
 FREQS = {
     "WiFi ch1 (2.412 GHz)": 2.412e9,
@@ -66,6 +70,11 @@ def main() -> int:
           "CAL_SIGNAL_ID surfaced as calibration_signal")
     check(spec.get("calibration_freq_param") == "freq",
           "CAL_FREQ_PARAM surfaced as calibration_freq_param")
+    laws = spec.get("calibration_power_laws")
+    check(isinstance(laws, list) and len(laws) == 1 and laws[0]["id"] == "fbw",
+          "CAL_POWER_LAWS surfaced as calibration_power_laws")
+    check(bool(laws) and laws[0]["param"] == "bw" and laws[0]["in"] == "density",
+          "declared law param + family surfaced (raw pass-through)")
     by = {p["name"]: p for p in spec["params"]}
     check(set(by) == {"freq", "gain", "antenna", "otw", "band", "verbose"}, "all params found")
 
@@ -135,6 +144,8 @@ def main() -> int:
           "no CAL_SIGNAL_ID → no calibration_signal key")
     check("calibration_freq_param" not in cspec,
           "no CAL_FREQ_PARAM → no calibration_freq_param key")
+    check("calibration_power_laws" not in cspec,
+          "no CAL_POWER_LAWS → no calibration_power_laws key")
     cby = {p["name"]: p for p in cspec["params"]}
     check(cby["x"]["max"] == 91.44, "named computed const (A+B) resolves in schema")
     check(cby["y"]["max"] == 91.44, "inline A+B resolves in schema")
