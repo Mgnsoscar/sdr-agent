@@ -137,3 +137,20 @@ def test_bad_bridge_refused():
     from agent.calibration import CalibrationError
     with pytest.raises(CalibrationError):
         _r(reported={"kind": "law", "law": "not-a-dict-or-known-id"})
+
+
+def test_per_signal_reading_overrides_plane():
+    # plane sets a +10 dB reported default; the signal overrides with +30 dB — signal wins.
+    doc = _doc(reported={"kind": "same", "k": 10.0, "unit": "dBm"})
+    doc["signals"]["sig"]["reported"] = {"kind": "same", "k": 30.0, "unit": "dBm/MHz"}
+    base = _r()
+    r = resolve(doc, None, "sig")
+    assert r.max_power_dbm == pytest.approx(base.max_power_dbm + 30.0)
+    assert r.to_public_dict()["operating_unit"] == "dBm/MHz"
+
+
+def test_plane_reading_is_the_default_when_signal_has_none():
+    doc = _doc(reported={"kind": "same", "k": 10.0, "unit": "dBm"})
+    base = _r()
+    r = resolve(doc, None, "sig")
+    assert r.max_power_dbm == pytest.approx(base.max_power_dbm + 10.0)

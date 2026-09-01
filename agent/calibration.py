@@ -898,17 +898,26 @@ def resolve(unit_doc: dict,
     op_spec = planes_spec.get(operating_plane)
     if not isinstance(op_spec, dict) or operating_plane in bypassed:
         op_spec = {}
+    # A reading is per-SIGNAL first (a chirp reports full-bandwidth power, a CW at the same
+    # node reports plain power), with the operating-plane spec as a shared default — so a
+    # single-signal-type unit can set it once on the plane, and a mixed unit overrides per
+    # signal. The signal entry wins per key.
+    def _reading(key):
+        v = sig.get(key)
+        if v is None:
+            v = op_spec.get(key)
+        return v if isinstance(v, dict) else None
+    rep_spec = _reading("reported")
+    lim_spec = _reading("limiting")
     try:
-        reported = parse_bridge(op_spec.get("reported"))
-        limiting = parse_bridge(op_spec.get("limiting"))
+        reported = parse_bridge(rep_spec)
+        limiting = parse_bridge(lim_spec)
     except ValueError as exc:
         raise CalibrationError(f"operating plane {operating_plane!r} reading: {exc}")
     reported_delta = reported.rep_delta_db()
     limiting_delta = limiting.rep_delta_db()
-    rep_spec = op_spec.get("reported") if isinstance(op_spec.get("reported"), dict) else {}
     reported_unit = reported.unit
     reported_quantity = str(rep_spec.get("quantity", "")) if rep_spec else ""
-    lim_spec = op_spec.get("limiting") if isinstance(op_spec.get("limiting"), dict) else {}
     lim_cap = None
     if lim_spec and lim_spec.get("max_dbm") is not None:
         try:
