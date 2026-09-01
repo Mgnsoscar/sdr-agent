@@ -21,6 +21,7 @@ def test_capabilities_advertised_and_stable():
     assert "calibration-no-signals" in cfg.AGENT_CAPABILITIES       # signal-less onboarding doc
     assert "calibration-limit-side" in cfg.AGENT_CAPABILITIES        # limit input/output side
     assert "calibration-power-bridges" in cfg.AGENT_CAPABILITIES      # reported/limiting bridges
+    assert "calibration-measurement-deembed" in cfg.AGENT_CAPABILITIES  # measurement cable de-embed
 
 
 def test_agent_info_carries_capabilities():

@@ -79,6 +79,11 @@ class _Measured:
     # leaves the v1 rep-frequency read-outs unchanged and only shifts the source AWAY from
     # where the curve was measured (the SDR's own gain-flatness). None ⇒ no bias.
     bias: Optional[list] = None              # [(freq_hz, delta_db)], strictly increasing freq
+    # Measurement DE-EMBED table Δ dB(f): the loss of the cable/pad between this plane and the
+    # analyzer during calibration (a bench artifact, NOT in the transmit path). resolve() folds
+    # its NEGATIVE, evaluated at the signal's measured-at frequency, into offset_db — recovering
+    # the TRUE power at the plane — then it is gone (never published). None ⇒ nothing to remove.
+    deembed: Optional[list] = None           # [(freq_hz, delta_db)], the measurement-path loss
 
     @property
     def is_reported(self) -> bool:
@@ -877,6 +882,19 @@ def resolve(unit_doc: dict,
     # 4. validate topology + operating plane usability
     _validate_topology(planes, operating_plane)
 
+    # Measurement DE-EMBED: remove any measurement-path loss (the cable/pad between a measured
+    # plane and the analyzer) from that plane's curve, recovering the TRUE power at the plane.
+    # Folded into offset_db as a constant, evaluated at the signal's measured-at frequency
+    # (center_freq_hz); a constant-loss cable needs none, and an unknown frequency on a
+    # frequency-dependent table falls back to its lowest-frequency value. Done here — BEFORE the
+    # ceiling/limit inversion below — so every safety limit gauges true power, and it is a
+    # bench artifact that never reaches the artifact or the transmit path.
+    for _p in planes.values():
+        if isinstance(_p, _Measured) and _p.deembed:
+            f = rep_freq if (rep_freq is not None or len(_p.deembed) == 1) else _p.deembed[0][0]
+            _p.offset_db -= _eval_table(_p.deembed, f)
+            _p.deembed = None
+
     # Bypassed stages (a component you've physically pulled without deleting it) resolve to
     # transparent 0-dB hops in _build_planes; here their safety limits are dropped too — "as
     # if it weren't there". The source (root) stage can't be bypassed (_build_planes rejects
@@ -1166,6 +1184,28 @@ def validate_document(unit_doc: dict, type_defaults: Optional[dict] = None,
     return summary
 
 
+def _deembed_table(spec, components: dict, plane_name: str):
+    """Resolve a measured plane's ``measurement_deembed`` into a Δ dB(f) loss table — the
+    measurement-path cable/pad between the plane and the analyzer (a bench artifact, removed
+    from the reading, never in the transmit path). Accepts a catalog component id or an inline
+    table (or ``{delta_db_by_freq: …}``); ``None``/"" ⇒ nothing to de-embed."""
+    if spec is None or spec == "":
+        return None
+    if isinstance(spec, str):
+        comp = components.get(spec)
+        if not isinstance(comp, dict):
+            raise CalibrationError(
+                f"measured plane {plane_name!r} de-embeds unknown component {spec!r}")
+        return _freq_table(comp.get("delta_db_by_freq"), f"de-embed component {spec!r}")
+    if isinstance(spec, dict) and "delta_db_by_freq" in spec:
+        return _freq_table(spec["delta_db_by_freq"],
+                           f"plane {plane_name!r} measurement_deembed")
+    if isinstance(spec, list):
+        return _freq_table(spec, f"plane {plane_name!r} measurement_deembed")
+    raise CalibrationError(
+        f"measured plane {plane_name!r} 'measurement_deembed' must be a component id or table")
+
+
 def _freq_table(raw, ctx: str) -> list:
     """Validate + sort a ``[[freq_hz, delta_db], …]`` table: ≥1 point, strictly
     increasing in frequency. Signed dB (negative = loss). One point ⇒ a constant hop."""
@@ -1276,7 +1316,8 @@ def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
                 planes[name] = _Measured(
                     gains=gains, powers=powers,
                     offset_db=float(curve.get("offset_db", 0.0)),
-                    quantity=quantity, description=description, role=role, of=of)
+                    quantity=quantity, description=description, role=role, of=of,
+                    deembed=_deembed_table(spec.get("measurement_deembed"), components, name))
             prev_name = name
             continue
         if ptype == "derived":

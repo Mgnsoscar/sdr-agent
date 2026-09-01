@@ -691,3 +691,42 @@ operator-form unit + parameter re-fold (`ui/param_form.py`), the `CAL_POWER_LAWS
 calibration-panel reported/limiting bridge editor. Covered by `test_power_law`,
 `test_calibration_bridges`, `test_calkit_bridges` (agent) and `test_power_fold_bridges`,
 `test_param_form_bridge`, `test_calibration_reading_editor` (client).
+
+
+## 14. Measurement DE-EMBED — remove the analyzer-cable loss from a measured stage
+
+You measure a stage's gain→power on a spectrum analyzer connected by a **measurement cable**.
+That cable's loss `L(f)` (signed, negative) sits between the plane and the analyzer, so the
+analyzer **under-reads** and the loss is baked into the measured curve. It is a **bench
+artifact** — it is NOT in the transmit path, so it must be *removed* from the measurement, not
+folded into the delivered-power chain.
+
+```
+P_true(g) = P_measured(g) − L_cable(f)      # L is signed (e.g. −1 dB); subtracting it adds the loss back
+```
+
+Because the measured curve is taken at one frequency (the signal's `center_freq_hz`), the
+correction is a constant per signal. A measured plane names the cable:
+
+```jsonc
+"sdr_output": { "type": "measured", "quantity": "power",
+                "measurement_deembed": "sa_cable_lmr240_1m" }   // a components.yaml id, or an inline table
+```
+
+- **It is not a chain stage.** The chain is the transmit path (`SDR → amp → cable → antenna`),
+  where a stage *adds* loss. The measurement cable is on the bench (`SDR → analyzer`); it
+  attaches to the measured stage as a de-embed, is applied in **reverse** (removed), and never
+  appears in the chain, the artifact, or anything the transmit script sees.
+- **Resolve.** `resolve()` folds `−L_cable(center_freq_hz)` into the measured plane's
+  `offset_db` — recovering true plane power — **before** the ceiling/limit inversion, so every
+  safety limit (e.g. the amp P1dB cap) gauges true power. A constant-loss cable needs no
+  frequency; a frequency-dependent one uses the signal's measured-at frequency (lowest-frequency
+  fallback when unknown).
+- **Swappable.** The stored curve stays the **raw** analyzer reading; the correction comes from
+  the referenced component. Change the physical cable → re-measure and re-select (the raw
+  reading drops by the new cable's extra loss, and the de-embed adds exactly that back, so the
+  resolved true curve is cable-independent). Re-characterize the *same* cable (a better VNA
+  sweep) → update its library entry and the existing raw readings re-correct, no re-measuring.
+- **Gate.** A ≤1.10.0 agent ignores `measurement_deembed` and leaves the cable loss in (wrong
+  absolute power and a mis-placed ceiling), so the client gates saving on
+  `calibration-measurement-deembed` (agent ≥ 1.11.0). Covered by `test_calibration_deembed`.

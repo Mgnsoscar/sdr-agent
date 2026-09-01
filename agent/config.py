@@ -240,7 +240,16 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # a ≤1.9.0 agent IGNORES `readings` and would resolve --power in the measured quantity (wrong
 # reported power) and skip the limiting cap — so the client gates saving a bridged document on
 # the capability below (a safety gate, not just a feature gate).
-AGENT_VERSION = "1.10.0"
+# 1.11.0 adds MEASUREMENT DE-EMBED. A measured plane may name `measurement_deembed` (a catalog
+# component id or an inline Δ dB(f) table) — the loss of the cable/pad between that plane and
+# the analyzer during calibration. resolve() removes it (folds its negative, at the signal's
+# measured-at frequency, into the curve's offset), recovering the TRUE power at the plane, and
+# does so BEFORE limit inversion so every safety limit gauges true power. It is a bench artifact
+# — never published to the artifact or the transmit path — and swapping the referenced cable
+# component re-corrects with no re-measuring. A ≤1.10.0 agent IGNORES the field and leaves the
+# cable loss baked into the measurement (wrong absolute power AND a mis-placed safety ceiling),
+# so the client gates saving on the capability below (a safety gate).
+AGENT_VERSION = "1.11.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -287,6 +296,10 @@ AGENT_CAPABILITIES = [
                                          # power-quantity bridges (same/law/own) — --power and
                                          # the safety ceiling in a derived quantity, re-folded
                                          # at the live task parameter (docs/calibration-v2 §13)
+    "calibration-measurement-deembed",   # a measured plane may name measurement_deembed (a
+                                         # cable/pad between it and the analyzer) — its loss is
+                                         # removed from the measurement, recovering true plane
+                                         # power (docs/calibration-v2 §14); swappable component
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
