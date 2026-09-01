@@ -84,13 +84,31 @@ class _Measured:
     # its NEGATIVE, evaluated at the signal's measured-at frequency, into offset_db — recovering
     # the TRUE power at the plane — then it is gone (never published). None ⇒ nothing to remove.
     deembed: Optional[list] = None           # [(freq_hz, delta_db)], the measurement-path loss
+    # Per-signal READING anchor curves at this (source) node (docs/calibration-v2.md §13/§15):
+    # a reported and/or limiting reading may be its OWN separately-measured curve (e.g. a
+    # main-lobe measurement backing the limit, while the primary measures full bandwidth). Set
+    # by resolve() from the signal's reading blocks; None ⇒ that reading reuses the primary
+    # curve (Measurement) or a law-derived shift of it. Each is a (gains, powers) pair, already
+    # de-embedded (the same measurement cable) and sharing this plane's offset.
+    reported_own: Optional[tuple] = None
+    limiting_own: Optional[tuple] = None
 
     @property
     def is_reported(self) -> bool:
         return self.role == "reported"
 
-    def power_at(self, gain: float) -> float:
-        return _interp(gain, self.gains, self.powers) + self.offset_db
+    def curve_for(self, reading: str = ""):
+        """The (gains, powers) backing a reading at this node: an own reported/limiting curve
+        when set, else the primary measured curve."""
+        if reading == "reported" and self.reported_own is not None:
+            return self.reported_own
+        if reading == "limiting" and self.limiting_own is not None:
+            return self.limiting_own
+        return (self.gains, self.powers)
+
+    def power_at(self, gain: float, reading: str = "") -> float:
+        g, p = self.curve_for(reading)
+        return _interp(gain, g, p) + self.offset_db
 
     def bias_at(self, freq: Optional[float]) -> float:
         """The source-bias shift (dB) at ``freq`` — 0 when no bias, or when the plane
@@ -313,10 +331,23 @@ class ResolvedCalibration:
 
     def _max_gain_at(self, freq: Optional[float]) -> float:
         """The safety ceiling in gain-space at ``freq``: the tightest of the
-        frequency-independent cap and every frequency-dependent limit."""
+        frequency-independent cap, every frequency-dependent limit, and the ceiling on the
+        LIMITING reading (gauged through the limiting bridge). The limiting-reading cap is
+        applied here for the agent's scalar read-outs but kept OUT of the emitted
+        ``gain_ceiling_db`` (a bridge-aware consumer re-folds it from ``readings`` at the live
+        parameter value, so baking it would double-count)."""
         caps = [self._gain_ceiling_const]
         for plane, max_dbm, _ in self._freq_limits:
             caps.append(_gain_for_power_on(max_dbm, plane, self._planes, freq, for_limit=True))
+        if self._limiting_cap is not None:
+            if self._limiting.is_own:
+                caps.append(_gain_for_power_on(self._limiting_cap, self.operating_plane,
+                                               self._planes, freq, for_limit=True,
+                                               reading="limiting"))
+            else:
+                caps.append(_gain_for_power_on(self._limiting_cap - self._limiting_delta,
+                                               self.operating_plane, self._planes, freq,
+                                               for_limit=True))
         return min(caps)
 
     def _snap(self, gain: float, freq: Optional[float]) -> float:
@@ -340,10 +371,15 @@ class ResolvedCalibration:
         clamped to [min_gain_db, max_gain]. Upward is clamped to the ceiling, never
         extrapolated past it."""
         f = self._eff_freq(freq)
-        # The operator's number is in the REPORTED quantity; convert to the operating
-        # (measured) quantity before inverting the curve (reported = operating + Δr).
-        op_power = float(delivered_dbm) - self._reported_delta
-        g = _gain_for_power_on(op_power, self.operating_plane, self._planes, f)
+        # The operator's number is in the REPORTED reading. An OWN reported curve is inverted
+        # directly (it is measured in the reported quantity); Measurement/law is an additive
+        # offset on the primary (reported = operating + Δr).
+        if self._reported.is_own:
+            g = _gain_for_power_on(float(delivered_dbm), self.operating_plane,
+                                   self._planes, f, reading="reported")
+        else:
+            g = _gain_for_power_on(float(delivered_dbm) - self._reported_delta,
+                                   self.operating_plane, self._planes, f)
         return self._snap(g, f)
 
     def power_for_gain(self, gain_db: float, freq: Optional[float] = None) -> float:
@@ -352,6 +388,8 @@ class ResolvedCalibration:
         to the hardware grid first, so the reported power matches what the SDR will set."""
         f = self._eff_freq(freq)
         g = self._snap(float(gain_db), f)
+        if self._reported.is_own:
+            return _power_on(self.operating_plane, g, self._planes, f, reading="reported")
         return _power_on(self.operating_plane, g, self._planes, f) + self._reported_delta
 
     # ── convenience for the script's --power min/max bounds (at the rep. frequency) ─
@@ -396,9 +434,13 @@ class ResolvedCalibration:
         actives = [Active(d.control.applied_hi, d.control.applied_lo,
                           d.control.step_db, d.control.engage_pct, meta=(n, d))
                    for n, d in hops]
+        # An OWN reported curve is measured in the reported quantity, so the grid works in it
+        # directly (no reported offset added at the boundary); otherwise the grid is in the
+        # operating/measured quantity and the reported offset is applied by the caller.
+        rd = "reported" if self._reported.is_own else ""
         grid = AchievableGrid(
-            power_for_gain=lambda g: _power_on(op, g, planes, f),
-            gain_for_power=lambda p: _gain_for_power_on(p, op, planes, f),
+            power_for_gain=lambda g: _power_on(op, g, planes, f, rd),
+            gain_for_power=lambda p: _gain_for_power_on(p, op, planes, f, reading=rd),
             min_gain=self.min_gain_db, ceiling=self._max_gain_at(f),
             gain_step=self._gain_step, actives=actives)
         return grid, actives
@@ -408,9 +450,9 @@ class ResolvedCalibration:
         ACHIEVABLE power and the device settings that produce it: the SDR gain, and per
         active component its applied gain and the parameter value to command on its task."""
         grid, actives = self._achievable(freq)
-        # Requested power is REPORTED; the achievable grid works in the operating (measured)
-        # quantity, so translate in and back out by the reported delta.
-        dr = self._reported_delta
+        # Requested power is REPORTED; the grid works in the reported quantity already for an
+        # OWN curve, else in the operating (measured) quantity — translate by the reported delta.
+        dr = 0.0 if self._reported.is_own else self._reported_delta
         res = grid.realize(power - dr)
         settings = []
         for a, applied in zip(actives, res["applied"]):
@@ -422,17 +464,22 @@ class ResolvedCalibration:
         return {"power_dbm": res["power_dbm"] + dr, "sdr_gain_db": res["sdr_gain_db"],
                 "settings": settings}
 
+    def _rd(self) -> float:
+        """Reported offset applied at the grid boundary: 0 for an own curve (the grid is
+        already in the reported quantity), else the additive reported delta."""
+        return 0.0 if self._reported.is_own else self._reported_delta
+
     def snap_power(self, power: float, freq: Optional[float] = None) -> float:
         """The nearest achievable delivered power to ``power`` (reported quantity)."""
-        dr = self._reported_delta
+        dr = self._rd()
         return self._achievable(freq)[0].snap(power - dr) + dr
 
     def quantize_up(self, power: float, freq: Optional[float] = None) -> float:
-        dr = self._reported_delta
+        dr = self._rd()
         return self._achievable(freq)[0].quantize_up(power - dr) + dr
 
     def quantize_down(self, power: float, freq: Optional[float] = None) -> float:
-        dr = self._reported_delta
+        dr = self._rd()
         return self._achievable(freq)[0].quantize_down(power - dr) + dr
 
     def active_components(self) -> list:
@@ -454,8 +501,12 @@ class ResolvedCalibration:
         _, anchor = _anchor(self.operating_plane, self._planes, f)
         # v1-compat curve is in the REPORTED quantity (what --power means to a v1 script);
         # a v2 consumer instead re-folds anchor_curve + passive_hops + the `readings` bridge.
-        return [[g, _power_on(self.operating_plane, g, self._planes, f) + self._reported_delta]
-                for g in anchor.gains]
+        # Gain breakpoints come from the reported reading's own curve when it has one.
+        rd = "reported" if self._reported.is_own else ""
+        gains = anchor.curve_for(rd)[0]
+        dr = 0.0 if self._reported.is_own else self._reported_delta
+        return [[g, _power_on(self.operating_plane, g, self._planes, f, rd) + dr]
+                for g in gains]
 
     def anchor_curve(self) -> list:
         """The operating plane's measured anchor curve (gain → power, offset folded in),
@@ -515,6 +566,13 @@ class ResolvedCalibration:
         lim = self._limiting.to_public_dict()
         if self._limiting_cap is not None:
             lim["max_dbm"] = self._limiting_cap
+        # An OWN reading publishes its SOURCE anchor curve (de-embedded), so a consumer folds
+        # the same passive_hops onto it — the reported axis / limiting ceiling track the chain.
+        src = _anchor_plane(self.operating_plane, self._planes)
+        if self._reported.is_own and src.reported_own is not None:
+            rep["anchor_curve"] = [[g, src.power_at(g, "reported")] for g in src.reported_own[0]]
+        if self._limiting.is_own and src.limiting_own is not None:
+            lim["anchor_curve"] = [[g, src.power_at(g, "limiting")] for g in src.limiting_own[0]]
         return {"reported": rep, "limiting": lim,
                 "reported_delta_db": self._reported_delta,
                 "limiting_delta_db": self._limiting_delta}
@@ -609,13 +667,16 @@ def _interp(x: float, xs: list[float], ys: list[float]) -> float:
 
 # ── Plane traversal (mirrors docs/calibration.md §7.3) ───────────────────────────
 
-def _power_on(plane_name: str, gain: float, planes: dict, freq: Optional[float]) -> float:
+def _power_on(plane_name: str, gain: float, planes: dict, freq: Optional[float],
+              reading: str = "") -> float:
     """Power at ``plane_name`` for a commanded gain, walking derived hops down to a
-    measured curve. Each derived hop is evaluated at ``freq``."""
+    measured curve. Each derived hop is evaluated at ``freq``. ``reading`` selects the
+    source anchor curve (an own reported/limiting curve when set), so a reading measured
+    at the source folds through the same passive hops to the operating plane."""
     p = planes[plane_name]
     if isinstance(p, _Measured):
-        return p.power_at(gain) + p.bias_at(freq)   # source-bias shift (0 if none / not source)
-    return _power_on(p.frm, gain, planes, freq) + p.delta_at(freq)
+        return p.power_at(gain, reading) + p.bias_at(freq)   # source-bias shift (0 if none)
+    return _power_on(p.frm, gain, planes, freq, reading) + p.delta_at(freq)
 
 
 def _anchor(plane_name: str, planes: dict, freq: Optional[float],
@@ -739,21 +800,24 @@ def _sum_tables(tables: list) -> list:
 
 
 def _gain_for_power_on(power: float, plane_name: str, planes: dict,
-                       freq: Optional[float], for_limit: bool = False) -> float:
+                       freq: Optional[float], for_limit: bool = False,
+                       reading: str = "") -> float:
     """Gain that yields ``power`` at ``plane_name``. Subtract downstream derived
     deltas (at ``freq``) to reach the anchor measured plane, then invert its curve
     once. Clamps at the measured range — upward to the top gain (never extrapolated
     past the ceiling), downward to the bottom gain. ``for_limit`` gauges a safety limit:
-    the walk punches through ``reported`` planes to the ``limiting`` curve (§4.1)."""
+    the walk punches through ``reported`` planes to the ``limiting`` curve (§4.1).
+    ``reading`` selects the source anchor's own reported/limiting curve when set."""
     delta, m = _anchor(plane_name, planes, freq, for_limit=for_limit)
+    g_curve, p_curve = m.curve_for(reading)
     target = power - delta - m.offset_db - m.bias_at(freq)   # undo the source-bias shift
-    if len(m.powers) == 1:
-        return m.gains[0] + (target - m.powers[0])         # slope-1 inverse
-    if target >= m.powers[-1]:
-        return m.gains[-1]
-    if target <= m.powers[0]:
-        return m.gains[0]
-    return _interp(target, m.powers, m.gains)              # powers monotonic → unambiguous
+    if len(p_curve) == 1:
+        return g_curve[0] + (target - p_curve[0])          # slope-1 inverse
+    if target >= p_curve[-1]:
+        return g_curve[-1]
+    if target <= p_curve[0]:
+        return g_curve[0]
+    return _interp(target, p_curve, g_curve)               # powers monotonic → unambiguous
 
 
 def _breakpoint_freqs(plane_name: str, planes: dict) -> list:
@@ -943,6 +1007,17 @@ def resolve(unit_doc: dict,
         except (TypeError, ValueError):
             raise CalibrationError(
                 f"operating plane {operating_plane!r} 'limiting.max_dbm' must be numeric")
+
+    # An `own` reading is a SEPARATELY measured curve at the source node (e.g. a main-lobe
+    # measurement backing the limit while the primary measures full bandwidth). Attach it to
+    # the observed source anchor so the operator axis / ceiling fold it through the chain like
+    # the primary; the de-embed (already folded into offset_db) applies to it too.
+    if reported.is_own or limiting.is_own:
+        src_anchor = _anchor_plane(operating_plane, planes)
+        if reported.is_own:
+            src_anchor.reported_own = _own_reading_curve(rep_spec, f"{signal_id!r} reported")
+        if limiting.is_own:
+            src_anchor.limiting_own = _own_reading_curve(lim_spec, f"{signal_id!r} limiting")
 
     # Per-unit SOURCE BIAS (the SDR's output-power-vs-frequency flatness): a fixed-gain CW
     # power table, unit-owned (top-level), NOT a component. Skipped when its stage is
@@ -1366,6 +1441,17 @@ def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
         else:
             raise CalibrationError(f"plane {name!r} has invalid type {ptype!r}")
     return planes
+
+
+def _own_reading_curve(spec: dict, ctx: str) -> tuple[list[float], list[float]]:
+    """Build the (gains, powers) for an ``own`` reading — a separately measured curve at the
+    source node embedded in the reading block as ``{curve: {points: […]}}`` (docs
+    §13/§15). Invertible like any measured curve."""
+    curve = spec.get("curve")
+    if not isinstance(curve, dict):
+        raise CalibrationError(
+            f"{ctx}: an own-measurement reading needs a 'curve' with measured points")
+    return _curve_points(curve, ctx)
 
 
 def _curve_points(curve: dict, name: str) -> tuple[list[float], list[float]]:

@@ -154,3 +154,29 @@ def test_plane_reading_is_the_default_when_signal_has_none():
     base = _r()
     r = resolve(doc, None, "sig")
     assert r.max_power_dbm == pytest.approx(base.max_power_dbm + 10.0)
+
+
+# ── own-measurement readings (a separate curve, not derived) ────────────────────
+
+def test_reported_own_curve_drives_the_operator_axis():
+    # primary measures density; reported is its OWN separately-measured curve (gain→power)
+    own = {"points": _pts([(40, 0.0), (74, 34.0)])}    # slope 1
+    r = _r(reported={"kind": "own", "unit": "dBm", "quantity": "main-lobe", "curve": own})
+    assert r.power_for_gain(60.0) == pytest.approx(20.0)   # interp(60, own)
+    # gain for a reported power inverts the OWN curve
+    assert r.gain_for_power(20.0) == pytest.approx(60.0)
+    art = r.to_public_dict()
+    assert art["readings"]["reported"]["kind"] == "own"
+    assert art["readings"]["reported"]["anchor_curve"] == [[40.0, 0.0], [74.0, 34.0]]
+
+
+def test_limiting_own_curve_sets_the_ceiling():
+    # limiting is its OWN main-lobe curve; a cap on it sets the gain ceiling (first-class)
+    own = {"points": _pts([(40, -20.0), (74, 14.0)])}  # slope 1
+    r = _r(limiting={"kind": "own", "curve": own, "max_dbm": 4.0})
+    # cap 4 dBm on the own curve → gain where own == 4 → 40 + (4 − (−20)) = 64
+    assert r.max_gain_db == pytest.approx(64.0)
+    art = r.to_public_dict()
+    assert art["readings"]["limiting"]["kind"] == "own"
+    assert art["readings"]["limiting"]["max_dbm"] == 4.0
+    assert art["readings"]["limiting"]["anchor_curve"] == [[40.0, -20.0], [74.0, 14.0]]
