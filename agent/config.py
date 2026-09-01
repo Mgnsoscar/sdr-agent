@@ -218,7 +218,18 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # curve (per-limit anchor_curve in freq_dependent_limits) so a consumer inverts the limit
 # against the right curve; calkit (OTA bundle) and the client's PowerFold both honour it. The
 # scalar bounds were always correct; only the save-time refusal and the v2 publish changed.
-AGENT_VERSION = "1.8.0"
+# 1.9.0 adds a per-unit SOURCE BIAS and STAGE BYPASS. source_bias is a unit-owned (top-level)
+# power-vs-frequency table (a fixed-gain CW sweep = the SDR's own output flatness); resolve()
+# normalizes it to the signal's rep frequency and shifts the source ANCHOR by it, so both the
+# delivered power AND the safety-limit/ceiling inversion track the transmit frequency. It is
+# published as source_bias_delta_by_freq and makes an otherwise-flat SDR chain frequency-aware
+# (so the client re-folds --power on --freq). A plane (or the bias) may set bypass:true: it
+# resolves as a transparent 0-dB hop with its limits dropped ("as if it weren't there"),
+# omitted from passive_hops; every stage but the source is bypassable, and bypassing the
+# operating plane re-anchors the operating point upstream. Both are byte-for-byte no-ops when
+# absent/false, but a ≤1.8.0 agent ignores source_bias / bypass, so the client gates on the
+# capabilities below (a source bias is a safety-relevant ceiling shift — a real gate).
+AGENT_VERSION = "1.9.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -256,6 +267,11 @@ AGENT_CAPABILITIES = [
                                          # task-driven gain/attenuation stage (e.g. a step
                                          # attenuator) that extends the achievable power range
                                          # and is auto-commanded alongside the SDR
+    "calibration-source-bias",           # a per-unit top-level source_bias (power-vs-freq CW
+                                         # table) shifts the source anchor with frequency —
+                                         # correcting delivered power AND the safety ceiling
+    "calibration-stage-bypass",          # a plane (or the source bias) may set bypass:true —
+                                         # a transparent 0-dB stage with its limits dropped
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
