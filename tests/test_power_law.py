@@ -46,6 +46,26 @@ def test_multi_term_law():
     assert law.delta_db({"bw": 1e6, "n": 10}) == pytest.approx(60.0 - 10.0)
 
 
+def test_rep_delta_defaults_to_ref_giving_k():
+    law = parse_law({"id": "x", "name": "x", "param": "bw", "coeff": 10.0, "ref": 1.0,
+                     "k": 2.0})
+    assert law.rep_delta_db() == pytest.approx(2.0)      # rep defaults to ref → log term 0
+
+
+def test_rep_delta_uses_representative_value():
+    law = parse_law({"id": "fbw", "name": "fbw", "param": "bw", "coeff": 10.0, "ref": 1.0,
+                     "rep": 1e7})
+    assert law.rep_delta_db() == pytest.approx(70.0)     # bounds shown at a typical 10 MHz
+    # runtime still evaluates at the live value
+    assert law.delta_db({"bw": 1e6}) == pytest.approx(60.0)
+
+
+def test_rep_survives_public_dict_roundtrip():
+    law = parse_law({"id": "fbw", "name": "fbw", "param": "bw", "coeff": 10.0, "rep": 1e7})
+    law2 = parse_law(law.to_public_dict())
+    assert law2.rep_delta_db() == pytest.approx(law.rep_delta_db())
+
+
 def test_law_missing_param_raises():
     law = parse_law({"id": "x", "name": "x", "param": "bw", "coeff": 10.0})
     with pytest.raises(ValueError):

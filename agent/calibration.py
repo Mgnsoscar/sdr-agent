@@ -31,6 +31,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
+from paramkit.power_law import Bridge, SAME, parse_bridge
+
 SCHEMA_VERSION = 1
 
 
@@ -278,6 +280,21 @@ class ResolvedCalibration:
     # source plane so the power functions fold it. Kept here to publish in the artifact and to
     # decide freq-dependence when the chain is otherwise flat (a bias-only SDR chain).
     _source_bias: Optional[list] = field(repr=False, default=None)  # [(freq_hz, delta_db)]
+    # Power-quantity BRIDGES on the operating node (docs/calibration-v2.md §13). The node is
+    # measured once; the REPORTED reading (what --power means to the operator) and the
+    # LIMITING reading (what a ceiling is gauged against) each derive from that measurement by
+    # a bridge. `_reported_delta`/`_limiting_delta` are the constant dB at representative
+    # parameter values (baked for the scalar read-outs; a bridge-aware consumer re-folds at the
+    # live parameter value from the artifact `readings` block). Default `same`/0 ⇒ every v1
+    # document behaves byte-identically.
+    _reported: Bridge = field(repr=False, default_factory=Bridge)
+    _limiting: Bridge = field(repr=False, default_factory=Bridge)
+    _reported_delta: float = 0.0
+    _limiting_delta: float = 0.0
+    _reported_quantity: str = ""     # the reported reading's quantity (operator-facing)
+    _reported_unit: str = ""         # the reported reading's display unit (drives the form)
+    _limiting_cap: Optional[float] = None   # ceiling on the LIMITING reading (its own quantity),
+                                            # enforced at runtime by re-folding the limiting bridge
 
     def limit_gauges(self) -> list:
         """Per-limit transparency: which plane (and quantity) each safety limit inverts
@@ -318,7 +335,10 @@ class ResolvedCalibration:
         clamped to [min_gain_db, max_gain]. Upward is clamped to the ceiling, never
         extrapolated past it."""
         f = self._eff_freq(freq)
-        g = _gain_for_power_on(float(delivered_dbm), self.operating_plane, self._planes, f)
+        # The operator's number is in the REPORTED quantity; convert to the operating
+        # (measured) quantity before inverting the curve (reported = operating + Δr).
+        op_power = float(delivered_dbm) - self._reported_delta
+        g = _gain_for_power_on(op_power, self.operating_plane, self._planes, f)
         return self._snap(g, f)
 
     def power_for_gain(self, gain_db: float, freq: Optional[float] = None) -> float:
@@ -327,7 +347,7 @@ class ResolvedCalibration:
         to the hardware grid first, so the reported power matches what the SDR will set."""
         f = self._eff_freq(freq)
         g = self._snap(float(gain_db), f)
-        return _power_on(self.operating_plane, g, self._planes, f)
+        return _power_on(self.operating_plane, g, self._planes, f) + self._reported_delta
 
     # ── convenience for the script's --power min/max bounds (at the rep. frequency) ─
     @property
@@ -383,7 +403,10 @@ class ResolvedCalibration:
         ACHIEVABLE power and the device settings that produce it: the SDR gain, and per
         active component its applied gain and the parameter value to command on its task."""
         grid, actives = self._achievable(freq)
-        res = grid.realize(power)
+        # Requested power is REPORTED; the achievable grid works in the operating (measured)
+        # quantity, so translate in and back out by the reported delta.
+        dr = self._reported_delta
+        res = grid.realize(power - dr)
         settings = []
         for a, applied in zip(actives, res["applied"]):
             name, d = a.meta
@@ -391,18 +414,21 @@ class ResolvedCalibration:
                              "param": d.control.param, "applied_db": applied,
                              "value": round(d.control.param_for_applied(applied), 6),
                              "consts": dict(d.control.consts)})
-        return {"power_dbm": res["power_dbm"], "sdr_gain_db": res["sdr_gain_db"],
+        return {"power_dbm": res["power_dbm"] + dr, "sdr_gain_db": res["sdr_gain_db"],
                 "settings": settings}
 
     def snap_power(self, power: float, freq: Optional[float] = None) -> float:
-        """The nearest achievable delivered power to ``power``."""
-        return self._achievable(freq)[0].snap(power)
+        """The nearest achievable delivered power to ``power`` (reported quantity)."""
+        dr = self._reported_delta
+        return self._achievable(freq)[0].snap(power - dr) + dr
 
     def quantize_up(self, power: float, freq: Optional[float] = None) -> float:
-        return self._achievable(freq)[0].quantize_up(power)
+        dr = self._reported_delta
+        return self._achievable(freq)[0].quantize_up(power - dr) + dr
 
     def quantize_down(self, power: float, freq: Optional[float] = None) -> float:
-        return self._achievable(freq)[0].quantize_down(power)
+        dr = self._reported_delta
+        return self._achievable(freq)[0].quantize_down(power - dr) + dr
 
     def active_components(self) -> list:
         """Public descriptors for each active component (for the artifact + UI)."""
@@ -411,7 +437,7 @@ class ResolvedCalibration:
 
     def banner_label(self) -> str:
         """e.g. 'EIRP, at antenna_eirp' — so the --power number is never ambiguous."""
-        q = self.operating_quantity or "power"
+        q = self._reported_quantity or self.operating_quantity or "power"
         return f"{q}, at {self.operating_plane}"
 
     def operating_curve(self, freq: Optional[float] = None) -> list:
@@ -421,7 +447,9 @@ class ResolvedCalibration:
         ``passive_hops`` so it can re-fold at its live frequency."""
         f = self._eff_freq(freq)
         _, anchor = _anchor(self.operating_plane, self._planes, f)
-        return [[g, _power_on(self.operating_plane, g, self._planes, f)]
+        # v1-compat curve is in the REPORTED quantity (what --power means to a v1 script);
+        # a v2 consumer instead re-folds anchor_curve + passive_hops + the `readings` bridge.
+        return [[g, _power_on(self.operating_plane, g, self._planes, f) + self._reported_delta]
                 for g in anchor.gains]
 
     def anchor_curve(self) -> list:
@@ -461,6 +489,31 @@ class ResolvedCalibration:
         anchor curve — so it needs no plane model of its own."""
         return [[f, d] for f, d in _sum_tables([dv.table for _, dv in _hops(plane_name, self._planes)])]
 
+    @property
+    def has_readings(self) -> bool:
+        """True when a non-trivial reported/limiting bridge is set (a v1 doc has neither,
+        so its artifact stays byte-identical)."""
+        def nontrivial(b: Bridge) -> bool:
+            return b.kind != SAME or b.k != 0.0 or bool(b.unit)
+        return (nontrivial(self._reported) or nontrivial(self._limiting)
+                or self._limiting_cap is not None)
+
+    def readings_public(self) -> dict:
+        """The reported/limiting bridges (+ any limiting-reading cap) for a bridge-aware
+        consumer to re-fold at the live parameter values (docs/calibration-v2.md §13). The
+        laws are embedded, so the consumer needs no script. ``reported_delta_db`` /
+        ``limiting_delta_db`` are the representative-value deltas the v1 ``curve``/min/max
+        already bake in, so a consumer that re-folds knows the baseline it is replacing."""
+        rep = self._reported.to_public_dict()
+        if self._reported_quantity:
+            rep["quantity"] = self._reported_quantity
+        lim = self._limiting.to_public_dict()
+        if self._limiting_cap is not None:
+            lim["max_dbm"] = self._limiting_cap
+        return {"reported": rep, "limiting": lim,
+                "reported_delta_db": self._reported_delta,
+                "limiting_delta_db": self._limiting_delta}
+
     def to_public_dict(self) -> dict:
         """The resolved artifact the agent writes for a task to consume.
 
@@ -478,7 +531,7 @@ class ResolvedCalibration:
             "signal_id": self.signal_id,
             "unit_type": self.unit_type,
             "operating_plane": self.operating_plane,
-            "quantity": self.operating_quantity,
+            "quantity": self._reported_quantity or self.operating_quantity,
             "amplitude": self.amplitude,
             "min_gain_db": self.min_gain_db,
             "max_gain_db": self.max_gain_db,
@@ -488,6 +541,10 @@ class ResolvedCalibration:
         }
         if self._gain_step:
             out["gain_step_db"] = self._gain_step
+        if self._reported_unit:
+            out["operating_unit"] = self._reported_unit     # drives the operator form's unit
+        if self.has_readings:
+            out["readings"] = self.readings_public()
         if self.has_active:
             out["active_components"] = self.active_components()
         hops = self.passive_hops()
@@ -824,6 +881,38 @@ def resolve(unit_doc: dict,
     bypassed = {n for n, s in planes_spec.items()
                 if isinstance(s, dict) and s.get("bypass")}
 
+    # Power-quantity BRIDGES on the operating node (docs/calibration-v2.md §13): the node is
+    # measured once; the REPORTED reading (what --power means to the operator) and the
+    # LIMITING reading (what a ceiling is gauged against) each derive from that measurement by
+    # a self-contained bridge (an embedded law, or `same`+k, or an independent `own` curve).
+    # Absent ⇒ `same`/0 dB, i.e. today's behaviour byte-for-byte. Ignored on a bypassed
+    # operating plane (it re-anchors upstream). The reported delta shifts the operator power
+    # axis; a limiting `max_dbm` cap becomes a synthetic limit on the operating plane in the
+    # MEASURED quantity (max_dbm − Δlim), so the existing limit machinery inverts and
+    # freq-classifies it. Both deltas are baked at representative parameter values for the
+    # scalar read-outs; the artifact carries the bridges so a consumer re-folds at the live value.
+    op_spec = planes_spec.get(operating_plane)
+    if not isinstance(op_spec, dict) or operating_plane in bypassed:
+        op_spec = {}
+    try:
+        reported = parse_bridge(op_spec.get("reported"))
+        limiting = parse_bridge(op_spec.get("limiting"))
+    except ValueError as exc:
+        raise CalibrationError(f"operating plane {operating_plane!r} reading: {exc}")
+    reported_delta = reported.rep_delta_db()
+    limiting_delta = limiting.rep_delta_db()
+    rep_spec = op_spec.get("reported") if isinstance(op_spec.get("reported"), dict) else {}
+    reported_unit = reported.unit
+    reported_quantity = str(rep_spec.get("quantity", "")) if rep_spec else ""
+    lim_spec = op_spec.get("limiting") if isinstance(op_spec.get("limiting"), dict) else {}
+    lim_cap = None
+    if lim_spec and lim_spec.get("max_dbm") is not None:
+        try:
+            lim_cap = float(lim_spec["max_dbm"])
+        except (TypeError, ValueError):
+            raise CalibrationError(
+                f"operating plane {operating_plane!r} 'limiting.max_dbm' must be numeric")
+
     # Per-unit SOURCE BIAS (the SDR's output-power-vs-frequency flatness): a fixed-gain CW
     # power table, unit-owned (top-level), NOT a component. Skipped when its stage is
     # bypassed. Parsed here; normalized to the rep frequency and attached to the source
@@ -933,7 +1022,11 @@ def resolve(unit_doc: dict,
         min_gain_db=gmin, operating_plane=operating_plane, operating_quantity=op_quantity,
         _planes=planes, _freq_hz=rep_freq, _gain_step=gstep,
         _gain_ceiling_const=gain_ceiling_const, _freq_limits=freq_limits,
-        _limit_gauges=limit_gauges, _source_bias=source_bias)
+        _limit_gauges=limit_gauges, _source_bias=source_bias,
+        _reported=reported, _limiting=limiting,
+        _reported_delta=reported_delta, _limiting_delta=limiting_delta,
+        _reported_quantity=reported_quantity, _reported_unit=reported_unit,
+        _limiting_cap=lim_cap)
     if resolved.max_gain_db < gmin:
         raise CalibrationError(
             f"resolved max gain {resolved.max_gain_db:.2f} dB is below min gain "

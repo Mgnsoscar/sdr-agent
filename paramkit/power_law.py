@@ -65,6 +65,12 @@ class LawTerm:
     param: str            # task parameter dest whose value drives this term
     coeff: float          # dB per decade of (param / ref)
     ref: float = 1.0      # reference the param is normalized against (same unit as param)
+    rep: Optional[float] = None   # a representative param value for the agent's scalar
+                                  # read-outs (defaults to ref); runtime uses the live value
+
+    @property
+    def rep_value(self) -> float:
+        return self.ref if self.rep is None else self.rep
 
 
 @dataclass
@@ -86,6 +92,16 @@ class Law:
         """The task-parameter dests this law reads (empty for a pure-constant law)."""
         return [t.param for t in self.terms]
 
+    def rep_delta_db(self) -> float:
+        """The dB the law adds at its representative parameter values — for the agent's
+        scalar read-outs when no live value is available (the client/script re-evaluate at
+        the live value). Each term uses its ``rep`` (or ``ref``), so a term at its reference
+        contributes 0 and the law reduces to ``k``."""
+        d = float(self.k)
+        for t in self.terms:
+            d += float(t.coeff) * math.log10(t.rep_value / float(t.ref))
+        return d
+
     def delta_db(self, values: dict) -> float:
         """The dB the law adds to the measured value, given a ``{param: value}`` mapping.
         A missing parameter or a non-positive value/ref raises ValueError so the caller
@@ -106,8 +122,13 @@ class Law:
         if self.k:
             out["k"] = self.k
         if self.terms:
-            out["terms"] = [{"param": t.param, "coeff": t.coeff, "ref": t.ref}
-                            for t in self.terms]
+            terms = []
+            for t in self.terms:
+                td = {"param": t.param, "coeff": t.coeff, "ref": t.ref}
+                if t.rep is not None:
+                    td["rep"] = t.rep
+                terms.append(td)
+            out["terms"] = terms
         return out
 
 
@@ -148,6 +169,13 @@ class Bridge:
             return self.law.delta_db(values or {})
         return float(self.k)   # SAME (constant k) or OWN (0 by construction)
 
+    def rep_delta_db(self) -> float:
+        """dB at representative parameter values, for the agent's scalar read-outs (the
+        client/script re-fold at the live value). SAME -> k; LAW -> its rep delta; OWN -> 0."""
+        if self.kind == LAW and self.law:
+            return self.law.rep_delta_db()
+        return float(self.k)
+
     def to_public_dict(self) -> dict:
         out = {"kind": self.kind}
         if self.unit:
@@ -182,7 +210,8 @@ def parse_law(spec: object) -> Law:
     raw_terms = spec.get("terms")
     if raw_terms is None and spec.get("param"):        # single-term convenience shape
         raw_terms = [{"param": spec["param"], "coeff": spec.get("coeff", 10.0),
-                      "ref": spec.get("ref", spec.get("ref_hz", 1.0))}]
+                      "ref": spec.get("ref", spec.get("ref_hz", 1.0)),
+                      "rep": spec.get("rep", spec.get("rep_hz"))}]
     terms: list = []
     for t in (raw_terms or []):
         if not isinstance(t, dict):
@@ -193,11 +222,14 @@ def parse_law(spec: object) -> Law:
         try:
             coeff = float(t.get("coeff", 10.0))
             ref = float(t.get("ref", 1.0))
+            rep = float(t["rep"]) if t.get("rep") is not None else None
         except (TypeError, ValueError):
-            raise ValueError(f"law {lid!r}: term coeff/ref must be numeric")
+            raise ValueError(f"law {lid!r}: term coeff/ref/rep must be numeric")
         if ref <= 0.0:
             raise ValueError(f"law {lid!r}: term 'ref' must be > 0")
-        terms.append(LawTerm(param=p, coeff=coeff, ref=ref))
+        if rep is not None and rep <= 0.0:
+            raise ValueError(f"law {lid!r}: term 'rep' must be > 0")
+        terms.append(LawTerm(param=p, coeff=coeff, ref=ref, rep=rep))
     return Law(id=lid, name=name, in_fam=in_fam, out_fam=out_fam, k=k, terms=terms)
 
 
