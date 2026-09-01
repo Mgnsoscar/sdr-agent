@@ -259,3 +259,34 @@ def test_load_amplitude_mismatch_returns_uncalibrated(tmp_path, monkeypatch):
     monkeypatch.setenv("SDR_CALIBRATION_FILE", str(art_path))
     pm = PowerMap.load(baked)
     assert pm is baked and pm.has_absolute is False and pm.warning
+
+
+# ── source bias: calkit folds the SDR flatness identically to the resolver ───────
+
+def _bias_doc():
+    """SDR-only chain (operating = source) with a per-unit source bias and a source limit,
+    so both the delivered power AND the safety ceiling move with the transmit frequency."""
+    return {
+        "schema_version": 1, "unit_type": "broadcaster",
+        "chain": {
+            "gain_limits": {"min_gain_db": 0.0, "max_gain_db": 89.75},
+            "operating_plane": "sdr_output",
+            "limits": [{"plane": "sdr_output", "max_dbm": -2.5, "reason": "amp"}],
+            "planes": {"sdr_output": {"type": "measured", "quantity": "power"}},
+        },
+        "signals": {"sig": {"amplitude": 0.8, "center_freq_hz": 1.5e9,
+                    "curves": {"sdr_output": {"points": _pts(SDR_POINTS)}}}},
+        "source_bias": {"power_by_freq": [[1.0e9, -8.0], [1.5e9, -10.0], [2.0e9, -12.0]]},
+    }
+
+
+def test_source_bias_matches_resolver_at_every_frequency():
+    r = cal.resolve(_bias_doc(), None, "sig")
+    pm = PowerMap.from_artifact(r.to_public_dict(), fallback_amplitude=0.8)
+    assert pm.freq_dependent
+    for f in (1.0e9, 1.25e9, 1.5e9, 2.0e9):
+        for g in (45.0, 60.0, 70.0):
+            assert pm.power_for_gain(g, freq=f) == pytest.approx(r.power_for_gain(g, freq=f))
+        for p in (-30.0, -20.0, -6.0):
+            assert pm.gain_for_power(p, freq=f) == pytest.approx(r.gain_for_power(p, freq=f))
+        assert pm._ceiling(f) == pytest.approx(r._max_gain_at(f))

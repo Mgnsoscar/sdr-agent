@@ -72,6 +72,11 @@ class _Measured:
     description: str = ""
     role: str = "limiting"
     of: str = ""                             # reported → the limiting plane it re-measures
+    # Per-unit SOURCE-BIAS Δ dB(f), attached only to the root/source plane by resolve().
+    # Normalized so it is 0 at the signal's representative (measured-at) frequency, so it
+    # leaves the v1 rep-frequency read-outs unchanged and only shifts the source AWAY from
+    # where the curve was measured (the SDR's own gain-flatness). None ⇒ no bias.
+    bias: Optional[list] = None              # [(freq_hz, delta_db)], strictly increasing freq
 
     @property
     def is_reported(self) -> bool:
@@ -79,6 +84,16 @@ class _Measured:
 
     def power_at(self, gain: float) -> float:
         return _interp(gain, self.gains, self.powers) + self.offset_db
+
+    def bias_at(self, freq: Optional[float]) -> float:
+        """The source-bias shift (dB) at ``freq`` — 0 when no bias, or when the plane
+        isn't the source. A one-point table is constant; an unknown frequency on a
+        multi-point table falls back to its lowest-frequency value."""
+        if not self.bias:
+            return 0.0
+        if len(self.bias) == 1 or freq is None:
+            return self.bias[0][1]
+        return _interp(float(freq), [f for f, _ in self.bias], [d for _, d in self.bias])
 
 
 @dataclass
@@ -259,6 +274,10 @@ class ResolvedCalibration:
     _gain_ceiling_const: float = float("inf")        # freq-independent gain cap
     _freq_limits: list = field(repr=False, default_factory=list)  # [(plane, max_dbm, reason)]
     _limit_gauges: list = field(repr=False, default_factory=list)  # per-limit gauge info
+    # Normalized per-unit source bias Δ dB(f) (0 at the rep frequency), also attached to the
+    # source plane so the power functions fold it. Kept here to publish in the artifact and to
+    # decide freq-dependence when the chain is otherwise flat (a bias-only SDR chain).
+    _source_bias: Optional[list] = field(repr=False, default=None)  # [(freq_hz, delta_db)]
 
     def limit_gauges(self) -> list:
         """Per-limit transparency: which plane (and quantity) each safety limit inverts
@@ -472,9 +491,15 @@ class ResolvedCalibration:
         if self.has_active:
             out["active_components"] = self.active_components()
         hops = self.passive_hops()
-        if hops or self._freq_limits:
+        if hops or self._freq_limits or self._source_bias:
             out["anchor_curve"] = self.anchor_curve()
             out["passive_hops"] = hops
+            # The per-unit source bias shifts the ANCHOR (so operating power AND limit
+            # inversion move with frequency); a v2 consumer adds it to the anchor at its
+            # live frequency. Normalized to 0 at the rep frequency, so the v1 curve above
+            # is unchanged. A bias alone makes an otherwise-flat SDR chain frequency-aware.
+            if self._source_bias:
+                out["source_bias_delta_by_freq"] = [[f, d] for f, d in self._source_bias]
             # Each frequency-dependent limit carries its own summed delta from the shared
             # anchor, so a consumer inverts it against the same anchor_curve at the live
             # frequency (no plane model needed script-side).
@@ -523,7 +548,7 @@ def _power_on(plane_name: str, gain: float, planes: dict, freq: Optional[float])
     measured curve. Each derived hop is evaluated at ``freq``."""
     p = planes[plane_name]
     if isinstance(p, _Measured):
-        return p.power_at(gain)
+        return p.power_at(gain) + p.bias_at(freq)   # source-bias shift (0 if none / not source)
     return _power_on(p.frm, gain, planes, freq) + p.delta_at(freq)
 
 
@@ -655,7 +680,7 @@ def _gain_for_power_on(power: float, plane_name: str, planes: dict,
     past the ceiling), downward to the bottom gain. ``for_limit`` gauges a safety limit:
     the walk punches through ``reported`` planes to the ``limiting`` curve (§4.1)."""
     delta, m = _anchor(plane_name, planes, freq, for_limit=for_limit)
-    target = power - delta - m.offset_db
+    target = power - delta - m.offset_db - m.bias_at(freq)   # undo the source-bias shift
     if len(m.powers) == 1:
         return m.gains[0] + (target - m.powers[0])         # slope-1 inverse
     if target >= m.powers[-1]:
@@ -791,6 +816,34 @@ def resolve(unit_doc: dict,
     # 4. validate topology + operating plane usability
     _validate_topology(planes, operating_plane)
 
+    # Bypassed stages (a component you've physically pulled without deleting it) resolve to
+    # transparent 0-dB hops in _build_planes; here their safety limits are dropped too — "as
+    # if it weren't there". The source (root) stage can't be bypassed (_build_planes rejects
+    # it). A bypassed operating plane re-anchors upstream for free: it's now a 0-dB hop, so
+    # the operating point falls through to the nearest live plane.
+    bypassed = {n for n, s in planes_spec.items()
+                if isinstance(s, dict) and s.get("bypass")}
+
+    # Per-unit SOURCE BIAS (the SDR's output-power-vs-frequency flatness): a fixed-gain CW
+    # power table, unit-owned (top-level), NOT a component. Skipped when its stage is
+    # bypassed. Parsed here; normalized to the rep frequency and attached to the source
+    # plane once the rep frequency is settled (below).
+    sb = unit_doc.get("source_bias")
+    if sb is not None and not isinstance(sb, dict):
+        raise CalibrationError("source_bias must be an object")
+    bias_pts = (_bias_table(sb.get("power_by_freq"), "source_bias")
+                if isinstance(sb, dict) and not sb.get("bypass") else None)
+
+    # The source (root measured) plane the bias attaches to. A source bias makes the source
+    # frequency-dependent, so any limit gauged through it must classify as frequency-dependent
+    # below — which needs the rep frequency settled first, so derive one from the bias sweep
+    # now when the signal declares none.
+    src_name = next((n for n, p in planes.items() if isinstance(p, _Measured)), None)
+    bias_on_source = bias_pts is not None and src_name is not None
+    if bias_pts is not None and rep_freq is None:
+        _bf = sorted({f for f, _ in bias_pts})
+        rep_freq = 0.5 * (_bf[0] + _bf[-1])
+
     # 5. gain bounds + ceiling, split into a frequency-independent part (the tightest
     #    that never moves — e.g. the amp-protection limit on the MEASURED sdr_output)
     #    and any limits whose plane sits behind a passive hop (frequency-dependent).
@@ -808,13 +861,18 @@ def resolve(unit_doc: dict,
     if gl.get("max_gain_db") is not None:
         const_caps.append(float(gl["max_gain_db"]))
     for lim in (chain.get("limits") or []):
+        if lim.get("plane") in bypassed:             # limit on a bypassed stage doesn't apply
+            continue
         plane = _limit_plane(lim, planes)            # honour side: input → one hop upstream
         anchor = _require_usable(plane, planes, for_limit=True)   # gauge on the LIMITING curve
         limit_gauges.append({
             "reason": lim.get("reason", ""), "max_dbm": float(lim["max_dbm"]),
             "at_plane": plane, "gauge_plane": _plane_name(anchor, planes),
             "gauge_quantity": anchor.quantity})
-        if _path_freq_dependent(plane, planes):
+        if _path_freq_dependent(plane, planes) or (
+                bias_on_source
+                and _anchor_plane(plane, planes, for_limit=True) is planes[src_name]):
+            # freq-dependent via a passive hop OR because it gauges through the biased source
             freq_limits.append((plane, float(lim["max_dbm"]), lim.get("reason", "")))
         else:
             const_caps.append(
@@ -857,13 +915,25 @@ def resolve(unit_doc: dict,
                 f"'center_freq_hz' and no frequency breakpoints to derive a representative "
                 f"operating frequency from")
 
+    # Normalize the source bias to the rep frequency (the frequency the curve was measured
+    # at) and attach it to the source plane. Zeroing it at the rep frequency keeps the v1
+    # rep-frequency read-outs unchanged; it only shifts the source AWAY from there. If the
+    # signal declares no rep frequency, derive one from the bias sweep so a bias-only SDR
+    # chain (no hops/limits) is still frequency-aware.
+    source_bias = None
+    if bias_pts is not None:
+        zero = _eval_table(bias_pts, rep_freq)            # bias(rep) — the normalization point
+        source_bias = [(f, d - zero) for f, d in bias_pts]
+        if src_name is not None:
+            planes[src_name].bias = source_bias           # fold it wherever source is the anchor
+
     op_quantity = _quantity_of(planes[operating_plane])
     resolved = ResolvedCalibration(
         signal_id=signal_id, unit_type=unit_type, amplitude=amplitude,
         min_gain_db=gmin, operating_plane=operating_plane, operating_quantity=op_quantity,
         _planes=planes, _freq_hz=rep_freq, _gain_step=gstep,
         _gain_ceiling_const=gain_ceiling_const, _freq_limits=freq_limits,
-        _limit_gauges=limit_gauges)
+        _limit_gauges=limit_gauges, _source_bias=source_bias)
     if resolved.max_gain_db < gmin:
         raise CalibrationError(
             f"resolved max gain {resolved.max_gain_db:.2f} dB is below min gain "
@@ -1007,6 +1077,25 @@ def _freq_table(raw, ctx: str) -> list:
     return pts
 
 
+def _bias_table(raw, ctx: str) -> list:
+    """Validate + sort a source-bias ``[[freq_hz, power_dbm], …]`` table: ≥1 point, strictly
+    increasing in frequency. The values are the ABSOLUTE power measured for the fixed-gain CW
+    at each frequency; resolve() normalizes them to a Δ against the rep frequency. One point ⇒
+    a constant (no-op after normalization)."""
+    if not isinstance(raw, list) or not raw:
+        raise CalibrationError(f"{ctx}: power_by_freq must be a non-empty list")
+    try:
+        pts = sorted(((float(f), float(p)) for f, p in raw), key=lambda fp: fp[0])
+    except (TypeError, ValueError) as exc:
+        raise CalibrationError(f"{ctx}: malformed power_by_freq point: {exc}")
+    for i in range(1, len(pts)):
+        if pts[i][0] <= pts[i - 1][0]:
+            raise CalibrationError(
+                f"{ctx}: power_by_freq frequencies not strictly increasing near "
+                f"{pts[i][0]:g} Hz")
+    return pts
+
+
 def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
                   components: dict) -> dict:
     """Turn the chain's plane specs (topology, no points) plus the signal's curves
@@ -1031,6 +1120,16 @@ def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
         quantity = spec.get("quantity", "")
         description = spec.get("description", "")
         if ptype == "measured":
+            if spec.get("bypass"):
+                # Bypassed measured stage → transparent 0-dB hop onto the stage before it
+                # (its curve/role are ignored). The source stage has nothing upstream, so it
+                # can't be bypassed.
+                if prev_name is None:
+                    raise CalibrationError(f"the source stage {name!r} can't be bypassed")
+                planes[name] = _Derived(frm=prev_name, table=[(0.0, 0.0)], fallback=True,
+                                        quantity=quantity, description=description)
+                prev_name = name
+                continue
             role = spec.get("role", "limiting")
             if role not in ("limiting", "reported"):
                 raise CalibrationError(
@@ -1078,6 +1177,13 @@ def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
             frm = spec.get("from")
             if not frm:
                 raise CalibrationError(f"derived plane {name!r} has no 'from'")
+            if spec.get("bypass"):
+                # Bypassed component → transparent 0-dB hop (its delta/component/control are
+                # ignored, and it's omitted from the published passive_hops via fallback).
+                planes[name] = _Derived(frm=frm, table=[(0.0, 0.0)], fallback=True,
+                                        quantity=quantity, description=description)
+                prev_name = name
+                continue
             has_comp = "component" in spec
             has_delta = "delta_db" in spec
             has_table = "delta_db_by_freq" in spec        # inline Δ dB(f) table (owns its own)

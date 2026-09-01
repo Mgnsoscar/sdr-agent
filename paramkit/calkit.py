@@ -99,7 +99,7 @@ class PowerMap:
 
     def __init__(self, gains, powers, min_gain_db, ceiling_const, amplitude,
                  source, label, hops=(), freq_limits=(), center_freq=None,
-                 gain_step_db=None, actives=()):
+                 gain_step_db=None, actives=(), source_bias=()):
         if not gains or len(gains) != len(powers):
             raise ValueError("calibration curve is empty or malformed")
         # keep gain-sorted; agent guarantees strict monotonicity, verify defensively
@@ -145,6 +145,11 @@ class PowerMap:
         # grid on top of its passive baseline (already folded into the hops). Empty = a plain
         # passive chain (v1/v2 behaviour unchanged).
         self._actives = [dict(a) for a in (actives or [])]
+        # Per-unit SOURCE BIAS Δ dB(f): the SDR's own output-vs-frequency flatness, shifting
+        # the measured ANCHOR with frequency (normalized to 0 at the rep frequency). Applied
+        # to the anchor everywhere — delivered power AND the limit/ceiling inversion — so it
+        # mirrors the agent resolver exactly. Empty ⇒ no bias.
+        self._bias = [(float(f), float(d)) for f, d in (source_bias or [])]
 
     # ── frequency-dependent internals ────────────────────────────────────────────
     def _eff(self, freq: Optional[float]) -> Optional[float]:
@@ -153,6 +158,13 @@ class PowerMap:
     def _op_delta(self, freq: Optional[float]) -> float:
         """Total passive delta (cable + antenna …) at ``freq`` — 0 for a v1 curve."""
         return sum(_table_at(fs, ds, freq) for fs, ds in self._hops)
+
+    def _source_bias_at(self, freq: Optional[float]) -> float:
+        """The source-bias shift (dB) applied to the measured anchor at ``freq`` — 0 when
+        there's no bias, or (single-point) a constant."""
+        if not self._bias:
+            return 0.0
+        return _table_at([f for f, _ in self._bias], [d for _, d in self._bias], freq)
 
     def _invert(self, target_power: float) -> float:
         """Anchor gain that yields ``target_power`` at the measured anchor, clamped to
@@ -165,11 +177,13 @@ class PowerMap:
         curve when it carries one (a reported operating plane), else the shared anchor.
         Tightest wins."""
         cap = self._ceiling_const
+        b = self._source_bias_at(freq)
         for max_dbm, fs, ds, ag, ap in self._freq_limits:
             target = max_dbm - _table_at(fs, ds, freq)
-            gains = ag if ag is not None else self._gains
-            powers = ap if ap is not None else self._powers
-            cap = min(cap, _interp(target, powers, gains))
+            if ag is not None:                    # own (downstream) limiting curve → no bias
+                cap = min(cap, _interp(target, ap, ag))
+            else:                                 # shared operating anchor = the biased source
+                cap = min(cap, _interp(target - b, self._powers, self._gains))
         return cap
 
     def _snap(self, gain: float, freq: Optional[float]) -> float:
@@ -195,13 +209,14 @@ class PowerMap:
         from paramkit.achievable import AchievableGrid, Active
         f = self._eff(freq)
         od = self._op_delta(f)
+        b = self._source_bias_at(f)
         actives = []
         for a in self._actives:
             hi, lo = _active_applied(a)
             actives.append(Active(hi, lo, a["step_db"], a.get("engage_pct", 0.0), meta=a))
         grid = AchievableGrid(
-            power_for_gain=lambda g: _interp(g, self._gains, self._powers) + od,
-            gain_for_power=lambda p: _interp(p - od, self._powers, self._gains),
+            power_for_gain=lambda g: _interp(g, self._gains, self._powers) + od + b,
+            gain_for_power=lambda p: _interp(p - od - b, self._powers, self._gains),
             min_gain=self.min_gain_db, ceiling=self._ceiling(f),
             gain_step=self._gain_step, actives=actives)
         return grid, actives
@@ -241,7 +256,7 @@ class PowerMap:
         f = self._eff(freq)
         if self._actives:
             return self._achievable(freq)[0].realize(float(delivered_dbm))["sdr_gain_db"]
-        g = self._invert(float(delivered_dbm) - self._op_delta(f))
+        g = self._invert(float(delivered_dbm) - self._op_delta(f) - self._source_bias_at(f))
         return self._snap(g, f)
 
     def power_for_gain(self, gain_db: float, freq: Optional[float] = None) -> float:
@@ -252,7 +267,7 @@ class PowerMap:
             raise NoAbsoluteScale("uncalibrated: no absolute power scale for this signal")
         f = self._eff(freq)
         g = self._snap(float(gain_db), f)
-        return _interp(g, self._gains, self._powers) + self._op_delta(f)
+        return _interp(g, self._gains, self._powers) + self._op_delta(f) + self._source_bias_at(f)
 
     @property
     def max_gain_db(self) -> float:
@@ -290,7 +305,8 @@ class PowerMap:
         """True when --power ↔ gain (or the ceiling) actually moves with frequency, so a
         caller knows to pass its live frequency."""
         return (any(len(fs) > 1 for fs, _ in self._hops)
-                or any(len(fs) > 1 for _, fs, _ds, _ag, _ap in self._freq_limits))
+                or any(len(fs) > 1 for _, fs, _ds, _ag, _ap in self._freq_limits)
+                or len(self._bias) > 1)
 
     # ── constructors ────────────────────────────────────────────────────────────
     @classmethod
@@ -324,6 +340,7 @@ class PowerMap:
         self._center_freq = None
         self._gain_step = None
         self._actives = []
+        self._bias = []
         self.has_absolute = False
         return self
 
@@ -354,7 +371,8 @@ class PowerMap:
                        source="calibration file", label=label,
                        hops=hops, freq_limits=freq_limits,
                        center_freq=art.get("center_freq_hz"), gain_step_db=step,
-                       actives=actives)
+                       actives=actives,
+                       source_bias=art.get("source_bias_delta_by_freq") or ())
 
         curve = art.get("curve") or []                # v1: pre-flattened operating curve
         gains = [pt[0] for pt in curve]
