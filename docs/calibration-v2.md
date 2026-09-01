@@ -586,3 +586,108 @@ consumer (`paramkit/calkit.py`), client fold + universal achievable slider
 auto-commanding (`agent/process_manager.py`), and the calibration-panel active-stage editor.
 Covered across `test_calibration_active`, `test_power_fold`, `test_achievable_levels` (client)
 and `test_calibration_active`, `test_active_autocommand` (agent).
+
+
+## 13. Reported & limiting power — quantity BRIDGES
+
+Some signals are naturally measured in one power quantity but must be *reported* in another,
+and *safety-limited* in a third. A chirp is measured as a spectral **density** (dBm/MHz); the
+operator wants to set its **full-bandwidth (total) power** (dBm), and the amplifier must be
+protected against that same total power. A comb is measured as **total** power but reported as
+**per-tooth peak**. A PRN's main-lobe peak converts to total by a code-type constant.
+
+A calibration node is measured **once**. Two readings derive from that measurement by a
+**bridge**:
+
+- **REPORTED** — what `--power` means to the operator (the operating quantity);
+- **LIMITING** — what a safety ceiling is gauged against.
+
+Each bridge is one of:
+
+- `same` — the reading IS the measured quantity, up to a constant `k` dB (a pure denominator
+  restatement, e.g. dBm/Hz → dBm/MHz is +60). Default ⇒ every v1 document is byte-identical.
+- `law` — a signal-declared conversion; the ONLY bridge that changes the quantity/unit family.
+- `own` — the reading is measured independently (its own curve).
+
+### 13.1 The law shape (affine in log₁₀)
+
+A law is closed and declarative — not an expression evaluator — because the SAME law is
+evaluated by three code paths (the agent resolver for the UI bounds, the transmit script at
+the live parameter value, and the client fold for the form read-out); a parity bug would mean
+wrong emitted power. Every RF power-quantity conversion is of the form:
+
+```
+out = in + k + Σ  coeffᵢ · log10( paramᵢ / refᵢ )
+```
+
+`k` alone is a constant (a PRN peak→total ratio, a denominator restatement); one log term is a
+density↔total (`+10·log10(bw/1 MHz)`) or per-tooth↔total (`−10·log10(N)`) conversion; several
+terms handle a multi-parameter law. `in`/`out` fix the unit **family** of each side (`abs` =
+dBm, `density` = dBm per bandwidth); a law is only applicable when the measurement's family
+matches its `in`, and within `density` the denominator is a free display choice. A term may
+carry an optional `rep` — a representative parameter value for the scalar read-outs — while
+`ref` defines the formula. The shared math lives in `paramkit/power_law.py` (`Law`, `Bridge`,
+`parse_law`/`parse_bridge`), mirrored byte-identically in the client (`state/power_law.py`).
+
+### 13.2 Where a law is declared, where a bridge lives
+
+A signal script declares the laws it offers as a module constant, surfaced statically like
+`CAL_SIGNAL_ID` / `CAL_FREQ_PARAM`:
+
+```python
+CAL_POWER_LAWS = [
+    {"id": "fbw_power", "name": "Full-bandwidth power", "in": "density", "out": "abs",
+     "param": "bw", "coeff": 10.0, "ref": 1.0, "rep": 20.0},   # bw in MHz
+]
+```
+
+The agent's `argspec` surfaces these raw as `calibration_power_laws` in `/scripts/{name}/params`
+so the calibration editor can offer them in a "declared by this signal" picker. When the
+operator picks one, the FULL law is **embedded** into the unit's calibration doc — so the
+resolver, the artifact, and the transmit script never read the script metadata; the document is
+self-contained.
+
+A bridge lives on the **operating node**, resolved **per signal first** (a signal entry's
+`reported`/`limiting` block) with the **operating-plane spec as the shared default** — so a
+single-signal-type unit sets it once on the plane, and a mixed unit overrides per signal:
+
+```jsonc
+"antenna_eirp": {
+  "type": "derived", "from": "cable_output",
+  "reported": { "kind": "law", "unit": "dBm", "quantity": "full-bandwidth power",
+                "law": { …embedded fbw_power… } },
+  "limiting": { "kind": "same", "max_dbm": 30.0 }   // optional ceiling on the limiting reading
+}
+```
+
+### 13.3 Resolve, artifact, runtime
+
+- **Resolve (`agent/calibration.py`).** The REPORTED delta is a pure additive offset on the
+  operator power axis — `gain_for_power`/`power_for_gain`, `realize`, `snap`/`quantize`,
+  `min`/`max_power` and the v1-compat `curve` all shift by it — so an old (v1) script still
+  shows the reported number. Param-keyed laws bake at a representative value for the scalar
+  read-outs (like `center_freq_hz` does for frequency). The operating quantity/unit and the
+  banner reflect the reported reading.
+- **Artifact.** A `readings` block carries the reported + limiting bridges (embedded laws), the
+  limiting cap, and the representative deltas the v1 fields bake in, plus `operating_unit`. The
+  anchor curve is emitted whenever a bridge is present, so a bridge-aware consumer folds the
+  MEASURED anchor and applies the bridge itself; the flat `curve` stays REPORTED for v1 scripts.
+  Additive — a v1 consumer ignores it.
+- **Runtime (`calkit` / client `power_fold`).** The transmit script passes its live keyed-param
+  values (e.g. `{"bw": …}`) alongside the frequency; the reported bridge converts `--power` to
+  the operating quantity before inverting the curve, and the limiting bridge + cap tighten the
+  ceiling — all re-evaluated at the LIVE parameter value, so a chirp's `--power` and its
+  total-power safety cap track the sweep bandwidth as it is tuned. The client form mirrors this:
+  the `--power` field is labelled in the reported unit and its range/snapping re-fold on a
+  keyed-parameter change, exactly as they already re-fold on a frequency change.
+
+### 13.4 Status — done
+
+Shared law/bridge math (`paramkit/power_law.py` ↔ `state/power_law.py`), the resolver
+(reported axis shift, per-signal reading, `readings` artifact), the transmit-script consumer
+(`paramkit/calkit.py`, live-parameter re-fold), the client fold (`state/power_fold.py`), the
+operator-form unit + parameter re-fold (`ui/param_form.py`), the `CAL_POWER_LAWS` surfacing
+(`agent/argspec.py` ↔ `api/argspec.py`), a chirp adopting it (`fm_chirp_tx.py`), and the
+calibration-panel reported/limiting bridge editor. Covered by `test_power_law`,
+`test_calibration_bridges`, `test_calkit_bridges` (agent) and `test_power_fold_bridges`,
+`test_param_form_bridge`, `test_calibration_reading_editor` (client).
