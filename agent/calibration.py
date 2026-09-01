@@ -548,7 +548,11 @@ class ResolvedCalibration:
         if self.has_active:
             out["active_components"] = self.active_components()
         hops = self.passive_hops()
-        if hops or self._freq_limits or self._source_bias:
+        # A non-trivial reading bridge also needs the v2 shape: the anchor is the MEASURED
+        # curve and the bridge is applied on top at the live parameter value, so the anchor
+        # must be published (the v1 `curve` already bakes the reported delta at rep, for old
+        # scripts) even on an otherwise-flat chain.
+        if hops or self._freq_limits or self._source_bias or self.has_readings:
             out["anchor_curve"] = self.anchor_curve()
             out["passive_hops"] = hops
             # The per-unit source bias shifts the ANCHOR (so operating power AND limit

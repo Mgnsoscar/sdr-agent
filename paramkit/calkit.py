@@ -31,6 +31,8 @@ import math
 import os
 from typing import Optional
 
+from paramkit.power_law import parse_bridge
+
 CALIBRATION_FILE_ENV = "SDR_CALIBRATION_FILE"
 
 # Amplitudes are authored numbers in [0, 1]; treat anything within this of the script's
@@ -99,7 +101,9 @@ class PowerMap:
 
     def __init__(self, gains, powers, min_gain_db, ceiling_const, amplitude,
                  source, label, hops=(), freq_limits=(), center_freq=None,
-                 gain_step_db=None, actives=(), source_bias=()):
+                 gain_step_db=None, actives=(), source_bias=(),
+                 reported=None, limiting=None, limiting_cap=None,
+                 reported_applies=False):
         if not gains or len(gains) != len(powers):
             raise ValueError("calibration curve is empty or malformed")
         # keep gain-sorted; agent guarantees strict monotonicity, verify defensively
@@ -150,10 +154,35 @@ class PowerMap:
         # to the anchor everywhere — delivered power AND the limit/ceiling inversion — so it
         # mirrors the agent resolver exactly. Empty ⇒ no bias.
         self._bias = [(float(f), float(d)) for f, d in (source_bias or [])]
+        # Power-quantity BRIDGES (docs/calibration-v2.md §13): how the REPORTED reading (what
+        # --power means to the operator) and the LIMITING reading (what the cap gauges) derive
+        # from the node's MEASURED curve. Evaluated at the live parameter values the script
+        # passes in (like the live frequency), so --power stays accurate as a keyed parameter
+        # (e.g. sweep bandwidth) is tuned. `reported_applies` is True only when the map is
+        # built from the MEASURED anchor (v2), where the reported delta must be added on top;
+        # a v1 flat curve already bakes it, so it is not re-applied. None ⇒ a plain map.
+        self._reported = reported
+        self._limiting = limiting
+        self._limiting_cap = None if limiting_cap is None else float(limiting_cap)
+        self._reported_applies = bool(reported_applies and reported is not None)
 
     # ── frequency-dependent internals ────────────────────────────────────────────
     def _eff(self, freq: Optional[float]) -> Optional[float]:
         return freq if freq is not None else self._center_freq
+
+    def _reading_delta(self, bridge, params: Optional[dict]) -> float:
+        """The dB a bridge adds to the measured value: at the live parameter values when the
+        bridge is param-keyed and they are supplied, else at the representative values (the
+        bounds fall back to representative, exactly as frequency falls back to center_freq)."""
+        if bridge is None:
+            return 0.0
+        if params and bridge.keyed_params():
+            return bridge.delta_db(params)
+        return bridge.rep_delta_db()
+
+    def _reported_shift(self, params: Optional[dict]) -> float:
+        """dB between the operating (measured) power and the operator's reported number."""
+        return self._reading_delta(self._reported, params) if self._reported_applies else 0.0
 
     def _op_delta(self, freq: Optional[float]) -> float:
         """Total passive delta (cable + antenna …) at ``freq`` — 0 for a v1 curve."""
@@ -171,11 +200,11 @@ class PowerMap:
         the measured range (up to the top gain, never extrapolated)."""
         return _interp(target_power, self._powers, self._gains)
 
-    def _ceiling(self, freq: Optional[float]) -> float:
+    def _ceiling(self, freq: Optional[float], params: Optional[dict] = None) -> float:
         """Gain ceiling at ``freq``: the frequency-independent cap tightened by any
-        frequency-dependent limit. Each limit inverts against its own published limiting
-        curve when it carries one (a reported operating plane), else the shared anchor.
-        Tightest wins."""
+        frequency-dependent limit and by a ceiling on the LIMITING reading. Each frequency
+        limit inverts against its own published limiting curve when it carries one (a reported
+        operating plane), else the shared anchor. Tightest wins."""
         cap = self._ceiling_const
         b = self._source_bias_at(freq)
         for max_dbm, fs, ds, ag, ap in self._freq_limits:
@@ -184,13 +213,20 @@ class PowerMap:
                 cap = min(cap, _interp(target, ap, ag))
             else:                                 # shared operating anchor = the biased source
                 cap = min(cap, _interp(target - b, self._powers, self._gains))
+        # Ceiling on the operating node's LIMITING reading (limiting = measured + Δlim), gauged
+        # against the measured anchor at the live parameter value — so a param-keyed limit
+        # (e.g. a total-power cap when the measurement is a density) tightens as the parameter
+        # is tuned, never baked at the wrong value.
+        if self._limiting_cap is not None:
+            target = self._limiting_cap - self._reading_delta(self._limiting, params)
+            cap = min(cap, _interp(target - b, self._powers, self._gains))
         return cap
 
-    def _snap(self, gain: float, freq: Optional[float]) -> float:
+    def _snap(self, gain: float, freq: Optional[float], params: Optional[dict] = None) -> float:
         """Clamp ``gain`` to [min, ceiling(freq)] and, when a hardware gain step is set,
         snap it to the nearest step on that grid — but NEVER above the ceiling (floor to the
         grid there) so quantisation can't push past a safety limit."""
-        lo, hi = self.min_gain_db, self._ceiling(freq)
+        lo, hi = self.min_gain_db, self._ceiling(freq, params)
         step = self._gain_step
         if not step:
             return min(max(float(gain), lo), hi)
@@ -202,10 +238,11 @@ class PowerMap:
         return round(g, 6)
 
     # ── active-component achievable-level resolver ───────────────────────────────
-    def _achievable(self, freq: Optional[float]):
+    def _achievable(self, freq: Optional[float], params: Optional[dict] = None):
         """Build the shared achievable-power resolver at ``freq`` (returns the grid and the
-        active descriptors). The SDR power map (components at baseline) feeds it; the grid
-        adds the components' applied-gain ranges. Empty actives ⇒ a plain SDR grid."""
+        active descriptors), in the OPERATING (measured) quantity. The SDR power map
+        (components at baseline) feeds it; the grid adds the components' applied-gain ranges.
+        The reported bridge is applied by the caller on top. Empty actives ⇒ a plain SDR grid."""
         from paramkit.achievable import AchievableGrid, Active
         f = self._eff(freq)
         od = self._op_delta(f)
@@ -217,57 +254,69 @@ class PowerMap:
         grid = AchievableGrid(
             power_for_gain=lambda g: _interp(g, self._gains, self._powers) + od + b,
             gain_for_power=lambda p: _interp(p - od - b, self._powers, self._gains),
-            min_gain=self.min_gain_db, ceiling=self._ceiling(f),
+            min_gain=self.min_gain_db, ceiling=self._ceiling(f, params),
             gain_step=self._gain_step, actives=actives)
         return grid, actives
 
-    def realize(self, delivered_dbm: float, freq: Optional[float] = None) -> dict:
+    def realize(self, delivered_dbm: float, freq: Optional[float] = None,
+                params: Optional[dict] = None) -> dict:
         """SDR-first realization of a requested delivered power with active components:
         ``{power_dbm, sdr_gain_db, settings}`` where settings names each component's task,
         parameter and the value to command on it. (The SDR side sets ``sdr_gain_db``; the
-        host commands the component tasks to their values.)"""
+        host commands the component tasks to their values.) The requested/returned power is
+        in the REPORTED quantity; the grid works in the operating quantity, so it is shifted
+        by the reported bridge (evaluated at ``params``) in and back out."""
         if not self.has_absolute:
             raise NoAbsoluteScale("uncalibrated: no absolute power scale for this signal")
-        grid, actives = self._achievable(freq)
-        res = grid.realize(float(delivered_dbm))
+        dr = self._reported_shift(params)
+        grid, actives = self._achievable(freq, params)
+        res = grid.realize(float(delivered_dbm) - dr)
         settings = []
         for act, applied in zip(actives, res["applied"]):
             a = act.meta
             settings.append({"plane": a.get("plane"), "task": a["task"], "param": a["param"],
                              "applied_db": applied,
                              "value": round(_active_param_value(a, applied), 6)})
-        return {"power_dbm": res["power_dbm"], "sdr_gain_db": res["sdr_gain_db"],
+        return {"power_dbm": res["power_dbm"] + dr, "sdr_gain_db": res["sdr_gain_db"],
                 "settings": settings}
 
-    def snap_power(self, delivered_dbm: float, freq: Optional[float] = None) -> float:
-        return self._achievable(freq)[0].snap(float(delivered_dbm))
+    def snap_power(self, delivered_dbm: float, freq: Optional[float] = None,
+                   params: Optional[dict] = None) -> float:
+        dr = self._reported_shift(params)
+        return self._achievable(freq, params)[0].snap(float(delivered_dbm) - dr) + dr
 
     # ── the two functions the script calls ──────────────────────────────────────
-    def gain_for_power(self, delivered_dbm: float, freq: Optional[float] = None) -> float:
+    def gain_for_power(self, delivered_dbm: float, freq: Optional[float] = None,
+                       params: Optional[dict] = None) -> float:
         """Commanded SDR gain (dB) for a requested delivered power at ``freq`` (defaults to
-        the artifact's representative frequency), clamped to [min, ceiling(freq)]. With an
-        active component the gain comes from the SDR-first realization (the SDR carries the
-        signal; the component fills below the engagement threshold) — the host commands the
-        component to the matching value so together they deliver the requested power."""
+        the artifact's representative frequency), clamped to [min, ceiling(freq)]. The power
+        is in the REPORTED quantity; a reported bridge (evaluated at ``params``) converts it
+        to the operating quantity before inverting the curve. With an active component the
+        gain comes from the SDR-first realization (the SDR carries the signal; the component
+        fills below the engagement threshold) — the host commands the component to the
+        matching value so together they deliver the requested power."""
         if not self.has_absolute:
             raise NoAbsoluteScale(
                 "this signal is not calibrated on this unit — absolute --power (dBm) has "
                 "no meaning here; provide --gain (raw dB) instead")
         f = self._eff(freq)
         if self._actives:
-            return self._achievable(freq)[0].realize(float(delivered_dbm))["sdr_gain_db"]
-        g = self._invert(float(delivered_dbm) - self._op_delta(f) - self._source_bias_at(f))
-        return self._snap(g, f)
+            return self.realize(float(delivered_dbm), freq, params)["sdr_gain_db"]
+        op_power = float(delivered_dbm) - self._reported_shift(params)
+        g = self._invert(op_power - self._op_delta(f) - self._source_bias_at(f))
+        return self._snap(g, f, params)
 
-    def power_for_gain(self, gain_db: float, freq: Optional[float] = None) -> float:
-        """Delivered power (dBm) at the operating plane for an (actual) gain at ``freq``.
-        The gain is snapped to the hardware grid first, so the reported power reflects what
-        the SDR really settles on."""
+    def power_for_gain(self, gain_db: float, freq: Optional[float] = None,
+                       params: Optional[dict] = None) -> float:
+        """Delivered power (dBm) at the operating plane for an (actual) gain at ``freq``, in
+        the REPORTED quantity (the reported bridge is applied on top). The gain is snapped to
+        the hardware grid first, so the reported power reflects what the SDR really settles on."""
         if not self.has_absolute:
             raise NoAbsoluteScale("uncalibrated: no absolute power scale for this signal")
         f = self._eff(freq)
-        g = self._snap(float(gain_db), f)
-        return _interp(g, self._gains, self._powers) + self._op_delta(f) + self._source_bias_at(f)
+        g = self._snap(float(gain_db), f, params)
+        op = _interp(g, self._gains, self._powers) + self._op_delta(f) + self._source_bias_at(f)
+        return op + self._reported_shift(params)
 
     @property
     def max_gain_db(self) -> float:
@@ -275,12 +324,12 @@ class PowerMap:
 
     @property
     def max_power_dbm(self):
-        """Top of the delivered-power range, or None when uncalibrated (no dBm scale).
+        """Top of the delivered-power range (reported quantity), or None when uncalibrated.
         With active components this is the extended range."""
         if not self.has_absolute:
             return None
         if self._actives:
-            return self._achievable(None)[0].bounds()[1]
+            return self._achievable(None)[0].bounds()[1] + self._reported_shift(None)
         return self.power_for_gain(self.max_gain_db)
 
     @property
@@ -288,7 +337,7 @@ class PowerMap:
         if not self.has_absolute:
             return None
         if self._actives:
-            return self._achievable(None)[0].bounds()[0]
+            return self._achievable(None)[0].bounds()[0] + self._reported_shift(None)
         return self.power_for_gain(self.min_gain_db)
 
     def power_field_kwargs(self) -> dict:
@@ -341,6 +390,10 @@ class PowerMap:
         self._gain_step = None
         self._actives = []
         self._bias = []
+        self._reported = None
+        self._limiting = None
+        self._limiting_cap = None
+        self._reported_applies = False
         self.has_absolute = False
         return self
 
@@ -356,6 +409,17 @@ class PowerMap:
 
         step = art.get("gain_step_db")
         actives = art.get("active_components") or ()
+        # Power-quantity bridges (docs/calibration-v2.md §13): reported/limiting readings and a
+        # limiting-reading cap, laws embedded, so no script metadata is needed at runtime.
+        reported = limiting = None
+        limiting_cap = None
+        readings = art.get("readings")
+        if isinstance(readings, dict):
+            reported = parse_bridge(readings.get("reported"))
+            lim_spec = readings.get("limiting") or {}
+            limiting = parse_bridge(lim_spec)
+            if lim_spec.get("max_dbm") is not None:
+                limiting_cap = lim_spec["max_dbm"]
         anchor = art.get("anchor_curve")
         if anchor:                                    # v2: fold passive hops at frequency
             gains = [pt[0] for pt in anchor]
@@ -367,12 +431,15 @@ class PowerMap:
             ceiling_const = art.get("gain_ceiling_db")
             if ceiling_const is None:
                 ceiling_const = float("inf")          # ceiling comes purely from limits
+            # The v2 anchor is the MEASURED curve, so the reported bridge is applied on top.
             return cls(gains, powers, art.get("min_gain_db"), ceiling_const, amp,
                        source="calibration file", label=label,
                        hops=hops, freq_limits=freq_limits,
                        center_freq=art.get("center_freq_hz"), gain_step_db=step,
                        actives=actives,
-                       source_bias=art.get("source_bias_delta_by_freq") or ())
+                       source_bias=art.get("source_bias_delta_by_freq") or (),
+                       reported=reported, limiting=limiting, limiting_cap=limiting_cap,
+                       reported_applies=True)
 
         curve = art.get("curve") or []                # v1: pre-flattened operating curve
         gains = [pt[0] for pt in curve]
