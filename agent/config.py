@@ -229,7 +229,18 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # operating plane re-anchors the operating point upstream. Both are byte-for-byte no-ops when
 # absent/false, but a ≤1.8.0 agent ignores source_bias / bypass, so the client gates on the
 # capabilities below (a source bias is a safety-relevant ceiling shift — a real gate).
-AGENT_VERSION = "1.9.0"
+# 1.10.0 adds reported/limiting power-quantity BRIDGES (docs/calibration-v2.md §13). The
+# operating node is measured once; its reported reading (what --power means) and limiting
+# reading (what the ceiling gauges) each derive from that measurement by a bridge — 'same'
+# (+k), an embedded 'law' (affine in log10 of a task parameter, the only bridge that changes
+# the quantity/family), or 'own'. Read per-signal first, else from the operating-plane spec.
+# The reported delta shifts the operator power axis; the artifact carries a `readings` block
+# (embedded laws + limiting cap + representative deltas) and `operating_unit`, so calkit / the
+# client fold re-evaluate at the LIVE parameter value. Byte-for-byte a no-op when absent, but
+# a ≤1.9.0 agent IGNORES `readings` and would resolve --power in the measured quantity (wrong
+# reported power) and skip the limiting cap — so the client gates saving a bridged document on
+# the capability below (a safety gate, not just a feature gate).
+AGENT_VERSION = "1.10.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -272,6 +283,10 @@ AGENT_CAPABILITIES = [
                                          # correcting delivered power AND the safety ceiling
     "calibration-stage-bypass",          # a plane (or the source bias) may set bypass:true —
                                          # a transparent 0-dB stage with its limits dropped
+    "calibration-power-bridges",         # the operating node may carry reported/limiting
+                                         # power-quantity bridges (same/law/own) — --power and
+                                         # the safety ceiling in a derived quantity, re-folded
+                                         # at the live task parameter (docs/calibration-v2 §13)
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
