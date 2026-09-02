@@ -249,7 +249,7 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # component re-corrects with no re-measuring. A ≤1.10.0 agent IGNORES the field and leaves the
 # cable loss baked into the measurement (wrong absolute power AND a mis-placed safety ceiling),
 # so the client gates saving on the capability below (a safety gate).
-AGENT_VERSION = "1.11.2"
+AGENT_VERSION = "1.12.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -300,6 +300,14 @@ AGENT_CAPABILITIES = [
                                          # cable/pad between it and the analyzer) — its loss is
                                          # removed from the measurement, recovering true plane
                                          # power (docs/calibration-v2 §14); swappable component
+    "calibration-measurement-quantity",  # a signal may carry signals.<id>.measurement =
+                                         # {quantity, unit}: the operator-facing quantity + unit
+                                         # it was measured in (e.g. spectral density [dBm/Hz]).
+                                         # Published as the artifact's operating quantity/unit,
+                                         # and its family gauges the reading bridges (a density
+                                         # measurement feeds the density→dBm laws; a dBm-only
+                                         # "same as measurement" limiting is refused for a
+                                         # density) — docs/calibration-ui-redesign §5 (Phase 2)
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

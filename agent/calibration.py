@@ -31,7 +31,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
-from paramkit.power_law import Bridge, SAME, parse_bridge
+from paramkit.power_law import ABS, Bridge, DENSITY, SAME, parse_bridge
 
 SCHEMA_VERSION = 1
 
@@ -316,6 +316,11 @@ class ResolvedCalibration:
     _limiting_delta: float = 0.0
     _reported_quantity: str = ""     # the reported reading's quantity (operator-facing)
     _reported_unit: str = ""         # the reported reading's display unit (drives the form)
+    # Per-signal MEASUREMENT (docs/calibration-ui-redesign §5): the operator-facing quantity
+    # the signal was measured in, and its display unit. Since Reported is retired, these ARE
+    # the base --power axis — published as the artifact's operating quantity/unit.
+    _measurement_quantity: str = ""
+    _measurement_unit: str = ""
     _limiting_cap: Optional[float] = None   # ceiling on the LIMITING reading (its own quantity),
                                             # enforced at runtime by re-folding the limiting bridge
 
@@ -487,9 +492,23 @@ class ResolvedCalibration:
         return [d.control.to_public_dict(name, list(d.table))
                 for name, d in self._active_hops()]
 
+    @property
+    def public_quantity(self) -> str:
+        """The operator-facing --power quantity published to the artifact/summary: the reported
+        reading's quantity if one is declared, else the signal's measured quantity (Phase 2),
+        else the operating plane's quantity."""
+        return (self._reported_quantity or self._measurement_quantity
+                or self.operating_quantity)
+
+    @property
+    def public_unit(self) -> str:
+        """The operator-facing --power display unit: the reported reading's unit if declared,
+        else the signal's measured unit (Phase 2). Empty ⇒ the consumer defaults to dBm."""
+        return self._reported_unit or self._measurement_unit
+
     def banner_label(self) -> str:
         """e.g. 'EIRP, at antenna_eirp' — so the --power number is never ambiguous."""
-        q = self._reported_quantity or self.operating_quantity or "power"
+        q = self.public_quantity or "power"
         return f"{q}, at {self.operating_plane}"
 
     def operating_curve(self, freq: Optional[float] = None) -> list:
@@ -594,7 +613,7 @@ class ResolvedCalibration:
             "signal_id": self.signal_id,
             "unit_type": self.unit_type,
             "operating_plane": self.operating_plane,
-            "quantity": self._reported_quantity or self.operating_quantity,
+            "quantity": self.public_quantity,
             "amplitude": self.amplitude,
             "min_gain_db": self.min_gain_db,
             "max_gain_db": self.max_gain_db,
@@ -604,8 +623,8 @@ class ResolvedCalibration:
         }
         if self._gain_step:
             out["gain_step_db"] = self._gain_step
-        if self._reported_unit:
-            out["operating_unit"] = self._reported_unit     # drives the operator form's unit
+        if self.public_unit:
+            out["operating_unit"] = self.public_unit        # drives the operator form's unit
         if self.has_readings:
             out["readings"] = self.readings_public()
         if self.has_active:
@@ -883,6 +902,31 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
+# ── per-signal measurement quantity/unit (docs/calibration-ui-redesign §5) ────────
+# The operator-facing quantity the signal was measured in, and its display unit. The unit's
+# FAMILY (absolute dBm vs a spectral density) is what the reading bridges convert from — a
+# density measurement feeds the density→dBm laws; an absolute one can be limited "as measured".
+_MEASUREMENT_UNIT_FAMILY = {"dBm": ABS, "dBm/Hz": DENSITY, "dBm/kHz": DENSITY, "dBm/MHz": DENSITY}
+
+
+def _measurement_of(sig: dict, signal_id: str) -> tuple[str, str]:
+    """The signal's declared ``measurement`` (quantity, unit), or ("", "") when absent.
+    Validates the shape and that the unit is one this agent understands (its family must be
+    known to gauge the bridges). Absent ⇒ today's behaviour (the plane quantity, dBm)."""
+    m = sig.get("measurement")
+    if m is None:
+        return "", ""
+    if not isinstance(m, dict):
+        raise CalibrationError(f"signal {signal_id!r} 'measurement' must be an object")
+    quantity = str(m.get("quantity", "") or "").strip()
+    unit = str(m.get("unit", "") or "").strip()
+    if unit and unit not in _MEASUREMENT_UNIT_FAMILY:
+        raise CalibrationError(
+            f"signal {signal_id!r} measurement unit {unit!r} is not one of "
+            f"{tuple(_MEASUREMENT_UNIT_FAMILY)}")
+    return quantity, unit
+
+
 # ── Resolution ───────────────────────────────────────────────────────────────────
 
 def resolve(unit_doc: dict,
@@ -1000,6 +1044,33 @@ def resolve(unit_doc: dict,
     limiting_delta = limiting.rep_delta_db()
     reported_unit = reported.unit
     reported_quantity = str(rep_spec.get("quantity", "")) if rep_spec else ""
+
+    # Per-signal MEASUREMENT quantity + unit (Phase 2). The operator's base --power axis IS
+    # the measured quantity (Reported is retired), so publish this signal's declared quantity
+    # and unit; the unit's FAMILY then gauges the reading bridges below. Absent ⇒ unchanged
+    # (the plane quantity, dBm).
+    meas_quantity, meas_unit = _measurement_of(sig, signal_id)
+    if meas_unit:
+        meas_fam = _MEASUREMENT_UNIT_FAMILY[meas_unit]
+        for role, bridge in (("reported", reported), ("limiting", limiting)):
+            if bridge.is_law and bridge.law is not None and bridge.law.in_fam != meas_fam:
+                raise CalibrationError(
+                    f"signal {signal_id!r} {role} law {bridge.law.id!r} expects a "
+                    f"{bridge.law.in_fam!r} measurement, but the signal is measured in "
+                    f"{meas_unit!r} ({meas_fam!r})")
+        # The safety ceiling is always dBm, so the LIMITING reading must resolve to dBm:
+        # "same as measurement" only when the measurement itself is dBm, and a limiting law
+        # must return dBm.
+        if limiting.is_same and meas_fam != ABS:
+            raise CalibrationError(
+                f"signal {signal_id!r} limiting is 'same as measurement' but the signal is "
+                f"measured in {meas_unit!r} (a density) — a dBm ceiling can't gauge it; use a "
+                f"law that returns dBm or a separate dBm measurement")
+        if limiting.is_law and limiting.law is not None and limiting.law.out_fam != ABS:
+            raise CalibrationError(
+                f"signal {signal_id!r} limiting law {limiting.law.id!r} must return dBm "
+                f"(out == {ABS!r}), not {limiting.law.out_fam!r}")
+
     lim_cap = None
     if lim_spec and lim_spec.get("max_dbm") is not None:
         try:
@@ -1132,6 +1203,7 @@ def resolve(unit_doc: dict,
         _reported=reported, _limiting=limiting,
         _reported_delta=reported_delta, _limiting_delta=limiting_delta,
         _reported_quantity=reported_quantity, _reported_unit=reported_unit,
+        _measurement_quantity=meas_quantity, _measurement_unit=meas_unit,
         _limiting_cap=lim_cap)
     if resolved.max_gain_db < gmin:
         raise CalibrationError(
@@ -1235,7 +1307,7 @@ def validate_document(unit_doc: dict, type_defaults: Optional[dict] = None,
             r = resolve(unit_doc, type_defaults, sig_id, components)
             summary[sig_id] = {
                 "operating_plane": r.operating_plane,
-                "quantity": r.operating_quantity,
+                "quantity": r.public_quantity,
                 "amplitude": r.amplitude,
                 "min_gain_db": r.min_gain_db, "max_gain_db": r.max_gain_db,
                 "min_power_dbm": r.min_power_dbm, "max_power_dbm": r.max_power_dbm,
