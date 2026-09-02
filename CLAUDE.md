@@ -1,0 +1,64 @@
+# sdr-agent — Claude working notes
+
+The **on-unit HTTP agent** (FastAPI) that runs on each SDR box: launches/monitors transmit
+tasks, serves status, stores the unit's power **calibration**, and resolves it per signal. Part
+of a three-repo system: **`sdr-agent`** (this), **`sdr-client`** (PyQt6 GUI), **`sdr-scripts`**
+(the transmit scripts). `paramkit/` is shared pure-Python used by the agent AND the scripts.
+
+## Environment setup (container starts without deps)
+```bash
+pip3 install numpy pytest PyQt6 httpx pydantic zeroconf websocket-client PyYAML paramiko \
+             fastapi uvicorn "ruamel.yaml" starlette psutil python-multipart inotify-simple
+```
+
+## Run the tests (always green on `main`)
+```bash
+python3 -m pytest -q            # ~361 tests
+```
+A few `paramkit`/`argspec` test files are also runnable directly (`python3 tests/<file>.py`);
+the drift guard is pytest-only.
+
+## Cross-repo invariants (do not break)
+- **Drift guard (`tests/test_shared_source_drift.py`):** `agent/argspec.py` and `agent/ramp.py`
+  MUST stay **byte-identical** to `sdr-client/api/argspec.py` and `sdr-client/api/ramp.py`. The
+  test finds a sibling `sdr-client/` checkout; if you touch one side, mirror it.
+- **Power-law mirror (manual):** `paramkit/power_law.py` is copied verbatim to
+  `sdr-client/state/power_law.py` (pure stdlib for Python/JS parity). Keep them in step.
+- **Capabilities + version:** a new client-visible feature adds a string to
+  `AGENT_CAPABILITIES` and bumps `AGENT_VERSION` (both in `agent/config.py`); `test_meta_endpoint.py`
+  asserts the capability set. The client feature-gates on these exact strings. Current version is
+  in `config.py` (bumped to `1.12.0` for per-signal measurement quantity/unit).
+
+## Where things live
+- `agent/calibration.py` (~1.7k lines) — the **calibration resolver**. `resolve(unit_doc, …,
+  signal_id)` runs **per signal** and returns a `ResolvedCalibration`; `to_public_dict()` is the
+  artifact the client/script consume; `summarize`/the `/calibration` view builds per-signal
+  bounds + artifact. Key concepts: measured/derived **planes**, **limits** (dBm ceilings on
+  stage boundaries), reading **bridges** (reported/limiting: same/law/own via
+  `paramkit/power_law.py`), and per-signal **measurement** `{quantity, unit}`
+  (`_measurement_of`, published as the operating quantity/unit; its family gauges the bridges).
+- `agent/config.py` — `AGENT_VERSION`, `AGENT_CAPABILITIES`, interpreter/defaults.
+- `agent/main.py` — the FastAPI surface (`/info`, `/calibration`, `/calibration/validate`,
+  `/files`, task control). `agent/models.py` — pydantic models.
+- `paramkit/` — shared math: `power_law.py` (bridge/law evaluation), `achievable.py` (the true
+  achievable gain/power grid), `calkit.py` (script-side fold), `argspec.py` (static param
+  extraction, drift-guarded).
+- `docs/calibration.md`, `docs/calibration-v2.md` — the authoritative model + artifact schema.
+
+## Calibration model (one paragraph)
+A unit is a **chain of planes** (measured SDR output → derived hops). Each **signal** declares
+its **measurement** (a `{quantity, unit}`: dBm or a spectral density dBm/Hz·kHz·MHz) and, per
+key, reported/limiting reading **bridges**. The operator sets `--power` in the measured quantity;
+declared **laws** (affine in log10 of task params; `in`/`out` families abs↔density) convert
+between quantities. Safety **limits** are dBm ceilings on stage boundaries; the LIMITING reading
+is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
+representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
+
+## Current state — per-signal measurement quantity/unit: COMPLETE
+Latest work: `resolve()` reads `signals.<id>.measurement = {quantity, unit}` and publishes it as
+the artifact's operating quantity/unit (`ResolvedCalibration.public_quantity`/`public_unit`); the
+unit family validates the reading bridges (a density feeds density→dBm laws; a "same as
+measurement" limiting is refused for a density; a limiting law must return dBm). Gated behind
+capability `calibration-measurement-quantity` (agent `1.12.0`). Tests:
+`tests/test_calibration_measurement.py`, `tests/test_calibration_bridges.py`. Full redesign
+record lives in `sdr-client/docs/calibration-ui-redesign.md`.
