@@ -249,7 +249,7 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # component re-corrects with no re-measuring. A ≤1.10.0 agent IGNORES the field and leaves the
 # cable loss baked into the measurement (wrong absolute power AND a mis-placed safety ceiling),
 # so the client gates saving on the capability below (a safety gate).
-AGENT_VERSION = "1.11.1"
+AGENT_VERSION = "1.11.2"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
