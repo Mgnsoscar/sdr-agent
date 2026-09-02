@@ -86,3 +86,20 @@ def test_limiting_cap_tightens_with_parameter():
     c_wide = pm._ceiling(None, {"bw": 1e7})     # target density 50-70 = -20 → gain 50
     assert c_wide < c_narrow
     assert c_narrow - c_wide == pytest.approx(10.0, abs=1e-6)
+
+
+# A law keyed on a param with no form field (e.g. GPS L1 C/A's full_power on enbw_mhz, filled
+# by the transmit script, not the form). Another signal (a chirp) folds with its OWN params
+# ({"bw": ...}) — the law's key is absent, so it must fold at its representative value, never
+# raise (regression: the sweep Run form crashed with "law 'full_power' needs parameter …").
+ENBW = {"id": "full_power", "name": "Full signal power", "in": "density", "out": "abs",
+        "k": 60.0, "param": "enbw_mhz", "coeff": 10.0, "ref": 1.0, "rep": 0.988638}
+
+
+def test_bridge_keyed_on_absent_param_folds_at_rep_not_crash():
+    _, pm = _resolved_and_map(
+        reported={"kind": "same", "unit": "dBm/Hz"},
+        limiting={"kind": "law", "law": ENBW, "max_dbm": 30.0})
+    g = pm.gain_for_power(pm.min_power_dbm + 5.0, params={"bw": 20.0})   # no enbw_mhz → no crash
+    assert isinstance(g, float)
+    assert pm._ceiling(None, {"bw": 20.0}) == pytest.approx(pm._ceiling(None, None))

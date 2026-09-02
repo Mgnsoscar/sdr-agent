@@ -172,12 +172,19 @@ class PowerMap:
 
     def _reading_delta(self, bridge, params: Optional[dict]) -> float:
         """The dB a bridge adds to the measured value: at the live parameter values when the
-        bridge is param-keyed and they are supplied, else at the representative values (the
-        bounds fall back to representative, exactly as frequency falls back to center_freq)."""
+        bridge is param-keyed and ALL of them are supplied (and usable), else at the
+        representative values (the bounds fall back to representative, exactly as frequency
+        falls back to center_freq). A law keyed on a parameter with no form field — e.g. a
+        script-internal one the transmit script fills — folds at its representative value here
+        rather than raising."""
         if bridge is None:
             return 0.0
-        if params and bridge.keyed_params():
-            return bridge.delta_db(params)
+        keyed = bridge.keyed_params()
+        if keyed and params and all(params.get(k) is not None for k in keyed):
+            try:
+                return bridge.delta_db(params)
+            except (ValueError, TypeError):
+                pass                                  # non-positive/invalid value → representative
         return bridge.rep_delta_db()
 
     def _reported_shift(self, params: Optional[dict]) -> float:
