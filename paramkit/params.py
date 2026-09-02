@@ -182,6 +182,11 @@ class Param:
     # the real frequency field is hidden by a mode — the GUI folds --power at the
     # visible is_freq field instead (e.g. a derived centre = midpoint of start/stop).
     is_freq: bool = False
+    # DERIVED only: compute the value (so the GUI can feed it to a calibration power law
+    # that keys on it) but do NOT render a readout for it — for an internal quantity the
+    # operator shouldn't see (e.g. a non-analytic equivalent-noise bandwidth). No runtime
+    # effect (a derived field is never a CLI argument regardless).
+    hidden: bool = False
 
     @property
     def display_name(self) -> str:
@@ -210,6 +215,7 @@ class Param:
             "show_when": dict(self.show_when) if self.show_when else None,
             "formula": dict(self.formula) if self.formula else None,
             "is_freq": self.is_freq,
+            "hidden": self.hidden,
         }
 
 
@@ -443,6 +449,7 @@ class Script:
     def derived(self, *flags: str, name: Optional[str] = None, help: str = "",
                 unit: str = "", min: Optional[float] = None, max: Optional[float] = None,
                 formula: Optional[Dict[str, Any]] = None, is_freq: bool = False,
+                hidden: bool = False,
                 show_when: Optional[Dict[str, Any]] = None) -> "Script":
         """A read-only value COMPUTED from other fields — never a CLI argument, so the
         script builds the same quantity itself. A GUI shows it live and, if min/max are
@@ -451,12 +458,14 @@ class Script:
         e.g. ``{"center": ["start", "stop"]}`` = (start+stop)/2 or
         ``{"span": ["start", "stop"]}`` = |stop-start|. Pass is_freq=True to make it the
         calibration fold frequency when the real frequency field is hidden by a mode (the
-        GUI folds --power here instead). Use a single display-only pseudo-flag for the
-        label and an explicit name=, e.g. ``.derived("-Sweep-width", name="band_span", …)``."""
+        GUI folds --power here instead). Pass hidden=True to compute the value for a power
+        law that keys on it without rendering a readout (an internal quantity). Use a single
+        display-only pseudo-flag for the label and an explicit name=, e.g.
+        ``.derived("-Sweep-width", name="band_span", …)``."""
         n, flags = self._derive_name(flags, name)
         return self._add(Param(
             name=n, flags=flags, kind=DERIVED, help=help, unit=unit, min=min, max=max,
-            formula=formula, is_freq=is_freq, show_when=show_when,
+            formula=formula, is_freq=is_freq, hidden=hidden, show_when=show_when,
         ))
 
     # ── argparse construction ────────────────────────────────────────────────
