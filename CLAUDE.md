@@ -27,7 +27,7 @@ the drift guard is pytest-only.
 - **Capabilities + version:** a new client-visible feature adds a string to
   `AGENT_CAPABILITIES` and bumps `AGENT_VERSION` (both in `agent/config.py`); `test_meta_endpoint.py`
   asserts the capability set. The client feature-gates on these exact strings. Current version is
-  in `config.py` (bumped to `1.12.0` for per-signal measurement quantity/unit).
+  in `config.py` (bumped to `1.13.0` for stage limits gauged through the limiting reading).
 
 ## Where things live
 - `agent/calibration.py` (~1.7k lines) — the **calibration resolver**. `resolve(unit_doc, …,
@@ -54,11 +54,24 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
-## Current state — per-signal measurement quantity/unit: COMPLETE
-Latest work: `resolve()` reads `signals.<id>.measurement = {quantity, unit}` and publishes it as
-the artifact's operating quantity/unit (`ResolvedCalibration.public_quantity`/`public_unit`); the
-unit family validates the reading bridges (a density feeds density→dBm laws; a "same as
-measurement" limiting is refused for a density; a limiting law must return dBm). Gated behind
-capability `calibration-measurement-quantity` (agent `1.12.0`). Tests:
+## Current state — stage limits gauged through the limiting reading: COMPLETE
+Latest work: a STAGE safety limit (`chain.limits`) is now inverted **through the operating node's
+LIMITING reading**, not directly against the measured curve — so one dBm ceiling caps every signal
+whatever quantity it is measured in. A constant limiting delta bakes into `gain_ceiling_db`
+(`C − Δlim`); a parameter-keyed limiting law is published as a `freq_dependent_limits` entry with
+`via_limiting: true`, which `calkit`/`power_fold` re-fold at the live task parameter (the same
+re-fold the `limiting.max_dbm` cap already gets). Fixes an over-power footgun (before, a dBm stage
+ceiling was compared against a density/main-lobe measurement). Motivating case: GPS C/A `--power`
+in main-lobe power, amp limit in total-in-band power, offset keyed on the sidelobe count. Gated on
+capability `calibration-limit-through-reading` (agent `1.13.0`, a safety gate). Byte-identical when
+no measurement/limiting bridge is in play. Tests: `tests/test_calibration_limit_reading.py`,
+`tests/test_calkit_bridges.py`; docs/calibration-v2.md §13.5.
+
+## Prior state — per-signal measurement quantity/unit: COMPLETE
+`resolve()` reads `signals.<id>.measurement = {quantity, unit}` and publishes it as the artifact's
+operating quantity/unit (`ResolvedCalibration.public_quantity`/`public_unit`); the unit family
+validates the reading bridges (a density feeds density→dBm laws; a "same as measurement" limiting
+is refused for a density; a limiting law must return dBm). Gated behind capability
+`calibration-measurement-quantity` (agent `1.12.0`). Tests:
 `tests/test_calibration_measurement.py`, `tests/test_calibration_bridges.py`. Full redesign
 record lives in `sdr-client/docs/calibration-ui-redesign.md`.

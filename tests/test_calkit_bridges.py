@@ -23,9 +23,13 @@ def _doc(reported=None, limiting=None):
         plane["reported"] = reported
     if limiting is not None:
         plane["limiting"] = limiting
+    # A deliberately LOOSE stage limit (80 dBm total > the curve's 74 dBm top), so it never
+    # binds through a limiting reading and these tests observe the limiting CAP / reported delta
+    # in isolation. (A stage limit is now gauged THROUGH the signal's limiting reading — see
+    # test_calibration_limit_reading.py for that behaviour on its own.)
     chain = {"gain_limits": {"min_gain_db": 0.0, "max_gain_db": 74.0},
              "operating_plane": "sdr_output",
-             "limits": [{"plane": "sdr_output", "max_dbm": 4.0, "reason": "amp"}],
+             "limits": [{"plane": "sdr_output", "max_dbm": 80.0, "reason": "amp"}],
              "planes": {"sdr_output": plane}}
     return {"schema_version": 1, "unit_type": "b", "chain": chain,
             "signals": {"sig": {"curves": {

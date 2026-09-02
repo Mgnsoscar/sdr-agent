@@ -211,9 +211,14 @@ so there is no version gate anywhere. As implemented:
       "delta_db_by_freq": [[1.17e9,5.1],[1.575e9,6.0]] }
   ],
   "gain_ceiling_db": 74.0,              // the frequency-INDEPENDENT cap (amp protection, on a measured plane)
-  "freq_dependent_limits": [            // caps whose plane passes a passive hop, each with its
+  "freq_dependent_limits": [            // caps whose plane passes a passive hop OR are gauged
     { "plane": "antenna_eirp", "max_dbm": 30.0, "reason": "regulatory EIRP",
-      "delta_db_by_freq": [[1.1e9,2.8],[1.6e9,3.19]] }   // summed delta from the shared anchor
+      "delta_db_by_freq": [[1.1e9,2.8],[1.6e9,3.19]] },  // summed delta from the shared anchor
+    // a stage cap gauged through a PARAMETER-KEYED limiting reading (see §13): the consumer
+    // subtracts the limiting delta Δlim(params) at the live task parameter before inverting.
+    { "plane": "sdr_output", "max_dbm": 4.0, "reason": "amp total power",
+      "delta_db_by_freq": [[0,0]], "via_limiting": true }
+    // (an OWN limiting reading instead carries the limit's own dBm curve as "anchor_curve")
   ],
   "center_freq_hz": 1.575e9            // representative frequency (on a freq-dependent chain; derived when the signal omits it)
 }
@@ -231,9 +236,13 @@ that folds no frequency of its own uses that safe representative value.
 
 ```
 delta(f)          = Σ interp(hop.delta_db_by_freq, f)   over passive_hops
-ceiling(f)        = min( gain_ceiling_db,
+ceiling(f, prm)   = min( gain_ceiling_db,
                          min over freq_dependent_limits of
-                             invert(anchor_curve, lim.max_dbm − interp(lim.delta_db_by_freq, f)) )
+                             invert(curve, lim.max_dbm − interp(lim.delta_db_by_freq, f)
+                                           − (Δlim(prm) if lim.via_limiting else 0)) )
+                    # curve = lim.anchor_curve (an OWN dBm limiting curve) when present, else the
+                    # shared anchor_curve; Δlim(prm) is the limiting reading's delta at the live
+                    # task parameters (readings.limiting), re-folded like the limiting cap (§13).
 power_for_gain(g, f) = interp(anchor_curve, g)  +  delta(f)          # g clamped to [min, ceiling(f)]
 gain_for_power(p, f) = invert(anchor_curve, p − delta(f)),  clamped to [min, ceiling(f)]
 ```
@@ -691,6 +700,34 @@ operator-form unit + parameter re-fold (`ui/param_form.py`), the `CAL_POWER_LAWS
 calibration-panel reported/limiting bridge editor. Covered by `test_power_law`,
 `test_calibration_bridges`, `test_calkit_bridges` (agent) and `test_power_fold_bridges`,
 `test_param_form_bridge`, `test_calibration_reading_editor` (client).
+
+### 13.5 Stage limits are gauged through the limiting reading (agent ≥ 1.13.0)
+
+A **stage safety limit** (`chain.limits`) is a **dBm** ceiling on a stage boundary (e.g. an
+amp's max total in-band power). A signal is measured in its own quantity (a spectral density, or
+main-lobe power); the operating node's **LIMITING reading** is exactly what converts that
+measured value into the dBm the ceiling is expressed in — so *one* dBm stage ceiling caps *every*
+signal correctly whatever it is measured in. The resolver therefore inverts a stage limit
+**through the limiting reading**, not directly against the measured curve:
+
+- **law / same** limiting → invert `max_dbm − Δlim` against the measured anchor (`Δlim` is the
+  limiting reading's delta). A **constant** `Δlim` is baked into `gain_ceiling_db` (`C − Δlim`);
+  a **parameter-keyed** limiting law can't be baked (its delta moves with the task parameter), so
+  the limit rides in `freq_dependent_limits` with `"via_limiting": true` and the consumer folds
+  `Δlim(params)` at the live value — the same re-fold the limiting *cap* already gets (§13.3).
+- **own** limiting → invert `max_dbm` against the reading's separate dBm curve (published as the
+  limit's `anchor_curve`).
+
+This is the same gauging the per-signal `limiting.max_dbm` cap uses; before 1.13.0 only the cap
+went through the reading while `chain.limits` were inverted against the measured curve — for a
+density (or law/own dBm) signal that compared a dBm ceiling against the measured quantity and
+**under-applied** the limit (over-power). A signal with no measurement / a trivial `same` limiting
+resolves byte-identically. **GPS C/A** is the motivating case: `--power` dials main-lobe power, the
+amp limit is total-in-band power, and the offset between them is a law keyed on the filter's
+sidelobe count — so the allowed main-lobe power tightens as more sidelobes are admitted, enforced
+at task-set time. Gated on capability `calibration-limit-through-reading` (a safety gate). Covered
+by `test_calibration_limit_reading` (agent) and `test_power_fold_bridges`,
+`test_calibration_limit_reading_client` (client).
 
 
 ## 14. Measurement DE-EMBED — remove the analyzer-cable loss from a measured stage

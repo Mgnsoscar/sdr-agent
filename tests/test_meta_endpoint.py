@@ -23,6 +23,7 @@ def test_capabilities_advertised_and_stable():
     assert "calibration-power-bridges" in cfg.AGENT_CAPABILITIES      # reported/limiting bridges
     assert "calibration-measurement-deembed" in cfg.AGENT_CAPABILITIES  # measurement cable de-embed
     assert "calibration-measurement-quantity" in cfg.AGENT_CAPABILITIES  # per-signal quantity/unit
+    assert "calibration-limit-through-reading" in cfg.AGENT_CAPABILITIES  # stage limit via limiting reading
 
 
 def test_agent_info_carries_capabilities():

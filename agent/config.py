@@ -249,7 +249,20 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # component re-corrects with no re-measuring. A ≤1.10.0 agent IGNORES the field and leaves the
 # cable loss baked into the measurement (wrong absolute power AND a mis-placed safety ceiling),
 # so the client gates saving on the capability below (a safety gate).
-AGENT_VERSION = "1.12.0"
+# 1.13.0 gauges a STAGE safety limit (chain.limits) through the signal's LIMITING reading, so a
+# single dBm ceiling caps every signal correctly whatever quantity it is measured in. Previously
+# a stage limit was inverted directly against the measured curve — for a signal measured in a
+# spectral density (or whose limiting reading is a law/own dBm curve) that compared a dBm ceiling
+# against the measured (density/main-lobe) number, under-applying the ceiling by the limiting
+# offset (a real over-power footgun). Now the limiting delta is folded in: a CONSTANT offset is
+# baked into gain_ceiling_db (C − Δlim), and a PARAMETER-KEYED limiting law (e.g. total-in-band
+# vs main-lobe power, keyed on the sidelobe count) is published as a limit the consumer re-folds
+# at the live task parameter (a `via_limiting` flag on a freq_dependent_limits entry) — the same
+# re-fold calkit / the client PowerFold already do for a limiting.max_dbm cap. A ≤1.12.0 agent
+# ignores the limiting reading for stage limits and would resolve a ceiling too high (over-power),
+# so the client gates saving such a document on the calibration-limit-through-reading capability
+# below (a safety gate). Byte-for-byte a no-op when no measurement/limiting bridge is in play.
+AGENT_VERSION = "1.13.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -308,6 +321,13 @@ AGENT_CAPABILITIES = [
                                          # measurement feeds the density→dBm laws; a dBm-only
                                          # "same as measurement" limiting is refused for a
                                          # density) — docs/calibration-ui-redesign §5 (Phase 2)
+    "calibration-limit-through-reading", # a STAGE safety limit (chain.limits) is gauged through
+                                         # the signal's LIMITING reading: its dBm threshold has the
+                                         # limiting delta folded in (constant → baked as C − Δlim;
+                                         # a parameter-keyed limiting law → published as a limit the
+                                         # consumer re-folds at the live task parameter). Without it
+                                         # a stage limit was compared against the measured quantity,
+                                         # under-applying the ceiling (over-power) — a safety gate
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

@@ -297,7 +297,7 @@ class ResolvedCalibration:
     _freq_hz: Optional[float] = None                 # representative frequency, or None
     _gain_step: Optional[float] = None               # hardware gain grid (dB), or None
     _gain_ceiling_const: float = float("inf")        # freq-independent gain cap
-    _freq_limits: list = field(repr=False, default_factory=list)  # [(plane, max_dbm, reason)]
+    _freq_limits: list = field(repr=False, default_factory=list)  # [(plane, max_dbm, reason, via)]
     _limit_gauges: list = field(repr=False, default_factory=list)  # per-limit gauge info
     # Normalized per-unit source bias Δ dB(f) (0 at the rep frequency), also attached to the
     # source plane so the power functions fold it. Kept here to publish in the artifact and to
@@ -340,10 +340,24 @@ class ResolvedCalibration:
         LIMITING reading (gauged through the limiting bridge). The limiting-reading cap is
         applied here for the agent's scalar read-outs but kept OUT of the emitted
         ``gain_ceiling_db`` (a bridge-aware consumer re-folds it from ``readings`` at the live
-        parameter value, so baking it would double-count)."""
+        parameter value, so baking it would double-count).
+
+        A frequency-dependent stage limit flagged ``via`` is gauged through the operating
+        node's LIMITING reading — its dBm threshold is inverted against the operating node's
+        limiting curve (an ``own`` reading) or, for a law/same reading, against the measured
+        curve after subtracting the limiting delta (``max_dbm − Δlim``). Here that delta is the
+        representative value; a bridge-aware consumer re-folds it at the live task parameter."""
         caps = [self._gain_ceiling_const]
-        for plane, max_dbm, _ in self._freq_limits:
-            caps.append(_gain_for_power_on(max_dbm, plane, self._planes, freq, for_limit=True))
+        for plane, max_dbm, _rs, via in self._freq_limits:
+            if via and self._limiting.is_own:
+                caps.append(_gain_for_power_on(max_dbm, plane, self._planes, freq,
+                                               for_limit=True, reading="limiting"))
+            elif via:
+                caps.append(_gain_for_power_on(max_dbm - self._limiting_delta, plane,
+                                               self._planes, freq, for_limit=True))
+            else:
+                caps.append(_gain_for_power_on(max_dbm, plane, self._planes, freq,
+                                               for_limit=True))
         if self._limiting_cap is not None:
             if self._limiting.is_own:
                 caps.append(_gain_for_power_on(self._limiting_cap, self.operating_plane,
@@ -557,6 +571,19 @@ class ResolvedCalibration:
             return None
         return [[g, lim_anchor.power_at(g)] for g in lim_anchor.gains]
 
+    def _limiting_own_curve(self) -> Optional[list]:
+        """The operating node's OWN limiting curve (``[[gain, dBm], …]``, offset folded in) —
+        the separately-measured dBm curve a limiting ``own`` reading carries. A frequency-
+        dependent stage limit gauged through it inverts against this curve at runtime (the same
+        curve ``readings.limiting.anchor_curve`` publishes). None when the limiting reading has
+        no own curve."""
+        if not self._limiting.is_own:
+            return None
+        src = _anchor_plane(self.operating_plane, self._planes)
+        if src.limiting_own is None:
+            return None
+        return [[g, src.power_at(g, "limiting")] for g in src.limiting_own[0]]
+
     def _plane_delta_table(self, plane_name: str) -> list:
         """The TOTAL passive delta from the measured anchor out to ``plane_name`` as one
         ``[[freq, delta], …]`` table (all its hops summed). A consumer inverts a limit on
@@ -647,12 +674,23 @@ class ResolvedCalibration:
             # anchor, so a consumer inverts it against the same anchor_curve at the live
             # frequency (no plane model needed script-side).
             fdl = []
-            for p, mx, rs in self._freq_limits:
+            for p, mx, rs, via in self._freq_limits:
                 entry = {"plane": p, "max_dbm": mx, "reason": rs,
                          "delta_db_by_freq": self._plane_delta_table(p)}
-                lac = self._limit_anchor_curve(p)     # its own limiting curve, if it differs
-                if lac is not None:
-                    entry["anchor_curve"] = lac       # invert THIS limit against this curve
+                if via and self._limiting.is_own:
+                    # gauge through the operating node's OWN limiting curve (dBm): publish it so
+                    # the consumer inverts THIS limit against it (the same curve readings carry).
+                    own = self._limiting_own_curve()
+                    if own is not None:
+                        entry["anchor_curve"] = own
+                elif via:
+                    # gauge through a law/same limiting reading: the consumer subtracts the
+                    # limiting delta (re-folded at the live task parameter) before inverting.
+                    entry["via_limiting"] = True
+                else:
+                    lac = self._limit_anchor_curve(p)  # its own limiting curve, if it differs
+                    if lac is not None:
+                        entry["anchor_curve"] = lac    # invert THIS limit against this curve
                 fdl.append(entry)
             out["freq_dependent_limits"] = fdl
             if self._gain_ceiling_const != float("inf"):
@@ -868,15 +906,18 @@ def _representative_freq(planes: dict, operating_plane: str, freq_limits: list,
     Returns None when no breakpoints exist (nothing to evaluate at)."""
     if freq_limits:
         cands: set = set()
-        for plane, _mx, _rs in freq_limits:
+        for plane, _mx, _rs, _via in freq_limits:
             cands.update(_breakpoint_freqs(plane, planes))
         cands.update(_breakpoint_freqs(operating_plane, planes))
         if not cands:
             return None
 
         def ceiling_at(fr: float) -> float:
+            # A uniform limiting-reading offset (a via limit's Δlim) shifts every candidate
+            # frequency's ceiling equally, so it can't change the argmin — invert on the passive
+            # path here and let _max_gain_at apply Δlim to the chosen frequency's scalar ceiling.
             caps = [gain_ceiling_const]
-            for plane, mx, _rs in freq_limits:
+            for plane, mx, _rs, _via in freq_limits:
                 caps.append(_gain_for_power_on(mx, plane, planes, fr, for_limit=True))
             return min(caps)
 
@@ -1126,6 +1167,17 @@ def resolve(unit_doc: dict,
     limit_gauges: list = []
     if gl.get("max_gain_db") is not None:
         const_caps.append(float(gl["max_gain_db"]))
+    # A stage limit's dBm ceiling is gauged through the operating node's LIMITING reading when it
+    # resolves to the same measured plane the operating node's limiting curve does (the shared
+    # source). Then the ceiling is compared in the LIMITING quantity, not the measured one — so a
+    # single dBm limit caps every signal correctly whatever quantity it is measured in. For a
+    # law/same limiting reading the limiting delta is folded in (max_dbm − Δlim); for an OWN
+    # reading the limit inverts against that separate dBm curve. A CONSTANT delta bakes into the
+    # ceiling; a PARAMETER-KEYED limiting law can't (its delta moves with the task parameter), so
+    # that limit is published as a runtime entry the consumer re-folds — even on a flat chain.
+    op_lim_anchor = _anchor_plane(operating_plane, planes, for_limit=True)
+    lim_reading_nontrivial = limiting.is_own or not limiting.is_same or limiting.k != 0.0
+    lim_reading_param_keyed = not limiting.is_constant
     for lim in (chain.get("limits") or []):
         if lim.get("plane") in bypassed:             # limit on a bypassed stage doesn't apply
             continue
@@ -1135,14 +1187,26 @@ def resolve(unit_doc: dict,
             "reason": lim.get("reason", ""), "max_dbm": float(lim["max_dbm"]),
             "at_plane": plane, "gauge_plane": _plane_name(anchor, planes),
             "gauge_quantity": anchor.quantity})
-        if _path_freq_dependent(plane, planes) or (
-                bias_on_source
-                and _anchor_plane(plane, planes, for_limit=True) is planes[src_name]):
-            # freq-dependent via a passive hop OR because it gauges through the biased source
-            freq_limits.append((plane, float(lim["max_dbm"]), lim.get("reason", "")))
+        max_dbm = float(lim["max_dbm"])
+        via = (lim_reading_nontrivial
+               and _anchor_plane(plane, planes, for_limit=True) is op_lim_anchor)
+        freqdep = _path_freq_dependent(plane, planes) or (
+            bias_on_source
+            and _anchor_plane(plane, planes, for_limit=True) is planes[src_name])
+        if freqdep or (via and lim_reading_param_keyed):
+            # runtime: re-folded per frequency (a passive hop / biased source) and/or per the
+            # live task parameter (a param-keyed limiting law). The via flag tells the consumer
+            # to also fold the limiting delta / invert against the own limiting curve.
+            freq_limits.append((plane, max_dbm, lim.get("reason", ""), via))
+        elif via and limiting.is_own:
+            const_caps.append(_gain_for_power_on(max_dbm, plane, planes, None,
+                                                 for_limit=True, reading="limiting"))
+        elif via:
+            const_caps.append(_gain_for_power_on(max_dbm - limiting_delta, plane, planes, None,
+                                                 for_limit=True))
         else:
             const_caps.append(
-                _gain_for_power_on(float(lim["max_dbm"]), plane, planes, None, for_limit=True))
+                _gain_for_power_on(max_dbm, plane, planes, None, for_limit=True))
     if not const_caps and not freq_limits:
         raise CalibrationError("no safety ceiling derivable — refusing to transmit")
     gain_ceiling_const = min(const_caps) if const_caps else float("inf")
@@ -1156,8 +1220,7 @@ def resolve(unit_doc: dict,
     # DIFFERENT measured plane than the operating one (no shared base for its delta).
     if freq_limits:
         op_anchor = _anchor_plane(operating_plane, planes)                    # observed anchor
-        op_lim_anchor = _anchor_plane(operating_plane, planes, for_limit=True)  # its limiting curve
-        for plane, _mx, _rs in freq_limits:
+        for plane, _mx, _rs, _via in freq_limits:
             lim_anchor = _anchor_plane(plane, planes, for_limit=True)         # the limiting curve
             if lim_anchor is op_anchor or lim_anchor is op_lim_anchor:
                 continue                                                       # shares a base — OK
@@ -1172,7 +1235,10 @@ def resolve(unit_doc: dict,
     # frequency is a runtime quantity — a task's --freq — so an absent center_freq_hz is
     # not an error: derive a representative one (worst-case tightest ceiling when there are
     # frequency-dependent safety limits, so a v1 script folding no frequency stays safe).
-    if (freq_limits or _path_freq_dependent(operating_plane, planes)) and rep_freq is None:
+    # A limit that is only PARAMETER-dependent (a flat path gauged through a param-keyed
+    # limiting law) needs no frequency at all, so it doesn't force a representative one.
+    has_freq_limit = any(_path_freq_dependent(p, planes) for p, _mx, _rs, _via in freq_limits)
+    if (has_freq_limit or _path_freq_dependent(operating_plane, planes)) and rep_freq is None:
         rep_freq = _representative_freq(planes, operating_plane, freq_limits,
                                         gain_ceiling_const)
         if rep_freq is None:
