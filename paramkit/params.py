@@ -187,6 +187,12 @@ class Param:
     # operator shouldn't see (e.g. a non-analytic equivalent-noise bandwidth). No runtime
     # effect (a derived field is never a CLI argument regardless).
     hidden: bool = False
+    # DERIVED only: this field STANDS IN FOR another parameter a calibration power law keys
+    # on, when THAT parameter's own field is hidden by a mode. The bandwidth analogue of
+    # is_freq: e.g. a start/stop sweep span provides "bw" while the --bw field is hidden, so
+    # the GUI folds --power at the actual span. The transmit script already computes the same
+    # quantity itself (a derived field is never a CLI argument). None ⇒ stands in for nothing.
+    provides: Optional[str] = None
 
     @property
     def display_name(self) -> str:
@@ -216,6 +222,7 @@ class Param:
             "formula": dict(self.formula) if self.formula else None,
             "is_freq": self.is_freq,
             "hidden": self.hidden,
+            "provides": self.provides,
         }
 
 
@@ -449,7 +456,7 @@ class Script:
     def derived(self, *flags: str, name: Optional[str] = None, help: str = "",
                 unit: str = "", min: Optional[float] = None, max: Optional[float] = None,
                 formula: Optional[Dict[str, Any]] = None, is_freq: bool = False,
-                hidden: bool = False,
+                hidden: bool = False, provides: Optional[str] = None,
                 show_when: Optional[Dict[str, Any]] = None) -> "Script":
         """A read-only value COMPUTED from other fields — never a CLI argument, so the
         script builds the same quantity itself. A GUI shows it live and, if min/max are
@@ -458,14 +465,18 @@ class Script:
         e.g. ``{"center": ["start", "stop"]}`` = (start+stop)/2 or
         ``{"span": ["start", "stop"]}`` = |stop-start|. Pass is_freq=True to make it the
         calibration fold frequency when the real frequency field is hidden by a mode (the
-        GUI folds --power here instead). Pass hidden=True to compute the value for a power
-        law that keys on it without rendering a readout (an internal quantity). Use a single
+        GUI folds --power here instead). Pass provides="<dest>" to make this field stand in
+        for another parameter a power law keys on when THAT parameter's field is hidden by a
+        mode (e.g. a start/stop span provides "bw" while --bw is hidden) — the bandwidth
+        analogue of is_freq. Pass hidden=True to compute the value for a power law that keys
+        on it without rendering a readout (an internal quantity). Use a single
         display-only pseudo-flag for the label and an explicit name=, e.g.
         ``.derived("-Sweep-width", name="band_span", …)``."""
         n, flags = self._derive_name(flags, name)
         return self._add(Param(
             name=n, flags=flags, kind=DERIVED, help=help, unit=unit, min=min, max=max,
-            formula=formula, is_freq=is_freq, hidden=hidden, show_when=show_when,
+            formula=formula, is_freq=is_freq, hidden=hidden, provides=provides,
+            show_when=show_when,
         ))
 
     # ── argparse construction ────────────────────────────────────────────────

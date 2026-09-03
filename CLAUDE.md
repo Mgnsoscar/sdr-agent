@@ -54,7 +54,16 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
-## Current state — stage limits gauged through the limiting reading: COMPLETE
+## Current state — `provides` derived stand-in (paramkit + argspec): COMPLETE
+`paramkit.Param`/`.derived()` gained `provides="<dest>"` — a derived field that stands in for a
+parameter a calibration power law keys on when THAT parameter's field is hidden by a mode (the
+bandwidth analogue of `is_freq`; e.g. a start/stop sweep span provides `bw` while `--bw` is
+hidden). `agent/argspec.py` extracts it (mirrored byte-identically in `sdr-client/api/argspec.py`
+— drift guard). No agent behaviour/version change: the transmit fold already used the resolved
+span; the client honors `provides` for its display fold. Tests: `tests/test_paramkit.py`,
+`tests/test_argspec_paramkit.py`. Script: `sdr-scripts` `fm_chirp_tx.py`.
+
+## Prior state — stage limits gauged through the limiting reading: COMPLETE
 Latest work: a STAGE safety limit (`chain.limits`) is now inverted **through the operating node's
 LIMITING reading**, not directly against the measured curve — so one dBm ceiling caps every signal
 whatever quantity it is measured in. A constant limiting delta bakes into `gain_ceiling_db`

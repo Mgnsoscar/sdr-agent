@@ -176,7 +176,7 @@ def main() -> int:
                   show_when={"band_mode": "start_stop"})
           .derived("-Sweep-width", name="band_span", unit="MHz",
                    formula={"span": ["start", "stop"]}, min=0.001, max=55.0,
-                   show_when={"band_mode": "start_stop"})
+                   show_when={"band_mode": "start_stop"}, provides="bw")
           .derived("-Carrier", name="band_center", unit="MHz", is_freq=True,
                    formula={"center": ["start", "stop"]},
                    show_when={"band_mode": "start_stop"})
@@ -189,6 +189,8 @@ def main() -> int:
     check(smd["band_center"]["is_freq"] is True, "derived is_freq surfaces")
     check(smd["band_span"]["hidden"] is False, "a visible derived field is not hidden")
     check(smd["enbw_mhz"]["hidden"] is True, "hidden derived field surfaces")
+    check(smd["band_span"]["provides"] == "bw", "derived provides surfaces")
+    check(smd["band_center"]["provides"] is None, "a plain derived field provides nothing")
     ns = sm.parse(["--band-mode", "start_stop", "--start", "1570", "--stop", "1580"])
     check(getattr(ns, "band_mode") == "start_stop", "mode selector parses")
     check(not hasattr(ns, "band_span") and not hasattr(ns, "band_center"),

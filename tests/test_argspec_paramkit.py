@@ -166,7 +166,8 @@ def main() -> int:
         "  .number('-Start','--start', unit='MHz', min=70, max=6000, show_when={'band_mode':'start_stop'})\n"
         "  .number('-Stop','--stop', unit='MHz', min=70, max=6000, show_when={'band_mode':'start_stop'})\n"
         "  .derived('-Sweep-width', name='band_span', unit='MHz',"
-        " formula={'span':['start','stop']}, min=0.001, max=MAXW, show_when={'band_mode':'start_stop'})\n"
+        " formula={'span':['start','stop']}, min=0.001, max=MAXW, show_when={'band_mode':'start_stop'},"
+        " provides='bw')\n"
         "  .derived('-Carrier', name='band_center', unit='MHz', is_freq=True,"
         " formula={'center':['start','stop']}, show_when={'band_mode':'start_stop'})\n"
         "  .derived('-ENBW', name='enbw_mhz', unit='MHz', hidden=True,"
@@ -183,6 +184,8 @@ def main() -> int:
     check(bby["band_mode"].get("show_when") is None, "a field without show_when carries None")
     check(bby["band_span"]["hidden"] is False, "a visible derived field extracts hidden=False")
     check(bby["enbw_mhz"]["hidden"] is True, "hidden derived field extracts")
+    check(bby["band_span"]["provides"] == "bw", "derived provides extracts")
+    check(bby["band_center"]["provides"] is None, "a plain derived field extracts provides=None")
     check(bby["enbw_mhz"]["formula"] == {"table": ["sidelobes", 0.9, 1.0]},
           "table formula (named const list) resolves")
 
