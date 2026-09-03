@@ -689,6 +689,16 @@ single-signal-type unit sets it once on the plane, and a mixed unit overrides pe
   total-power safety cap track the sweep bandwidth as it is tuned. The client form mirrors this:
   the `--power` field is labelled in the reported unit and its range/snapping re-fold on a
   keyed-parameter change, exactly as they already re-fold on a frequency change.
+- **`CAL_POWER_LAWS` "control in" views + `restates_measurement`.** A script's `CAL_POWER_LAWS`
+  are surfaced to the client (`argspec` copies each law dict verbatim, so extra keys ride through
+  with no agent change) as selectable `--power` "control in" quantities plus live companion
+  read-outs. A law may carry `restates_measurement: true` — it re-expresses the MEASURED reading
+  itself (e.g. a chirp's live spectral density restating the density measured at a fixed reference
+  sweep), rather than being a distinct quantity. When the operating axis is the raw measurement
+  (no reported override) and such a law is offered, the form drops the raw measured quantity from
+  the picker and lets the live restatement stand in — otherwise a bandwidth-frozen measured
+  density sits confusingly beside its live twin. Explicit only: a same-unit but genuinely
+  different reading (main-lobe vs total-in-band power, both dBm) is never dropped.
 
 ### 13.4 Status — done
 
