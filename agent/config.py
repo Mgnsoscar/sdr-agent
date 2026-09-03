@@ -262,7 +262,12 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # ignores the limiting reading for stage limits and would resolve a ceiling too high (over-power),
 # so the client gates saving such a document on the calibration-limit-through-reading capability
 # below (a safety gate). Byte-for-byte a no-op when no measurement/limiting bridge is in play.
-AGENT_VERSION = "1.13.0"
+# 1.13.1 surfaces a derived field's `provides` in the script param schema (argspec): a derived
+# field that STANDS IN FOR a parameter a calibration power law keys on when that parameter's own
+# field is hidden by a mode (e.g. a start/stop sweep span provides "bw" while --bw is hidden), so
+# the client folds --power at the actual value. Backward/forward-compatible param metadata (no new
+# capability); the bump exists so the OTA/"Update agent…" flow installs the new argspec on units.
+AGENT_VERSION = "1.13.1"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list

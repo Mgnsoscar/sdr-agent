@@ -59,9 +59,12 @@ representative frequency for scalar read-outs and publishes the full artifact fo
 parameter a calibration power law keys on when THAT parameter's field is hidden by a mode (the
 bandwidth analogue of `is_freq`; e.g. a start/stop sweep span provides `bw` while `--bw` is
 hidden). `agent/argspec.py` extracts it (mirrored byte-identically in `sdr-client/api/argspec.py`
-— drift guard). No agent behaviour/version change: the transmit fold already used the resolved
-span; the client honors `provides` for its display fold. Tests: `tests/test_paramkit.py`,
-`tests/test_argspec_paramkit.py`. Script: `sdr-scripts` `fm_chirp_tx.py`.
+— drift guard). No behaviour change (the transmit fold already used the resolved span; the client
+honors `provides` for its display fold), but `AGENT_VERSION` is bumped to **1.13.1** so the
+OTA/"Update agent…" flow installs the new argspec on units (the client reads `provides` from the
+unit's `/scripts/{name}/params`). No new capability — `provides` is backward/forward-compatible
+param metadata. Tests: `tests/test_paramkit.py`, `tests/test_argspec_paramkit.py`. Script:
+`sdr-scripts` `fm_chirp_tx.py`.
 
 ## Prior state — stage limits gauged through the limiting reading: COMPLETE
 Latest work: a STAGE safety limit (`chain.limits`) is now inverted **through the operating node's
