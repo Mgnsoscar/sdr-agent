@@ -1140,6 +1140,15 @@ def resolve(unit_doc: dict,
         raise CalibrationError("source_bias must be an object")
     bias_pts = (_bias_table(sb.get("power_by_freq"), "source_bias")
                 if isinstance(sb, dict) and not sb.get("bypass") else None)
+    # Measurement DE-EMBED for the source bias (the SDR-flatness sweep is taken over frequency at a
+    # fixed gain, through a cable whose loss varies with frequency): remove L(f) at EACH measured
+    # frequency, recovering the true flatness shape. Freq-dependent — a constant-loss cable cancels
+    # in the rep-frequency normalization below (it shifts absolute power, not the shape), exactly as
+    # a bench artifact should. Never published; never in the transmit path.
+    if bias_pts is not None and isinstance(sb, dict):
+        _bias_dt = _deembed_table(sb.get("measurement_deembed"), components or {}, "source bias")
+        if _bias_dt:
+            bias_pts = [(f, p - _eval_table(_bias_dt, f)) for f, p in bias_pts]
 
     # The source (root measured) plane the bias attaches to. A source bias makes the source
     # frequency-dependent, so any limit gauged through it must classify as frequency-dependent
@@ -1397,26 +1406,24 @@ def validate_document(unit_doc: dict, type_defaults: Optional[dict] = None,
     return summary
 
 
-def _deembed_table(spec, components: dict, plane_name: str):
-    """Resolve a measured plane's ``measurement_deembed`` into a Δ dB(f) loss table — the
-    measurement-path cable/pad between the plane and the analyzer (a bench artifact, removed
-    from the reading, never in the transmit path). Accepts a catalog component id or an inline
-    table (or ``{delta_db_by_freq: …}``); ``None``/"" ⇒ nothing to de-embed."""
+def _deembed_table(spec, components: dict, where: str):
+    """Resolve a ``measurement_deembed`` — on a measured plane's per-signal curve or on the source
+    bias — into a Δ dB(f) loss table: the measurement-path cable/pad between the measured point and
+    the analyzer (a bench artifact, removed from the reading, never in the transmit path). Accepts a
+    catalog component id or an inline table (or ``{delta_db_by_freq: …}``); ``None``/"" ⇒ nothing to
+    de-embed. ``where`` is a human context for error messages."""
     if spec is None or spec == "":
         return None
     if isinstance(spec, str):
         comp = components.get(spec)
         if not isinstance(comp, dict):
-            raise CalibrationError(
-                f"measured plane {plane_name!r} de-embeds unknown component {spec!r}")
+            raise CalibrationError(f"{where} de-embeds unknown component {spec!r}")
         return _freq_table(comp.get("delta_db_by_freq"), f"de-embed component {spec!r}")
     if isinstance(spec, dict) and "delta_db_by_freq" in spec:
-        return _freq_table(spec["delta_db_by_freq"],
-                           f"plane {plane_name!r} measurement_deembed")
+        return _freq_table(spec["delta_db_by_freq"], f"{where} measurement_deembed")
     if isinstance(spec, list):
-        return _freq_table(spec, f"plane {plane_name!r} measurement_deembed")
-    raise CalibrationError(
-        f"measured plane {plane_name!r} 'measurement_deembed' must be a component id or table")
+        return _freq_table(spec, f"{where} measurement_deembed")
+    raise CalibrationError(f"{where} 'measurement_deembed' must be a component id or table")
 
 
 def _freq_table(raw, ctx: str) -> list:
@@ -1526,11 +1533,18 @@ def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
                                              description=description, role=role, of=of)
             else:
                 gains, powers = _curve_points(curve, name)
+                # Measurement DE-EMBED: prefer THIS signal's own curve-level component (each signal
+                # is measured at one frequency, possibly through a different cable — a later signal
+                # can name a new cable while the others keep theirs), falling back to a plane-level
+                # default for backward compatibility. Removed at resolve() as a constant at the
+                # signal's measured-at frequency.
                 planes[name] = _Measured(
                     gains=gains, powers=powers,
                     offset_db=float(curve.get("offset_db", 0.0)),
                     quantity=quantity, description=description, role=role, of=of,
-                    deembed=_deembed_table(spec.get("measurement_deembed"), components, name))
+                    deembed=_deembed_table(
+                        curve.get("measurement_deembed", spec.get("measurement_deembed")),
+                        components, f"measured plane {name!r}"))
             prev_name = name
             continue
         if ptype == "derived":

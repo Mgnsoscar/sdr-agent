@@ -66,6 +66,20 @@ unit's `/scripts/{name}/params`). No new capability — `provides` is backward/f
 param metadata. Tests: `tests/test_paramkit.py`, `tests/test_argspec_paramkit.py`. Script:
 `sdr-scripts` `fm_chirp_tx.py`.
 
+## Current state — per-signal + source-bias measurement de-embed: COMPLETE
+Extends the plane-level measurement de-embed (§14) to two per-measurement placements so each
+measurement carries its own bench cable. `signals.<id>.curves.<plane>.measurement_deembed` (a
+component id or inline table) is preferred over the plane-level default and removed as a CONSTANT at
+the signal's `center_freq_hz` (a per-signal power curve is a gain sweep at one frequency) — so a
+signal measured later through a different/re-characterized cable is corrected independently while the
+others keep theirs (`_build_planes`, line ~1533). `source_bias.measurement_deembed` removes the
+flatness-sweep cable FREQUENCY-BY-FREQUENCY (`bias(f) −= L(f)` before the rep-frequency normalization,
+in `resolve()` right after the `source_bias` parse) — a constant-loss cable cancels in the
+normalization, so only a frequency-dependent bias cable reshapes the flatness. Both reuse
+`_deembed_table` (now context-generalized). Gated on `calibration-deembed-per-signal`, `AGENT_VERSION`
+`1.14.0` (a safety gate — a ≤1.13.x agent would leave the loss baked in). Byte-identical when neither
+new field is present. Tests: `tests/test_calibration_deembed_per_signal.py`; docs/calibration-v2 §14.1.
+
 ## Prior state — stage limits gauged through the limiting reading: COMPLETE
 Latest work: a STAGE safety limit (`chain.limits`) is now inverted **through the operating node's
 LIMITING reading**, not directly against the measured curve — so one dBm ceiling caps every signal

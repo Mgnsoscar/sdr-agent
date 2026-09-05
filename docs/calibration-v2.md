@@ -777,3 +777,35 @@ correction is a constant per signal. A measured plane names the cable:
 - **Gate.** A ≤1.10.0 agent ignores `measurement_deembed` and leaves the cable loss in (wrong
   absolute power and a mis-placed ceiling), so the client gates saving on
   `calibration-measurement-deembed` (agent ≥ 1.11.0). Covered by `test_calibration_deembed`.
+
+### 14.1 Per-signal and source-bias de-embed (agent ≥ 1.14.0)
+
+The de-embed above is one cable per measured *plane*, shared by every signal. In practice each
+signal is measured on its own day, at ONE frequency (its `center_freq_hz`), through whatever cable
+was on the bench then — and a signal added months later may use a different, re-characterized cable
+while the earlier signals must keep theirs. So `measurement_deembed` may also live **per signal, on
+that signal's own measured curve**, and there is a matching de-embed for the **source bias**.
+
+- **Per-signal curve.** `signals.<id>.curves.<plane>.measurement_deembed` (a component id or inline
+  table) is preferred over the plane-level default and removed as a **constant** at that signal's
+  measured-at frequency (`center_freq_hz`) — the per-signal power curve is a gain sweep at one
+  frequency, so its cable loss is a single number. Each signal is corrected independently: a new
+  signal names a new cable, the others keep theirs, and swapping/re-characterizing a cable
+  re-corrects with no re-measuring (the raw reading and the de-embed move together and cancel).
+
+  ```jsonc
+  "signals": { "gps_ca": { "center_freq_hz": 1575420000,
+    "curves": { "sdr_output": { "interp": "linear", "points": [ … ],
+                                "measurement_deembed": "sa_cable_lmr240_1m" } } } }
+  ```
+
+- **Source bias.** `source_bias.measurement_deembed` removes the flatness-sweep cable **frequency
+  by frequency** (`bias(f) −= L_cable(f)` on each `power_by_freq` point, before the rep-frequency
+  normalization). The source bias is measured *over frequency* at a fixed gain, so — unlike a
+  per-signal curve — a frequency-dependent cable reshapes the flatness. A constant-loss cable
+  cancels in the normalization (it shifts absolute power, which the per-signal curve carries, not
+  the shape), so only the frequency-dependent part of a bias cable ever matters.
+
+- **Gate.** A ≤1.13.x agent ignores both placements and leaves the loss baked in, so the client
+  gates saving on `calibration-deembed-per-signal` (agent ≥ 1.14.0) — a safety gate. Covered by
+  `test_calibration_deembed_per_signal`.

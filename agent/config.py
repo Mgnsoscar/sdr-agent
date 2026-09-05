@@ -267,7 +267,11 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # field is hidden by a mode (e.g. a start/stop sweep span provides "bw" while --bw is hidden), so
 # the client folds --power at the actual value. Backward/forward-compatible param metadata (no new
 # capability); the bump exists so the OTA/"Update agent…" flow installs the new argspec on units.
-AGENT_VERSION = "1.13.1"
+# 1.14.0 extends measurement de-embed (docs/calibration-v2 §14) to a signal's OWN measured curve
+# (signals.<id>.curves.<plane>.measurement_deembed, overriding any plane-level default) and to the
+# source bias (source_bias.measurement_deembed, removed frequency-by-frequency), advertised as
+# calibration-deembed-per-signal (a safety gate).
+AGENT_VERSION = "1.14.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -333,6 +337,17 @@ AGENT_CAPABILITIES = [
                                          # consumer re-folds at the live task parameter). Without it
                                          # a stage limit was compared against the measured quantity,
                                          # under-applying the ceiling (over-power) — a safety gate
+    "calibration-deembed-per-signal",    # measurement_deembed may live on a signal's OWN measured
+                                         # curve (signals.<id>.curves.<plane>) — each signal removes
+                                         # its own measurement cable (constant at its measured-at
+                                         # frequency), so a signal measured later through a different
+                                         # cable is corrected independently — AND on the source bias
+                                         # (source_bias.measurement_deembed) where the cable loss is
+                                         # removed frequency-by-frequency across the flatness sweep.
+                                         # A pre-1.14.0 agent ignores both, leaving cable loss baked
+                                         # into the measurement (wrong power + mis-placed ceiling), so
+                                         # the client gates saving on it — docs/calibration-v2 §14; a
+                                         # safety gate
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
