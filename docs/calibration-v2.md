@@ -809,3 +809,11 @@ that signal's own measured curve**, and there is a matching de-embed for the **s
 - **Gate.** A ≤1.13.x agent ignores both placements and leaves the loss baked in, so the client
   gates saving on `calibration-deembed-per-signal` (agent ≥ 1.14.0) — a safety gate. Covered by
   `test_calibration_deembed_per_signal`.
+- **Persistence.** A de-embed cable is a bench artifact, but the resolver still evaluates it at
+  resolve time, so the reference must survive housekeeping: the client counts every de-embed
+  component id (plane, per-signal curve, source bias) as a **referenced component**
+  (`referenced_components`), so deleting the cable from the shared library **keeps it on any unit
+  whose calibration still de-embeds it** — the unit holds its own `components.yaml` copy, and every
+  push (`plan_unit_deploy`, and the calibration panel's own saves) preserves a referenced part the
+  library dropped. Re-characterizing the same cable still re-corrects (swappability, above); only a
+  cable no unit references is ever pruned.
