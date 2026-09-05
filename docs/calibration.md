@@ -579,8 +579,50 @@ def gain_for_power(p_req):                   # --power -> commanded gain
 ```
 
 `np.interp` is already available (lazy numpy import) — linear interpolation with
-endpoint clamping, no scipy. The **only** inviolable rule: upward is always clamped
-to the ceiling, never extrapolated.
+endpoint clamping, no scipy. The **inviolable rule** is about GAIN: the commanded gain
+is always clamped to `[gmin, gmax]`, never pushed past the safety ceiling. By default
+the measured *curve* is also clamped past its endpoints (a gain outside the measured
+range reads the nearest measured power); §7.5 lets a signal opt that curve into
+extrapolation, but the gain clamp above still holds.
+
+### 7.5 Extrapolating past the measured curve (opt-in, per signal)
+
+By default a measured curve is **endpoint-clamped**: past the lowest/highest measured
+gain the power is held flat (a gain you didn't measure reads the nearest measured
+point). That is the safe default — the resolver never promises power it hasn't seen —
+and it means the `--power` range equals the span of the measured points, even when the
+device gain range is wider.
+
+A signal's measured curve may set **`extrapolate`** to continue the curve linearly at
+its end-segment slope instead of clamping, so `--power` can reach a gain that wasn't
+measured (e.g. below a low-gain point that sits in the analyzer's noise floor):
+
+```jsonc
+"signals": { "sig": { "curves": {
+  "sdr_output": { "points": [ … ], "extrapolate": "down" }   // none | down | up | both
+}}}
+```
+
+- `none` (default, and when the key is absent) — clamp, exactly as before.
+- `down` — extend below the lowest measured gain (toward lower power). Inherently safe:
+  it can only promise *less* power than the measured floor.
+- `up` — extend above the highest measured gain, **bounded by the gain ceiling** (a
+  `max_gain_db` and/or a safety limit). The predicted high-gain power is not
+  measurement-backed, so use it only where you trust the curve's linearity.
+- `both` — both ends.
+
+The end slope is `(y₁−y₀)/(x₁−x₀)` at the low end and `(yₙ−yₙ₋₁)/(xₙ−xₙ₋₁)` at the
+high end; a single-point curve keeps its slope-1 fallback. The commanded gain is still
+clamped to `[gmin, gmax]`, so extrapolation extends the *curve*, never the gain limits —
+and a stage limit's dBm ceiling is inverted through the same (possibly extrapolated)
+curve, so the ceiling stays self-consistent.
+
+The resolver, the transmit fold (`calkit`) and the client's `PowerFold` all fold
+`extrapolate` identically (the artifact publishes it top-level), so the range the
+operator sees is the range the unit delivers. Gated on the agent capability
+`calibration-extrapolate` (agent ≥ 1.14.0): an older agent would clamp, so the client
+refuses to save an extrapolating document to it. Byte-for-byte a no-op when every curve
+is `none`.
 
 ---
 

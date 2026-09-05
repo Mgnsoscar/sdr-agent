@@ -271,7 +271,16 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # (signals.<id>.curves.<plane>.measurement_deembed, overriding any plane-level default) and to the
 # source bias (source_bias.measurement_deembed, removed frequency-by-frequency), advertised as
 # calibration-deembed-per-signal (a safety gate).
-AGENT_VERSION = "1.14.0"
+# 1.15.0 lets a measured curve EXTRAPOLATE past its measured gain endpoints: a signal's curve may
+# set extrapolate: down/up/both (default none), continuing the end-segment slope so --power can be
+# commanded at a gain that wasn't measured (e.g. below a noise-floor-limited low-gain point). The
+# resolver, calkit (transmit) and the client PowerFold all fold it identically; the commanded gain
+# is still clamped to [min_gain, ceiling], so it extends the curve, never the gain limits. A ≤1.14.0
+# agent IGNORES the flag and CLAMPS — so a new client would show/author a wider --power range than
+# the unit would actually deliver (commanding into the extrapolated region would silently clamp to a
+# different power), a real mismatch, so the client gates saving such a document on the capability
+# below. Byte-for-byte a no-op when every curve is extrapolate: none.
+AGENT_VERSION = "1.15.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -348,6 +357,12 @@ AGENT_CAPABILITIES = [
                                          # into the measurement (wrong power + mis-placed ceiling), so
                                          # the client gates saving on it — docs/calibration-v2 §14; a
                                          # safety gate
+    "calibration-extrapolate",           # a signal's measured curve may set extrapolate:
+                                         # down/up/both — continue the end-segment slope past the
+                                         # measured gain endpoints so --power reaches a gain that
+                                         # wasn't measured. Gain is still clamped to the ceiling.
+                                         # A ≤1.14.0 agent clamps instead, so the client's wider
+                                         # range wouldn't match what the unit delivers — a gate
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

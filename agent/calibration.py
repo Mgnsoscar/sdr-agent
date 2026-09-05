@@ -74,6 +74,14 @@ class _Measured:
     description: str = ""
     role: str = "limiting"
     of: str = ""                             # reported → the limiting plane it re-measures
+    # Per-signal EXTRAPOLATION beyond the measured gain endpoints (docs/calibration.md §7.4).
+    # "none" (default) clamps flat past the lowest/highest measured gain — the safe default and
+    # byte-identical to every existing document. "down"/"up"/"both" instead continue the curve
+    # linearly at its end-segment slope past that end, so the operator can command power at a
+    # gain they didn't measure (e.g. below a noise-floor-limited low-gain measurement). The
+    # commanded gain is STILL clamped to [min_gain, ceiling] by _snap, so extrapolation extends
+    # the curve, never the gain limits. A single-point curve keeps its slope-1 fallback.
+    extrapolate: str = "none"
     # Per-unit SOURCE-BIAS Δ dB(f), attached only to the root/source plane by resolve().
     # Normalized so it is 0 at the signal's representative (measured-at) frequency, so it
     # leaves the v1 rep-frequency read-outs unchanged and only shifts the source AWAY from
@@ -112,7 +120,7 @@ class _Measured:
 
     def power_at(self, gain: float, reading: str = "") -> float:
         g, p = self.curve_for(reading)
-        return _interp(gain, g, p) + self.offset_db
+        return _interp_extrap(gain, g, p, self.extrapolate) + self.offset_db
 
     def bias_at(self, freq: Optional[float]) -> float:
         """The source-bias shift (dB) at ``freq`` — 0 when no bias, or when the plane
@@ -652,6 +660,12 @@ class ResolvedCalibration:
             "max_power_dbm": self.max_power_dbm,
             "curve": self.operating_curve(),
         }
+        # Extrapolation past the measured gain endpoints is a property of the operating
+        # curve; publish it (top-level, even on a flat v1 chain) so calkit / the client
+        # re-fold --power the same way the resolver did (else they'd clamp and disagree).
+        op_anchor = _anchor_plane(self.operating_plane, self._planes)
+        if isinstance(op_anchor, _Measured) and op_anchor.extrapolate != "none":
+            out["extrapolate"] = op_anchor.extrapolate
         if self._gain_step:
             out["gain_step_db"] = self._gain_step
         if self.public_unit:
@@ -724,6 +738,28 @@ def _interp(x: float, xs: list[float], ys: list[float]) -> float:
             x0, x1, y0, y1 = xs[i - 1], xs[i], ys[i - 1], ys[i]
             return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
     return ys[-1]                              # unreachable (x < xs[-1] handled above)
+
+
+def _interp_extrap(x: float, xs: list[float], ys: list[float], mode: str) -> float:
+    """Like :func:`_interp`, but linearly EXTRAPOLATES past an endpoint at that end's
+    segment slope when ``mode`` permits the direction: ``"down"`` below ``xs[0]``,
+    ``"up"`` above ``xs[-1]``, ``"both"`` either; ``"none"`` (or empty) clamps exactly
+    like ``_interp``. A single-point curve keeps the slope-1 fallback (no slope to use).
+
+    Only a MEASURED gain→power curve the operator opted into extrapolating uses this;
+    frequency and bias tables always clamp (they call ``_interp`` directly). Because a
+    curve's powers are strictly increasing with gain, the SAME call inverts it — pass
+    ``(power, powers, gains, mode)`` to get the extrapolated gain for a power."""
+    n = len(xs)
+    if n < 2 or not mode or mode == "none":
+        return _interp(x, xs, ys)
+    if x < xs[0] and mode in ("down", "both"):
+        slope = (ys[1] - ys[0]) / (xs[1] - xs[0])
+        return ys[0] + slope * (x - xs[0])
+    if x > xs[-1] and mode in ("up", "both"):
+        slope = (ys[-1] - ys[-2]) / (xs[-1] - xs[-2])
+        return ys[-1] + slope * (x - xs[-1])
+    return _interp(x, xs, ys)
 
 
 # ── Plane traversal (mirrors docs/calibration.md §7.3) ───────────────────────────
@@ -872,13 +908,11 @@ def _gain_for_power_on(power: float, plane_name: str, planes: dict,
     delta, m = _anchor(plane_name, planes, freq, for_limit=for_limit)
     g_curve, p_curve = m.curve_for(reading)
     target = power - delta - m.offset_db - m.bias_at(freq)   # undo the source-bias shift
-    if len(p_curve) == 1:
-        return g_curve[0] + (target - p_curve[0])          # slope-1 inverse
-    if target >= p_curve[-1]:
-        return g_curve[-1]
-    if target <= p_curve[0]:
-        return g_curve[0]
-    return _interp(target, p_curve, g_curve)               # powers monotonic → unambiguous
+    # Invert by interpolating gain(power) — powers are strictly increasing, so it is
+    # unambiguous. "none" clamps at the measured endpoints (the historical behaviour); an
+    # extrapolate mode continues the end slope past that end. The result is still clamped to
+    # [min_gain, ceiling] by _snap, and the ceiling itself never exceeds max_gain_db.
+    return _interp_extrap(target, p_curve, g_curve, m.extrapolate)
 
 
 def _breakpoint_freqs(plane_name: str, planes: dict) -> list:
@@ -1561,6 +1595,7 @@ def _build_planes(planes_spec: dict, curves: dict, signal_id: str,
                     gains=gains, powers=powers,
                     offset_db=float(curve.get("offset_db", 0.0)),
                     quantity=quantity, description=description, role=role, of=of,
+                    extrapolate=_curve_extrapolate(curve, name),
                     deembed=_deembed_table(
                         curve.get("measurement_deembed", spec.get("measurement_deembed")),
                         components, f"measured plane {name!r}"))
@@ -1647,6 +1682,27 @@ def _curve_points(curve: dict, name: str) -> tuple[list[float], list[float]]:
                 f"plane {name!r} power not strictly increasing with gain "
                 f"(not invertible) near {gains[i]:g} dB")
     return gains, powers
+
+
+_EXTRAPOLATE_MODES = ("none", "down", "up", "both")
+
+
+def _curve_extrapolate(curve: dict, name: str) -> str:
+    """Validate and normalize a measured curve's optional ``extrapolate`` setting —
+    how the curve behaves past its measured gain endpoints (see ``_Measured``). Accepts
+    ``"none"``/``"down"``/``"up"``/``"both"`` (case-insensitive), plus a bool for
+    convenience (``true`` → ``"both"``); absent/false/null ⇒ ``"none"``."""
+    v = curve.get("extrapolate", "none")
+    if v is True:
+        return "both"
+    if v is False or v is None:
+        return "none"
+    v = str(v).strip().lower()
+    if v not in _EXTRAPOLATE_MODES:
+        raise CalibrationError(
+            f"plane {name!r} has invalid extrapolate {v!r} "
+            f"(expected one of {', '.join(_EXTRAPOLATE_MODES)})")
+    return v
 
 
 def _validate_role_refs(planes: dict) -> None:

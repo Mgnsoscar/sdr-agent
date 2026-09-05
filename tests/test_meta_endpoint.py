@@ -25,6 +25,7 @@ def test_capabilities_advertised_and_stable():
     assert "calibration-measurement-quantity" in cfg.AGENT_CAPABILITIES  # per-signal quantity/unit
     assert "calibration-limit-through-reading" in cfg.AGENT_CAPABILITIES  # stage limit via limiting reading
     assert "calibration-deembed-per-signal" in cfg.AGENT_CAPABILITIES  # per-signal + source-bias de-embed
+    assert "calibration-extrapolate" in cfg.AGENT_CAPABILITIES            # measured-curve extrapolation
 
 
 def test_agent_info_carries_capabilities():

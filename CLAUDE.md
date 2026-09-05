@@ -27,7 +27,7 @@ the drift guard is pytest-only.
 - **Capabilities + version:** a new client-visible feature adds a string to
   `AGENT_CAPABILITIES` and bumps `AGENT_VERSION` (both in `agent/config.py`); `test_meta_endpoint.py`
   asserts the capability set. The client feature-gates on these exact strings. Current version is
-  in `config.py` (bumped to `1.13.0` for stage limits gauged through the limiting reading).
+  in `config.py` (bumped to `1.15.0` for opt-in measured-curve extrapolation).
 
 ## Where things live
 - `agent/calibration.py` (~1.7k lines) — the **calibration resolver**. `resolve(unit_doc, …,
@@ -53,6 +53,25 @@ declared **laws** (affine in log10 of task params; `in`/`out` families abs↔den
 between quantities. Safety **limits** are dBm ceilings on stage boundaries; the LIMITING reading
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
+
+## Current state — opt-in measured-curve extrapolation: COMPLETE (branch `claude/calibration-extrapolate`)
+A signal's measured curve may set `extrapolate: down|up|both` (default `none`) on its curve entry
+(`signals.<id>.curves.<plane>.extrapolate`) to continue the end-segment slope past the measured gain
+endpoints, instead of clamping flat — so `--power` can reach a gain that wasn't measured (motivating
+case: a clean high-gain measurement extrapolated DOWN, because low gain sits in the analyzer's noise
+floor). The commanded gain is still clamped to `[min_gain, ceiling]`, so it extends the *curve*, never
+the gain limits. Implemented as a per-curve `_Measured.extrapolate` + a new `_interp_extrap` used by
+`power_at` and (since powers are strictly increasing, the same call inverts) `_gain_for_power_on`;
+`_interp` stays clamped for frequency/bias tables. Published TOP-LEVEL in the artifact (`extrapolate`)
+so it reaches a flat v1 chain too; **`paramkit/calkit.py`** (transmit fold) and **`sdr-client`
+`state/power_fold.py`** mirror it via their own `_interp_ex` on the operating anchor, so the range the
+operator sees is the range the unit delivers. Gated on capability `calibration-extrapolate`
+(`AGENT_VERSION` → `1.15.0`, a safety gate: an older agent clamps → client range wouldn't match). The
+client picker is a per-signal dropdown on the measured-points dialog (`ui/calibration_panel.py`;
+`_doc_uses_extrapolate`/`_blocks_on_extrapolate`). Byte-for-byte a no-op when every curve is `none`.
+Tests: `tests/test_calibration_extrapolate.py`, `tests/test_calkit_extrapolate.py` (agent);
+`tests/test_power_fold_extrapolate.py`, `tests/test_calibration_extrapolate.py` (client). Docs:
+`docs/calibration.md` §7.5.
 
 ## Current state — `provides` derived stand-in (paramkit + argspec): COMPLETE
 `paramkit.Param`/`.derived()` gained `provides="<dest>"` — a derived field that stands in for a

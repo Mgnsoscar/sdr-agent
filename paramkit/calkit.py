@@ -67,6 +67,22 @@ def _interp(x: float, xs: list, ys: list) -> float:
     return ys[-1]
 
 
+def _interp_ex(x: float, xs: list, ys: list, mode: str) -> float:
+    """Like :func:`_interp`, but linearly EXTRAPOLATES past an endpoint at that end's
+    segment slope when ``mode`` permits the direction (``down``/``up``/``both``); ``none``
+    or empty clamps exactly like ``_interp``. Mirrors the agent resolver's ``_interp_extrap``
+    so the transmit-time fold matches the resolved --power range. Applied ONLY to the
+    operating anchor curve (the operator opted in); frequency/bias/own-limit tables clamp."""
+    n = len(xs)
+    if n < 2 or not mode or mode == "none":
+        return _interp(x, xs, ys)
+    if x < xs[0] and mode in ("down", "both"):
+        return ys[0] + (ys[1] - ys[0]) / (xs[1] - xs[0]) * (x - xs[0])
+    if x > xs[-1] and mode in ("up", "both"):
+        return ys[-1] + (ys[-1] - ys[-2]) / (xs[-1] - xs[-2]) * (x - xs[-1])
+    return _interp(x, xs, ys)
+
+
 def _table_at(freqs: list, deltas: list, freq: Optional[float]) -> float:
     """A delta table's value at ``freq``: constant if single-point; if the frequency is
     unknown for a multi-point table, fall back to its lowest-frequency value."""
@@ -103,7 +119,7 @@ class PowerMap:
                  source, label, hops=(), freq_limits=(), center_freq=None,
                  gain_step_db=None, actives=(), source_bias=(),
                  reported=None, limiting=None, limiting_cap=None,
-                 reported_applies=False):
+                 reported_applies=False, extrapolate="none"):
         if not gains or len(gains) != len(powers):
             raise ValueError("calibration curve is empty or malformed")
         # keep gain-sorted; agent guarantees strict monotonicity, verify defensively
@@ -169,6 +185,11 @@ class PowerMap:
         self._limiting = limiting
         self._limiting_cap = None if limiting_cap is None else float(limiting_cap)
         self._reported_applies = bool(reported_applies and reported is not None)
+        # Extrapolation past the measured gain endpoints (docs/calibration.md §7.4): continue
+        # the operating anchor's end slope when set, matching the resolver's published range.
+        # Applied only to the operating anchor folds; the commanded gain is still clamped to
+        # [min_gain, ceiling], so it extends the curve, not the gain limits.
+        self._extrapolate = str(extrapolate or "none").strip().lower()
 
     # ── frequency-dependent internals ────────────────────────────────────────────
     def _eff(self, freq: Optional[float]) -> Optional[float]:
@@ -207,9 +228,10 @@ class PowerMap:
         return _table_at([f for f, _ in self._bias], [d for _, d in self._bias], freq)
 
     def _invert(self, target_power: float) -> float:
-        """Anchor gain that yields ``target_power`` at the measured anchor, clamped to
-        the measured range (up to the top gain, never extrapolated)."""
-        return _interp(target_power, self._powers, self._gains)
+        """Anchor gain that yields ``target_power`` at the measured anchor. Clamped to the
+        measured range, unless the operating curve opted into extrapolation, in which case
+        it continues the end slope past that end (the result is still gain-clamped by _snap)."""
+        return _interp_ex(target_power, self._powers, self._gains, self._extrapolate)
 
     def _ceiling(self, freq: Optional[float], params: Optional[dict] = None) -> float:
         """Gain ceiling at ``freq``: the frequency-independent cap tightened by any
@@ -225,14 +247,14 @@ class PowerMap:
             if ag is not None:                    # own (downstream) limiting curve → no bias
                 cap = min(cap, _interp(target, ap, ag))
             else:                                 # shared operating anchor = the biased source
-                cap = min(cap, _interp(target - b, self._powers, self._gains))
+                cap = min(cap, _interp_ex(target - b, self._powers, self._gains, self._extrapolate))
         # Ceiling on the operating node's LIMITING reading (limiting = measured + Δlim), gauged
         # against the measured anchor at the live parameter value — so a param-keyed limit
         # (e.g. a total-power cap when the measurement is a density) tightens as the parameter
         # is tuned, never baked at the wrong value.
         if self._limiting_cap is not None:
             target = self._limiting_cap - self._reading_delta(self._limiting, params)
-            cap = min(cap, _interp(target - b, self._powers, self._gains))
+            cap = min(cap, _interp_ex(target - b, self._powers, self._gains, self._extrapolate))
         return cap
 
     def _snap(self, gain: float, freq: Optional[float], params: Optional[dict] = None) -> float:
@@ -265,8 +287,8 @@ class PowerMap:
             hi, lo = _active_applied(a)
             actives.append(Active(hi, lo, a["step_db"], a.get("engage_pct", 0.0), meta=a))
         grid = AchievableGrid(
-            power_for_gain=lambda g: _interp(g, self._gains, self._powers) + od + b,
-            gain_for_power=lambda p: _interp(p - od - b, self._powers, self._gains),
+            power_for_gain=lambda g: _interp_ex(g, self._gains, self._powers, self._extrapolate) + od + b,
+            gain_for_power=lambda p: _interp_ex(p - od - b, self._powers, self._gains, self._extrapolate),
             min_gain=self.min_gain_db, ceiling=self._ceiling(f, params),
             gain_step=self._gain_step, actives=actives)
         return grid, actives
@@ -328,7 +350,7 @@ class PowerMap:
             raise NoAbsoluteScale("uncalibrated: no absolute power scale for this signal")
         f = self._eff(freq)
         g = self._snap(float(gain_db), f, params)
-        op = _interp(g, self._gains, self._powers) + self._op_delta(f) + self._source_bias_at(f)
+        op = _interp_ex(g, self._gains, self._powers, self._extrapolate) + self._op_delta(f) + self._source_bias_at(f)
         return op + self._reported_shift(params)
 
     @property
@@ -407,6 +429,7 @@ class PowerMap:
         self._limiting = None
         self._limiting_cap = None
         self._reported_applies = False
+        self._extrapolate = "none"
         self.has_absolute = False
         return self
 
@@ -421,6 +444,7 @@ class PowerMap:
         label = f"{quantity}, at {plane}" if plane else quantity
 
         step = art.get("gain_step_db")
+        extrapolate = art.get("extrapolate", "none")   # operating-curve extrapolation, if any
         actives = art.get("active_components") or ()
         # Power-quantity bridges (docs/calibration-v2.md §13): reported/limiting readings and a
         # limiting-reading cap, laws embedded, so no script metadata is needed at runtime.
@@ -452,14 +476,14 @@ class PowerMap:
                        actives=actives,
                        source_bias=art.get("source_bias_delta_by_freq") or (),
                        reported=reported, limiting=limiting, limiting_cap=limiting_cap,
-                       reported_applies=True)
+                       reported_applies=True, extrapolate=extrapolate)
 
         curve = art.get("curve") or []                # v1: pre-flattened operating curve
         gains = [pt[0] for pt in curve]
         powers = [pt[1] for pt in curve]
         return cls(gains, powers, art.get("min_gain_db"), art.get("max_gain_db"), amp,
                    source="calibration file", label=label, gain_step_db=step,
-                   actives=actives)
+                   actives=actives, extrapolate=extrapolate)
 
     @classmethod
     def load(cls, baked: "PowerMap", env_var: str = CALIBRATION_FILE_ENV) -> "PowerMap":
