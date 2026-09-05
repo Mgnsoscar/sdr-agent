@@ -84,6 +84,10 @@ class _Measured:
     # its NEGATIVE, evaluated at the signal's measured-at frequency, into offset_db — recovering
     # the TRUE power at the plane — then it is gone (never published). None ⇒ nothing to remove.
     deembed: Optional[list] = None           # [(freq_hz, delta_db)], the measurement-path loss
+    # The de-embed VALUE (signed dB) resolve() folded into offset_db, kept so an OWN reading curve
+    # (a separate measurement at this node) can de-embed by ITS OWN cable instead: power_at() adds
+    # offset_db to the own curve too, so the own de-embed is applied relative to this.
+    deembed_applied: float = 0.0
     # Per-signal READING anchor curves at this (source) node (docs/calibration-v2.md §13/§15):
     # a reported and/or limiting reading may be its OWN separately-measured curve (e.g. a
     # main-lobe measurement backing the limit, while the primary measures full bandwidth). Set
@@ -1041,7 +1045,8 @@ def resolve(unit_doc: dict,
     for _p in planes.values():
         if isinstance(_p, _Measured) and _p.deembed:
             f = rep_freq if (rep_freq is not None or len(_p.deembed) == 1) else _p.deembed[0][0]
-            _p.offset_db -= _eval_table(_p.deembed, f)
+            _p.deembed_applied = _eval_table(_p.deembed, f)      # kept for an own reading (below)
+            _p.offset_db -= _p.deembed_applied
             _p.deembed = None
 
     # Bypassed stages (a component you've physically pulled without deleting it) resolve to
@@ -1123,13 +1128,27 @@ def resolve(unit_doc: dict,
     # An `own` reading is a SEPARATELY measured curve at the source node (e.g. a main-lobe
     # measurement backing the limit while the primary measures full bandwidth). Attach it to
     # the observed source anchor so the operator axis / ceiling fold it through the chain like
-    # the primary; the de-embed (already folded into offset_db) applies to it too.
+    # the primary. It is its OWN bench measurement, so it carries its OWN `measurement_deembed`:
+    # power_at() adds the anchor's offset_db (which already has the PRIMARY curve's de-embed,
+    # `deembed_applied`) to the own curve too, so removing the own cable means shifting the own
+    # powers by (deembed_applied − D_own) — the primary de-embed is cancelled and the own one
+    # applied. No own cable ⇒ it inherits the primary's (shift 0), the same-setup default.
     if reported.is_own or limiting.is_own:
         src_anchor = _anchor_plane(operating_plane, planes)
+        _da = getattr(src_anchor, "deembed_applied", 0.0)
+
+        def _own(spec, ctx):
+            gains, powers = _own_reading_curve(spec, ctx)
+            dt = _deembed_table(spec.get("measurement_deembed"), components or {}, ctx)
+            if dt:
+                f = rep_freq if (rep_freq is not None or len(dt) == 1) else dt[0][0]
+                shift = _da - _eval_table(dt, f)
+                powers = [p + shift for p in powers]
+            return gains, powers
         if reported.is_own:
-            src_anchor.reported_own = _own_reading_curve(rep_spec, f"{signal_id!r} reported")
+            src_anchor.reported_own = _own(rep_spec, f"{signal_id!r} reported")
         if limiting.is_own:
-            src_anchor.limiting_own = _own_reading_curve(lim_spec, f"{signal_id!r} limiting")
+            src_anchor.limiting_own = _own(lim_spec, f"{signal_id!r} limiting")
 
     # Per-unit SOURCE BIAS (the SDR's output-power-vs-frequency flatness): a fixed-gain CW
     # power table, unit-owned (top-level), NOT a component. Skipped when its stage is

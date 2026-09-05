@@ -75,8 +75,14 @@ signal measured later through a different/re-characterized cable is corrected in
 others keep theirs (`_build_planes`, line ~1533). `source_bias.measurement_deembed` removes the
 flatness-sweep cable FREQUENCY-BY-FREQUENCY (`bias(f) −= L(f)` before the rep-frequency normalization,
 in `resolve()` right after the `source_bias` parse) — a constant-loss cable cancels in the
-normalization, so only a frequency-dependent bias cable reshapes the flatness. Both reuse
-`_deembed_table` (now context-generalized). Gated on `calibration-deembed-per-signal`, `AGENT_VERSION`
+normalization, so only a frequency-dependent bias cable reshapes the flatness. A third placement: an
+OWN (separate-measurement) reading — `signals.<id>.limiting`/`reported` `{kind:own,curve:…}` — carries
+its own `measurement_deembed`, de-embedded INDEPENDENTLY of the primary: the own curve shares the
+node's `offset_db` (which already has the primary de-embed, captured as `_Measured.deembed_applied`),
+so `resolve()` shifts the own powers by `(primary − own)` at the signal freq — no own cable inherits
+the primary, the same cable equals inheriting, a different cable overrides; only the reading it backs
+(the ceiling) moves, never the `--power` axis. All reuse `_deembed_table` (now context-generalized).
+Gated on `calibration-deembed-per-signal`, `AGENT_VERSION`
 `1.14.0` (a safety gate — a ≤1.13.x agent would leave the loss baked in). Byte-identical when neither
 new field is present. Tests: `tests/test_calibration_deembed_per_signal.py`; docs/calibration-v2 §14.1.
 

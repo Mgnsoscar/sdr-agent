@@ -157,3 +157,76 @@ def test_unknown_source_bias_deembed_component_refused():
     with pytest.raises(CalibrationError):
         resolve(_doc({"sig": {"points": [(40, -31.0), (74, 3.0)], "center_freq_hz": 1e9}},
                      source_bias=sb), None, "sig", CABLES)
+
+
+# ── OWN limiting reading (a SEPARATE measurement) carries its OWN de-embed cable ─────────────────
+# The "Separate measurement (dBm)" limiting reading is its own bench curve, possibly through a
+# different cable than the primary measurement. It de-embeds by ITS OWN cable, overriding the
+# primary's (which it otherwise inherits via the shared source-node offset).
+
+def _own_doc(main, own, *, plane_dm=None, own_dm=None, limit_dbm=5.0):
+    plane = {"type": "measured", "quantity": "power"}
+    if plane_dm is not None:
+        plane["measurement_deembed"] = plane_dm
+    limiting = {"kind": "own", "curve": {"interp": "linear", "points": _pts(own)}}
+    if own_dm is not None:
+        limiting["measurement_deembed"] = own_dm
+    return {
+        "schema_version": 1, "unit_type": "b",
+        "chain": {"gain_limits": {"min_gain_db": 0.0, "max_gain_db": 74.0},
+                  "operating_plane": "sdr_output",
+                  "limits": [{"plane": "sdr_output", "max_dbm": limit_dbm, "reason": "amp"}],
+                  "planes": {"sdr_output": plane}},
+        "signals": {"sig": {"center_freq_hz": 1.5e9,
+                            "measurement": {"quantity": "main-lobe power", "unit": "dBm"},
+                            "curves": {"sdr_output": {"interp": "linear", "points": _pts(main)}},
+                            "limiting": limiting}},
+    }
+
+
+_MAIN = [(40, -31.0), (74, 3.0)]
+_OWN = [(40, -20.0), (74, 10.0)]
+
+
+def _lim_anchor0(doc):
+    art = resolve(doc, None, "sig", CABLES).to_public_dict()
+    return art["readings"]["limiting"]["anchor_curve"][0][1]
+
+
+def test_own_limiting_curve_deembeds_by_its_own_cable():
+    # No primary de-embed; the own curve names cable1 (−1) → its true reading is 1 dB higher.
+    assert _lim_anchor0(_own_doc(_MAIN, _OWN)) == pytest.approx(-20.0)                 # raw
+    assert _lim_anchor0(_own_doc(_MAIN, _OWN, own_dm="cable1")) == pytest.approx(-19.0)  # +1
+
+
+def test_own_curve_inherits_the_primary_cable_when_it_names_none():
+    # The default (same-setup) behaviour: with a primary de-embed and no own cable, the own reading
+    # inherits the primary cable through the shared source-node offset.
+    assert _lim_anchor0(_own_doc(_MAIN, _OWN, plane_dm="cable1")) == pytest.approx(-19.0)
+
+
+def test_own_cable_matching_the_primary_equals_inheriting():
+    # Naming the SAME cable on the own curve as the primary gives the SAME result as inheriting —
+    # the correction isn't double-applied.
+    inherit = _lim_anchor0(_own_doc(_MAIN, _OWN, plane_dm="cable1"))
+    same = _lim_anchor0(_own_doc(_MAIN, _OWN, plane_dm="cable1", own_dm="cable1"))
+    assert same == pytest.approx(inherit)
+
+
+def test_own_cable_overrides_a_different_primary_cable():
+    # Primary through cable1 (−1), the separate limiting measurement through cable2 (−2): the own
+    # reading is de-embedded by cable2, not cable1.
+    assert _lim_anchor0(_own_doc(_MAIN, _OWN, plane_dm="cable1", own_dm="cable2")) == pytest.approx(-18.0)
+
+
+def test_own_cable_does_not_touch_the_operating_axis():
+    # The own curve backs only the LIMITING reading; the operator's --power axis (the primary curve)
+    # is unaffected by the own cable.
+    base = resolve(_own_doc(_MAIN, _OWN), None, "sig", CABLES)
+    withc = resolve(_own_doc(_MAIN, _OWN, own_dm="cable1"), None, "sig", CABLES)
+    assert withc.power_for_gain(50.0) == pytest.approx(base.power_for_gain(50.0))
+
+
+def test_unknown_own_deembed_component_refused():
+    with pytest.raises(CalibrationError):
+        resolve(_own_doc(_MAIN, _OWN, own_dm="nope"), None, "sig", CABLES)

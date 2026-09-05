@@ -799,6 +799,16 @@ that signal's own measured curve**, and there is a matching de-embed for the **s
                                 "measurement_deembed": "sa_cable_lmr240_1m" } } } }
   ```
 
+- **Own (separate-measurement) reading.** A limiting/reported reading set to a separate measurement
+  (`{kind: own, curve: {points: …}}`) is its own bench curve — possibly through a different cable —
+  so it takes its own `measurement_deembed`. It is de-embedded **independently** of the primary
+  curve: the own curve shares the source node's `offset_db` (which already carries the primary
+  curve's de-embed), so `resolve()` shifts the own powers by `(primary_deembed − own_deembed)` at the
+  signal's frequency — cancelling the inherited primary correction and applying the own one. Naming
+  no own cable ⇒ it **inherits** the primary's (the same-setup default); naming the *same* cable is
+  identical to inheriting (the correction is never double-applied); naming a *different* cable
+  overrides. Only the reading it backs (the ceiling, for limiting) is affected — never the operator's
+  `--power` axis, which the primary curve owns.
 - **Source bias.** `source_bias.measurement_deembed` removes the flatness-sweep cable **frequency
   by frequency** (`bias(f) −= L_cable(f)` on each `power_by_freq` point, before the rep-frequency
   normalization). The source bias is measured *over frequency* at a fixed gain, so — unlike a
