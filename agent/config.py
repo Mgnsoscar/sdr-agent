@@ -280,7 +280,12 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # the unit would actually deliver (commanding into the extrapolated region would silently clamp to a
 # different power), a real mismatch, so the client gates saving such a document on the capability
 # below. Byte-for-byte a no-op when every curve is extrapolate: none.
-AGENT_VERSION = "1.15.0"
+# 1.15.1 is a resolver correctness fix (no new capability): a programmable attenuator's engage_pct
+# no longer caps a signal's MINIMUM achievable power — the floor is now SDR@min_gain + attenuator@max
+# for every engage_pct, and the engagement % only steers WHEN the attenuator engages (paramkit/
+# achievable.py, mirrored to sdr-client/state/achievable.py). The version bump lets the OTA/"Update
+# agent…" flow push the corrected resolver onto already-deployed units.
+AGENT_VERSION = "1.15.1"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list

@@ -27,7 +27,8 @@ the drift guard is pytest-only.
 - **Capabilities + version:** a new client-visible feature adds a string to
   `AGENT_CAPABILITIES` and bumps `AGENT_VERSION` (both in `agent/config.py`); `test_meta_endpoint.py`
   asserts the capability set. The client feature-gates on these exact strings. Current version is
-  in `config.py` (bumped to `1.15.0` for opt-in measured-curve extrapolation).
+  in `config.py` (`1.15.1`: a resolver correctness fix — attenuator `engage_pct` no longer caps the
+  minimum achievable power — pushed via OTA; no new capability).
 
 ## Where things live
 - `agent/calibration.py` (~1.7k lines) — the **calibration resolver**. `resolve(unit_doc, …,
@@ -67,8 +68,9 @@ threshold only steers `realize`'s (gain, reduction) choice — ABOVE it least-re
 attenuator at rest), and once the attenuator is MAXED the SDR drops below the threshold (most-
 reduction) to extend the low end. So the floor is `SDR@min_gain + attenuator@max` for every
 `engage_pct`, and the engaged region still holds the SDR at the threshold. `paramkit/achievable.py`
-and `sdr-client/state/achievable.py` kept byte-identical (manual mirror). No capability/version
-change (a resolver correctness fix; the resolved `min_power_dbm` just becomes correct). Tests:
+and `sdr-client/state/achievable.py` kept byte-identical (manual mirror). No new capability, but
+`AGENT_VERSION` is bumped to `1.15.1` so the OTA/"Update agent…" flow pushes the corrected resolver
+onto already-deployed units (the resolved `min_power_dbm` just becomes correct). Tests:
 `tests/test_calibration_active.py`, `tests/test_achievable_grid.py` (min independent of engage_pct;
 SDR drops below the threshold once the attenuator is maxed); client `tests/test_power_fold.py`.
 
