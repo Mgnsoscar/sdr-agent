@@ -120,13 +120,26 @@ def test_sdr_first_keeps_attenuator_at_rest_above_the_floor():
     assert out["settings"][0]["value"] == pytest.approx(60.0)   # 60 dB attenuation
 
 
-def test_engage_threshold_keeps_sdr_higher():
+def test_engage_threshold_keeps_sdr_higher_but_not_the_floor():
     r = _resolve(_doc(_control(engage_pct=50.0)))
-    # Threshold at the midpoint (−20): the SDR never drops below gain 20.
-    assert r.min_power_dbm == pytest.approx(-115.0)             # −20 − 95
+    # The engagement threshold steers WHEN the attenuator is used, not the range: the floor is
+    # still the SDR at min gain with the attenuator fully engaged (−40 − 95), independent of it.
+    assert r.min_power_dbm == pytest.approx(-135.0)
+    # In the engaged region (threshold at −20) the SDR is held at gain 20 and the attenuator fills.
     out = r.realize(-60.0)
     assert out["sdr_gain_db"] == pytest.approx(20.0)
     assert out["settings"][0]["value"] == pytest.approx(40.0)
+    # Below the engaged region the attenuator MAXES OUT and the SDR drops below the threshold —
+    # extending the low end rather than being pinned at gain 20.
+    out = r.realize(-130.0)
+    assert out["settings"][0]["value"] == pytest.approx(95.0)  # attenuator fully engaged
+    assert out["sdr_gain_db"] == pytest.approx(5.0)            # SDR below the 20 dB threshold
+
+
+def test_min_power_is_independent_of_engage_pct():
+    lows = [_resolve(_doc(_control(engage_pct=e))).min_power_dbm
+            for e in (0.0, 25.0, 50.0, 90.0)]
+    assert all(low == pytest.approx(-135.0) for low in lows)
 
 
 def test_snap_only_returns_achievable_levels():
@@ -172,7 +185,7 @@ def test_artifact_carries_active_components():
     assert ac["task"] == "atten_set" and ac["param"] == "attenuation"
     assert ac["sense"] == "attenuation" and ac["step_db"] == 0.25
     assert ac["min_db"] == 0.0 and ac["max_db"] == 95.0 and ac["engage_pct"] == 10.0
-    assert art["min_power_dbm"] == pytest.approx(-131.0)        # −36 − 95, T at 10%
+    assert art["min_power_dbm"] == pytest.approx(-135.0)        # −40 − 95, floor is engage-independent
 
 
 def test_active_baseline_input_loss_is_folded_on_top_of_the_programmable_range():

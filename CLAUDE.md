@@ -54,6 +54,24 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — attenuator engagement no longer caps the minimum power: COMPLETE (branch `claude/table-and-ramp-fixes`, cross-repo)
+Bug: a signal's minimum achievable power tracked a programmable attenuator's `engage_pct` (lower
+engagement → lower min). The engagement % should decide only WHEN the attenuator engages, not the
+absolute floor. Root cause in `paramkit/achievable.py` (imported by `agent/calibration.py` resolver
+AND `paramkit/calkit.py` transmit fold; mirrored verbatim to `sdr-client/state/achievable.py`):
+`AchievableGrid._gain_points` clamped the SDR gain floor to the engagement-threshold gain `_g_thr`,
+and `realize`/bounds clamped the target to `_thr − _span`, so the floor was `P_base(_g_thr) −
+max_atten` rather than `P_base(min_gain) − max_atten`. Fix: the achievable SET spans the whole SDR
+grid to min gain (`_gain_points` floors at `_lo_g`; `realize` clamps at `_s_lo − _span`); the
+threshold only steers `realize`'s (gain, reduction) choice — ABOVE it least-reduction (SDR-first,
+attenuator at rest), and once the attenuator is MAXED the SDR drops below the threshold (most-
+reduction) to extend the low end. So the floor is `SDR@min_gain + attenuator@max` for every
+`engage_pct`, and the engaged region still holds the SDR at the threshold. `paramkit/achievable.py`
+and `sdr-client/state/achievable.py` kept byte-identical (manual mirror). No capability/version
+change (a resolver correctness fix; the resolved `min_power_dbm` just becomes correct). Tests:
+`tests/test_calibration_active.py`, `tests/test_achievable_grid.py` (min independent of engage_pct;
+SDR drops below the threshold once the attenuator is maxed); client `tests/test_power_fold.py`.
+
 ## Current state — opt-in measured-curve extrapolation: COMPLETE (branch `claude/calibration-extrapolate`)
 A signal's measured curve may set `extrapolate: down|up|both` (default `none`) on its curve entry
 (`signals.<id>.curves.<plane>.extrapolate`) to continue the end-segment slope past the measured gain

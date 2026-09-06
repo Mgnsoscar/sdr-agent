@@ -88,9 +88,15 @@ def test_no_active_threshold_gain_robust_to_inverse_float_noise():
 
 def test_engage_threshold_keeps_sdr_higher_with_odd_steps():
     g = _grid(1.0, 0.3, engage_pct=50.0)              # threshold at −20 dBm
-    assert g.bounds()[0] == pytest.approx(-50.0)      # −20 − 30
+    # The engagement threshold steers the SDR-vs-attenuator split, not the range: the floor is
+    # still min gain + full attenuation (−40 − 30), independent of engage_pct.
+    assert g.bounds()[0] == pytest.approx(-70.0)
     r = g.realize(-35.0)
-    assert r["sdr_gain_db"] == pytest.approx(20.0)    # SDR pinned at the threshold gain
+    assert r["sdr_gain_db"] == pytest.approx(20.0)    # engaged region: SDR held at the threshold
+    # Below the engaged region the attenuator is maxed and the SDR drops below the threshold.
+    r = g.realize(-65.0)
+    assert r["applied"][0] == pytest.approx(-30.0)    # attenuator fully engaged (−30 dB)
+    assert r["sdr_gain_db"] == pytest.approx(5.0)     # SDR below the 20 dB threshold gain
 
 
 def test_threshold_gain_is_robust_to_inverse_float_noise():

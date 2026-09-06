@@ -10,7 +10,9 @@ computes:
   * ``snap`` — the nearest power the whole chain can actually produce;
   * ``realize`` — the device settings that produce it (SDR gain + each component's applied
     gain), SDR-first: keep the components at rest so the SDR carries the signal down to an
-    engagement threshold, below which the SDR is pinned and the components fill the rest;
+    engagement threshold, at which the SDR is held and the components engage to fill the rest;
+    once the components are MAXED the SDR resumes dropping below the threshold, so the components
+    EXTEND the low end rather than cap it (the threshold sets WHEN they engage, not the range);
   * ``quantize_up``/``quantize_down`` — the next/previous achievable level (non-uniform).
 
 The model: ``P = P_base(g) − R`` where ``P_base(g)`` is the delivered power with the SDR at
@@ -153,12 +155,15 @@ class AchievableGrid:
 
     # ── candidate SDR gains ────────────────────────────────────────────────────────
     def _gain_points(self, g_a, g_b):
-        """Grid gains in ``[g_a, g_b]`` (clamped to the usable range), inclusive."""
-        g_a = min(max(g_a, self._g_thr), self._hi_g)
-        g_b = min(max(g_b, self._g_thr), self._hi_g)
+        """Grid gains in ``[g_a, g_b]`` (clamped to the usable range), inclusive. The SDR may use
+        its WHOLE grid down to min gain — the engagement threshold only steers realize()'s choice
+        of (gain, reduction), it does NOT restrict the achievable set: below the threshold the
+        components run to their max and the SDR keeps dropping, which is what extends the low end."""
+        g_a = min(max(g_a, self._lo_g), self._hi_g)
+        g_b = min(max(g_b, self._lo_g), self._hi_g)
         if not self._step:
             return {g_a, g_b}
-        out = {self._g_thr, self._hi_g}
+        out = {self._lo_g, self._g_thr, self._hi_g}
         g, n = g_a, 0
         while g <= g_b + _EPS and n < _SCAN_CAP:
             out.add(round(g, 6)); g += self._step; n += 1
@@ -170,9 +175,13 @@ class AchievableGrid:
         ``{power_dbm, sdr_gain_db, applied}`` — the nearest ACHIEVABLE power and the device
         settings that produce it. Every SDR grid gain whose baseline could trim down to the
         target is tried (so a value between the SDR's coarse grid points is reached by nudging
-        the SDR up and trimming with the components), and among equally-near options the one
-        with the LEAST reduction wins (SDR-first — components nearest rest)."""
-        target = min(max(float(power), self._thr - self._span), self._s_hi)
+        the SDR up and trimming with the components). The engagement threshold decides WHEN the
+        components are used, not the range: ABOVE the threshold the least-reduction option wins
+        (SDR-first, components nearest rest); once the components are MAXED the SDR is allowed to
+        drop BELOW the threshold to extend the low end, and there the fully-engaged option wins."""
+        # The floor is the SDR at min gain with the components fully engaged (not the threshold
+        # gain — the components extend the range below it, they don't cap it).
+        target = min(max(float(power), self._s_lo - self._span), self._s_hi)
         # Gains whose baseline power sits in [target, target+span] can trim down to target;
         # the floor/ceil brackets cover the exact-target and undershoot cases.
         g_lo = self._grid(self._gfp(target - self._sum_hi), "floor")
@@ -186,7 +195,14 @@ class AchievableGrid:
             else:                                    # undershoots; can't trim upward
                 red, applied = 0.0, [a.applied_hi for a in self._act]
             achieved = pb - red
-            key = (round(abs(achieved - target), 6), round(red, 6))
+            # Prefer keeping the SDR at/above the engagement threshold (so the components engage
+            # there and the SDR isn't dropped early); only go below it when the components can't
+            # cover the target on their own. Above the threshold: least reduction (SDR-first).
+            # Below it (components maxed): most reduction, so the SDR is only lowered as far as the
+            # fully-engaged components still require.
+            below = g < self._g_thr - _EPS
+            sub = (self._span - red) if below else red
+            key = (round(abs(achieved - target), 6), 1 if below else 0, round(sub, 6))
             if best is None or key < best[0]:
                 best = (key, g, achieved, applied)
         _, g, achieved, applied = best
