@@ -55,6 +55,20 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Planned — Hold step (operator-gated sequence pause): DESIGN AGREED, building in phases
+Design doc lives in the client repo: **`sdr-client/docs/sequence-hold-step.md`** (cross-repo spec +
+owner decisions + a self-contained Phase 0 checklist in Appendix A). A new **Hold** sequence step
+pauses a running sequence at the hold, holding state exactly, until the operator proceeds (the GNSS
+loss-of-lock/reacquire test with an unknown 2–10 min receiver-restart wait). **Runtime is here:**
+`agent/sequence_runner.py` (the two-anchor tick-loop runner) + `agent/models.py`. The Hold is a
+**third anchor** (`anchor="hold"`) splitting a run into window A (fixed at arm) and window B (resolved
+only at **proceed**, relative to the resume instant), reusing the runner's existing `open_ended` runs,
+`patch_on_air_end`, and per-run step overrides. v1 is **single-unit, operator-present (Library) only,
+and a no-op in the schedule** (a `hold_aware` arm is refused on the scheduled surface). **Phase 0**
+(next): `StepAction.HOLD`, `SequenceState.HOLDING`, the `SequenceRun`/`ArmSequenceRequest` fields,
+`_validate_steps` rules (exactly one HOLD), a temporary arm-guard, and a new `sequence-hold`
+capability with an `AGENT_VERSION` bump — data-model only, zero behavior change. See Appendix A.
+
 ## Current state — attenuator engagement no longer caps the minimum power: COMPLETE (branch `claude/table-and-ramp-fixes`, cross-repo)
 Bug: a signal's minimum achievable power tracked a programmable attenuator's `engage_pct` (lower
 engagement → lower min). The engagement % should decide only WHEN the attenuator engages, not the
