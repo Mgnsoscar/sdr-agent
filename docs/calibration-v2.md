@@ -600,7 +600,7 @@ and `test_calibration_active`, `test_active_autocommand` (agent).
 ## 13. Reported & limiting power — quantity BRIDGES
 
 Some signals are naturally measured in one power quantity but must be *reported* in another,
-and *safety-limited* in a third. A chirp is measured as a spectral **density** (dBm/MHz); the
+and *safety-limited* in a third. A chirp is measured as a spectral **density** (dBm/Hz); the
 operator wants to set its **full-bandwidth (total) power** (dBm), and the amplifier must be
 protected against that same total power. A comb is measured as **total** power but reported as
 **per-tooth peak**. A PRN's main-lobe peak converts to total by a code-type constant.
