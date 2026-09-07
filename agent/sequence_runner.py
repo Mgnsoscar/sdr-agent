@@ -39,7 +39,7 @@ from . import ramp
 from .log_manager import LogManager
 from .models import (
     ArmSequenceRequest, CreateSequenceRequest, Sequence, SequenceRun,
-    SequenceState, SequenceStep, StepFire, StepOverride,
+    SequenceState, SequenceStep, StepAction, StepFire, StepOverride,
     SequenceWebhook,
 )
 from .process_manager import ProcessManager
@@ -63,6 +63,11 @@ def _parse(ts: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _step_action(s: SequenceStep) -> str:
+    """The step's action as a plain string (tolerating a str or the StepAction enum)."""
+    return s.action.value if hasattr(s.action, "value") else str(s.action)
 
 
 def _spans_overlap(a_start: datetime, a_end: Optional[datetime],
@@ -189,13 +194,33 @@ class SequenceRunner:
     def _validate_steps(self, steps: List[SequenceStep]) -> None:
         if not steps:
             raise ValueError("sequence must have at least one step")
-        # All referenced tasks must exist on this unit
+        # ── Hold rules (docs/sequence-hold-step.md §5.1, structural only) ────────
+        # Exactly one HOLD per sequence in v1: zero = a normal sequence, ≥2 rejected.
+        # A HOLD is a boundary MARKER — it names no task and carries no work — that
+        # splits the run into window A (start-anchored) and window B (anchor="hold"
+        # + stop-anchored). Phase 0 validates the shape only; the holding runtime is
+        # Phase 1 (and arm() refuses a Hold-bearing sequence until then).
+        holds = [s for s in steps if _step_action(s) == "hold"]
+        if len(holds) > 1:
+            raise ValueError("a sequence may contain at most one HOLD step")
+        has_hold = bool(holds)
         for s in steps:
+            action = _step_action(s)
+            if action == "hold":
+                # A HOLD is a pure boundary at the end of window A: no task, no work.
+                if s.anchor != "start":
+                    raise ValueError("a HOLD step must be anchored to 'start' (it ends window A)")
+                if s.args or s.params or s.ramp is not None:
+                    raise ValueError("a HOLD step is a boundary marker and takes no args/params/ramp")
+                continue
+            # All non-HOLD steps reference a real task on this unit.
             if not self._manager.has_task(s.task_name):
                 raise ValueError(f"unknown task in step: '{s.task_name}'")
-            action = s.action.value if hasattr(s.action, "value") else str(s.action)
-            if s.anchor not in ("start", "stop", "both"):
-                raise ValueError(f"step anchor must be 'start', 'stop' or 'both', got '{s.anchor}'")
+            if s.anchor not in ("start", "stop", "both", "hold"):
+                raise ValueError(
+                    f"step anchor must be 'start', 'stop', 'both' or 'hold', got '{s.anchor}'")
+            if s.anchor == "hold" and not has_hold:
+                raise ValueError("an anchor='hold' step requires a HOLD marker in the sequence")
             if s.anchor == "both" and action != "ramp":
                 raise ValueError("only a ramp step can be anchored to both edges")
             if action == "ramp":
@@ -212,6 +237,19 @@ class SequenceRunner:
                                           include_last=s.ramp.include_last)
                 except ValueError as exc:
                     raise ValueError(f"ramp step for '{s.task_name}': {exc}")
+        # Position: the HOLD ends window A, so every OTHER start-anchored step must
+        # fire at or before it (start and stop offsets live on different clocks, so
+        # this start-side check is the well-defined one; window-B steps take anchor
+        # 'hold'/'stop' and are after the hold by construction).
+        if has_hold:
+            hold = holds[0]
+            for s in steps:
+                if s is hold:
+                    continue
+                if s.anchor == "start" and s.offset_s > hold.offset_s:
+                    raise ValueError(
+                        "a start-anchored step is scheduled after the HOLD; window A "
+                        "(pre-hold) must complete before the hold")
         # Must have an on-air start (a start-anchored action at offset 0 is the
         # conventional T0 action, but we don't force it — we just require that
         # there's at least one start-anchored and one stop-anchored step so the
@@ -473,6 +511,15 @@ class SequenceRunner:
             eff_steps = list(req.steps)
         else:
             eff_steps = seq.steps
+
+        # Phase-0 guard (docs/sequence-hold-step.md Appendix A.2.3): a Hold-bearing
+        # sequence is not yet EXECUTABLE. The holding runtime — arm resolves window A
+        # only, _tick enters HOLDING, proceed resolves window B from T_resume, the
+        # max_hold deadman — all land in Phase 1. Until then, refuse to arm one rather
+        # than run it half-built. REMOVE THIS GUARD IN PHASE 1. (Every arm of a
+        # sequence with no HOLD is untouched.)
+        if any(_step_action(s) == "hold" for s in eff_steps):
+            raise ValueError("Hold steps are not yet executable (Phase 1)")
 
         on_air_at  = _parse(req.on_air_at)
         now = _utcnow_dt()

@@ -260,6 +260,10 @@ class StepAction(str, Enum):
     RUN   = "run"     # fire-and-exit one-shot: launch, let it self-terminate, no stop
     TUNE  = "tune"    # retune a running task's live parameters (see SequenceStep.params)
     RAMP  = "ramp"    # sweep one live parameter over time (expands to many tunes; see RampSpec)
+    HOLD  = "hold"    # operator-gated pause marker: a boundary step (no task work) that
+                      # splits a sequence into window A (pre-hold) and window B (post-hold,
+                      # anchor="hold"). Holding BEHAVIOR is Phase 1; Phase 0 is data model
+                      # + validation only. See docs/sequence-hold-step.md.
 
 
 class RampSpec(BaseModel):
@@ -301,8 +305,12 @@ class SequenceStep(BaseModel):
     anchor = "stop":  offset_s is measured from on-air STOP. The amplifier-off
                       step is offset 0 here; cool-down steps use positive
                       offsets and move automatically when the stop is extended.
+    anchor = "hold":  offset_s is measured from the resume instant (T_resume) of a
+                      Hold. Window-B steps take this anchor; only valid when the
+                      sequence has exactly one StepAction.HOLD marker. Resolution at
+                      proceed is Phase 1 — Phase 0 only validates the shape.
     """
-    anchor: str = "start"              # "start" | "stop" | "both" (ramp filling the window)
+    anchor: str = "start"              # "start" | "stop" | "both" (ramp) | "hold" (post-Hold window B)
     offset_s: float                    # relative to the chosen anchor (on-air side for "both")
     # For a "both"-anchored ramp: the off-air-side inset (≤ 0 = before off-air). The
     # ramp fills [on-air + offset_s, off-air + offset_end_s]. Ignored otherwise.
@@ -350,6 +358,8 @@ class CreateSequenceRequest(BaseModel):
 class SequenceState(str, Enum):
     ARMED     = "armed"        # waiting for the first step to fire
     RUNNING   = "running"      # at least one step has fired, not yet finished
+    HOLDING   = "holding"      # parked at a Hold, RF live, awaiting operator proceed
+                               # (Phase 1 runtime; Phase 0 only defines the state)
     COMPLETED = "completed"    # all steps fired normally
     CANCELLED = "cancelled"    # cancelled before first step
     ABORTED   = "aborted"      # stopped early (reboot mid-run, manual abort, panic)
@@ -391,6 +401,15 @@ class SequenceRun(BaseModel):
     # Plan stamp — lets any GUI regroup runs into their plan after a restart/swap.
     plan_id: str = ""
     plan_name: str = ""
+    # ── Hold step (docs/sequence-hold-step.md) ────────────────────────────────
+    # All defaulted so runs persisted before this feature deserialize unchanged.
+    # Phase 0 defines the fields; the holding runtime that populates them is Phase 1.
+    hold_at_offset_s: Optional[float] = None  # window-A end offset (the hold's position from T0)
+    held_actual: Optional[str] = None         # wall-clock (UTC ISO) HOLDING was entered
+    resumed_actual: Optional[str] = None       # wall-clock (UTC ISO) the operator proceeded
+    hold_aware: bool = False           # True only for an interactive (Library) arm; False =
+                                       # today's behavior (the Hold is a no-op / compiled out)
+    max_hold_s: float = 1800.0         # auto-abort deadman while HOLDING; 0 = unlimited (30-min default)
 
 
 class StepOverride(BaseModel):
@@ -438,11 +457,31 @@ class ArmSequenceRequest(BaseModel):
     # stored sequence's own steps are used. Any step_overrides still apply on top,
     # addressed by index into these steps.
     steps: Optional[list[SequenceStep]] = None
+    # ── Hold step (docs/sequence-hold-step.md) ────────────────────────────────
+    # hold_aware makes a Hold real: True only for the interactive (Library) arm,
+    # where execution pauses at the Hold and awaits the operator. False (the
+    # default) is today's behavior exactly — the scheduled/plan path never sets it,
+    # so the agent never enters HOLDING. (Phase 0 carries the fields; the holding
+    # runtime and the scheduled-surface rejection are Phase 1.)
+    hold_aware: bool = False
+    max_hold_s: float = 1800.0         # auto-abort deadman while HOLDING; 0 = unlimited
 
 
 class PatchSequenceRunRequest(BaseModel):
     """Body for PATCH /sequence-runs/{id} — move the on-air STOP to a new absolute UTC time."""
     on_air_end: str                    # UTC ISO-8601
+
+
+class ProceedRequest(BaseModel):
+    """Body for the (Phase 1) POST /sequence-runs/{id}/proceed — resume a HOLDING run.
+
+    proceed_at is the operator's chosen resume instant (absolute UTC ISO-8601); window B
+    is resolved relative to it. steps, if given, is the edited window-B step list sent by
+    edit-while-holding (it replaces the run's stored window-B definitions for this run
+    only, exactly like ArmSequenceRequest.steps). Defined now so the model is stable;
+    the proceed endpoint and resolution land in Phase 1 (docs/sequence-hold-step.md §5.3)."""
+    proceed_at: str                    # UTC ISO-8601 — the resume instant (T_resume)
+    steps: Optional[list[SequenceStep]] = None
 
 
 class SequenceWebhook(BaseModel):

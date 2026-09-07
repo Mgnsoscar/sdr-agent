@@ -285,7 +285,12 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # for every engage_pct, and the engagement % only steers WHEN the attenuator engages (paramkit/
 # achievable.py, mirrored to sdr-client/state/achievable.py). The version bump lets the OTA/"Update
 # agent…" flow push the corrected resolver onto already-deployed units.
-AGENT_VERSION = "1.15.1"
+# 1.16.0 adds the "sequence-hold" capability (below): the Hold-step data model + validation vocabulary
+# (StepAction.HOLD, SequenceState.HOLDING, anchor="hold", the SequenceRun/ArmSequenceRequest fields).
+# Phase 0 is data-model only — a Hold-bearing sequence can be stored/round-tripped but is refused at
+# arm ("not yet executable (Phase 1)"). A new capability ⇒ a minor bump; it is a safety gate so the
+# client won't offer Hold authoring/arming to an agent that can't run it (docs/sequence-hold-step.md).
+AGENT_VERSION = "1.16.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -368,6 +373,15 @@ AGENT_CAPABILITIES = [
                                          # wasn't measured. Gain is still clamped to the ceiling.
                                          # A ≤1.14.0 agent clamps instead, so the client's wider
                                          # range wouldn't match what the unit delivers — a gate
+    "sequence-hold",                     # a sequence may contain a HOLD step (StepAction.HOLD +
+                                         # anchor="hold" window-B steps): an operator-gated pause
+                                         # that parks a run at the hold (RF live) until the operator
+                                         # proceeds. Phase 0 is the data model + validation only (a
+                                         # Hold-bearing sequence stores/round-trips but is refused at
+                                         # arm); the holding runtime is Phase 1. The client gates Hold
+                                         # authoring/arming on this string so it never offers the
+                                         # feature to an agent that can't run it (a safety gate —
+                                         # docs/sequence-hold-step.md)
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

@@ -27,8 +27,9 @@ the drift guard is pytest-only.
 - **Capabilities + version:** a new client-visible feature adds a string to
   `AGENT_CAPABILITIES` and bumps `AGENT_VERSION` (both in `agent/config.py`); `test_meta_endpoint.py`
   asserts the capability set. The client feature-gates on these exact strings. Current version is
-  in `config.py` (`1.15.1`: a resolver correctness fix — attenuator `engage_pct` no longer caps the
-  minimum achievable power — pushed via OTA; no new capability).
+  in `config.py` (`1.16.0`: adds the `sequence-hold` capability — the Hold-step data-model vocabulary,
+  Phase 0; a Hold-bearing sequence stores/validates but is refused at arm; the holding runtime is
+  Phase 1).
 
 ## Where things live
 - `agent/calibration.py` (~1.7k lines) — the **calibration resolver**. `resolve(unit_doc, …,
@@ -55,19 +56,34 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
-## Planned — Hold step (operator-gated sequence pause): DESIGN AGREED, building in phases
+## Current state — Hold step Phase 0 (data model): COMPLETE (branch `claude/hold-step-phase-0-wwwxf7`, cross-repo)
 Design doc lives in the client repo: **`sdr-client/docs/sequence-hold-step.md`** (cross-repo spec +
 owner decisions + a self-contained Phase 0 checklist in Appendix A). A new **Hold** sequence step
 pauses a running sequence at the hold, holding state exactly, until the operator proceeds (the GNSS
-loss-of-lock/reacquire test with an unknown 2–10 min receiver-restart wait). **Runtime is here:**
-`agent/sequence_runner.py` (the two-anchor tick-loop runner) + `agent/models.py`. The Hold is a
-**third anchor** (`anchor="hold"`) splitting a run into window A (fixed at arm) and window B (resolved
-only at **proceed**, relative to the resume instant), reusing the runner's existing `open_ended` runs,
-`patch_on_air_end`, and per-run step overrides. v1 is **single-unit, operator-present (Library) only,
-and a no-op in the schedule** (a `hold_aware` arm is refused on the scheduled surface). **Phase 0**
-(next): `StepAction.HOLD`, `SequenceState.HOLDING`, the `SequenceRun`/`ArmSequenceRequest` fields,
-`_validate_steps` rules (exactly one HOLD), a temporary arm-guard, and a new `sequence-hold`
-capability with an `AGENT_VERSION` bump — data-model only, zero behavior change. See Appendix A.
+loss-of-lock/reacquire test with an unknown 2–10 min receiver-restart wait). The Hold is a **third
+anchor** (`anchor="hold"`) splitting a run into window A (fixed at arm) and window B (resolved only at
+**proceed**, relative to the resume instant); v1 is **single-unit, operator-present (Library) only,
+and a no-op in the schedule**. Phase 0 adds the Hold's *shape* + structural rules only — **zero
+behavior change**, a Hold-bearing sequence stores/validates/round-trips but **cannot be armed** (a
+temporary guard removed in Phase 1). Shipped in `agent/`:
+- **`models.py`** — `StepAction.HOLD`, `SequenceState.HOLDING`; `SequenceRun` gains `hold_at_offset_s`,
+  `held_actual`, `resumed_actual`, `hold_aware=False`, `max_hold_s=1800.0` (0 = unlimited);
+  `ArmSequenceRequest` gains `hold_aware`/`max_hold_s`; a new `ProceedRequest{proceed_at, steps?}`
+  (defined for Phase 1, no endpoint yet). `SequenceStep.anchor` now also accepts `"hold"` (a HOLD
+  marker itself is `anchor="start"`, `task_name=""`, no args/params/ramp).
+- **`sequence_runner.py`** — `_validate_steps` (via a `_step_action` helper) accepts `anchor="hold"`,
+  enforces **exactly one HOLD** (0 = normal, ≥2 rejected), a HOLD that is `anchor="start"` at the end
+  of window A (no other start-anchored step may have a larger offset) carrying no args/params/ramp,
+  and `anchor="hold"` only when a HOLD exists. A **temporary Phase-0 guard in `arm`** refuses any
+  Hold-bearing `eff_steps` with `"Hold steps are not yet executable (Phase 1)"` (**remove in Phase 1**).
+- **`config.py`** — `AGENT_VERSION` `1.15.1 → 1.16.0`; `"sequence-hold"` added to `AGENT_CAPABILITIES`
+  (a safety gate: the client won't offer Hold authoring/arming to an agent that can't run it).
+Tests: `tests/test_sequence_hold_model.py` (model defaults, validation good/bad cases, the arm guard,
+a non-Hold regression) + a `"sequence-hold"` assertion in `test_meta_endpoint.py`; suite 398 → 415.
+**NEXT — Phase 1** (runtime): remove the arm guard; arm resolves window A only, `_tick` enters
+HOLDING at the hold offset, `proceed` resolves window B from `T_resume` (reusing `_resolve_steps` with
+`hold`-anchored steps based at `T_resume`), `sequence_hold`/`sequence_proceed` events, restart-abort +
+the `max_hold_s` deadman. See the design doc §5 + §13.
 
 ## Current state — attenuator engagement no longer caps the minimum power: COMPLETE (branch `claude/table-and-ramp-fixes`, cross-repo)
 Bug: a signal's minimum achievable power tracked a programmable attenuator's `engage_pct` (lower
