@@ -410,6 +410,10 @@ class SequenceRun(BaseModel):
     hold_aware: bool = False           # True only for an interactive (Library) arm; False =
                                        # today's behavior (the Hold is a no-op / compiled out)
     max_hold_s: float = 1800.0         # auto-abort deadman while HOLDING; 0 = unlimited (30-min default)
+    # Window B (post-hold) step DEFINITIONS, stored at a hold-aware arm and resolved to
+    # absolute fire times only at proceed (relative to the resume instant). Empty for a
+    # normal run. Persisted so a proceed survives the run being reloaded.
+    window_b_steps: list[SequenceStep] = []
 
 
 class StepOverride(BaseModel):
@@ -486,7 +490,7 @@ class ProceedRequest(BaseModel):
 
 class SequenceWebhook(BaseModel):
     """Event emitted on the SSE stream on sequence-run lifecycle transitions."""
-    type: str                          # sequence_started | sequence_on_air | sequence_step | sequence_off_air | sequence_stopped | sequence_aborted | sequence_modified
+    type: str                          # sequence_started | sequence_on_air | sequence_step | sequence_off_air | sequence_stopped | sequence_aborted | sequence_modified | sequence_hold | sequence_proceed | sequence_hold_timeout
     unit_id: str
     run_id: str
     sequence_name: str

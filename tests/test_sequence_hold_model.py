@@ -1,9 +1,13 @@
-"""Phase 0 of the Hold step (docs/sequence-hold-step.md, Appendix A): the data-model
-vocabulary + structural validation + the temporary arm guard. NO holding behavior yet —
-a Hold-bearing sequence can be created/stored/validated but is refused at arm time.
+"""The Hold step DATA MODEL + structural validation (docs/sequence-hold-step.md §5.1).
+
+Covers the vocabulary (StepAction.HOLD, SequenceState.HOLDING, the SequenceRun/
+ArmSequenceRequest fields, ProceedRequest) and the _validate_steps rules. The arm-time
+GATE lives here too: a Hold-bearing sequence must be armed hold_aware, else it is refused
+(the scheduled path compiles the Hold out client-side). The holding RUNTIME itself — park
+at the hold, proceed, the deadman, restart-abort — is exercised in test_sequence_hold_runtime.py.
 
 The validation rules (SequenceRunner._validate_steps) are pure/synchronous, so most tests
-call them directly; the arm guard and the non-Hold regression run through the async arm().
+call them directly; the arm gate and the non-Hold regression run through the async arm().
 """
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -192,36 +196,37 @@ def test_validate_rejects_stray_hold_anchor_without_a_hold(tmp_path):
         _runner(tmp_path)._validate_steps(steps)
 
 
-# ── The temporary Phase-0 arm guard, and the non-Hold regression ─────────────
+# ── The arm-time gate (a Hold must be armed hold_aware), and the non-Hold regression ─
 
-def test_arming_a_hold_sequence_is_refused_in_phase_0(tmp_path):
+def test_non_hold_aware_arm_of_a_hold_sequence_is_refused(tmp_path):
+    # The safety gate (docs §7): the agent refuses to run a Hold un-held. The scheduled
+    # path compiles the Hold out client-side; a raw non-hold-aware arm is rejected.
     async def scenario():
         runner = _runner(tmp_path)
         seq = await runner.create_sequence(CreateSequenceRequest(
             name="hold-run", steps=_valid_hold_steps()))
         now = datetime.now(timezone.utc)
-        with pytest.raises(ValueError, match="not yet executable"):
+        with pytest.raises(ValueError, match="contains a Hold"):
             await runner.arm(
                 seq.id,
                 ArmSequenceRequest(on_air_at=(now + timedelta(seconds=60)).isoformat(),
-                                   open_ended=True, hold_aware=True),
+                                   open_ended=True),           # hold_aware defaults False
                 None,
             )
-        # Nothing was armed.
-        assert runner.list_runs() == []
+        assert runner.list_runs() == []                        # nothing armed
 
     asyncio.run(scenario())
 
 
-def test_arming_the_guard_also_covers_per_run_step_lists(tmp_path):
-    # A plan may pass a Hold-bearing step list via ArmSequenceRequest.steps; the guard
+def test_arm_gate_also_covers_per_run_step_lists(tmp_path):
+    # A plan may pass a Hold-bearing step list via ArmSequenceRequest.steps; the gate
     # must fire on eff_steps, not just the stored sequence.
     async def scenario():
         runner = _runner(tmp_path)
         seq = await runner.create_sequence(CreateSequenceRequest(
             name="plain", steps=_normal_steps()))
         now = datetime.now(timezone.utc)
-        with pytest.raises(ValueError, match="not yet executable"):
+        with pytest.raises(ValueError, match="contains a Hold"):
             await runner.arm(
                 seq.id,
                 ArmSequenceRequest(on_air_at=(now + timedelta(seconds=60)).isoformat(),

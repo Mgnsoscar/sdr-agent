@@ -285,12 +285,15 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # for every engage_pct, and the engagement % only steers WHEN the attenuator engages (paramkit/
 # achievable.py, mirrored to sdr-client/state/achievable.py). The version bump lets the OTA/"Update
 # agent…" flow push the corrected resolver onto already-deployed units.
-# 1.16.0 adds the "sequence-hold" capability (below): the Hold-step data model + validation vocabulary
+# 1.16.0 added the "sequence-hold" capability (below): the Hold-step data model + validation vocabulary
 # (StepAction.HOLD, SequenceState.HOLDING, anchor="hold", the SequenceRun/ArmSequenceRequest fields).
-# Phase 0 is data-model only — a Hold-bearing sequence can be stored/round-tripped but is refused at
-# arm ("not yet executable (Phase 1)"). A new capability ⇒ a minor bump; it is a safety gate so the
-# client won't offer Hold authoring/arming to an agent that can't run it (docs/sequence-hold-step.md).
-AGENT_VERSION = "1.16.0"
+# Phase 0 was data-model only — a Hold-bearing sequence stored/round-tripped but was refused at arm.
+# 1.17.0 ships the Phase-1 HOLDING RUNTIME behind that same capability: a hold-aware arm resolves only
+# window A and parks the run at the hold (SequenceState.HOLDING, RF live); POST /sequence-runs/{id}/
+# proceed resolves window B from the resume instant; a max_hold_s deadman auto-aborts; a HOLDING run is
+# abort-on-restart. The capability set is unchanged, but the version bump lets the OTA/"Update agent…"
+# flow push the working runtime onto units still on 1.16.0 (docs/sequence-hold-step.md §5).
+AGENT_VERSION = "1.17.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list

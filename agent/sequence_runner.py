@@ -38,7 +38,7 @@ from typing import Dict, List, Optional, Tuple
 from . import ramp
 from .log_manager import LogManager
 from .models import (
-    ArmSequenceRequest, CreateSequenceRequest, Sequence, SequenceRun,
+    ArmSequenceRequest, CreateSequenceRequest, ProceedRequest, Sequence, SequenceRun,
     SequenceState, SequenceStep, StepAction, StepFire, StepOverride,
     SequenceWebhook,
 )
@@ -48,6 +48,13 @@ from .sequence_log import RunLog
 logger = logging.getLogger(__name__)
 
 _TICK_SECONDS = 0.25
+
+# States in which a run is LIVE — it occupies the single TX channel: armed (about to
+# fire), running, or parked at a Hold with RF on. Used by the active-run guards
+# (delete / arm-overlap / panic / abort-all). Note the tick loop's fire-eligibility is
+# deliberately NARROWER — (ARMED, RUNNING) — because a HOLDING run is parked and fires
+# nothing until the operator proceeds.
+_ACTIVE_STATES = (SequenceState.ARMED, SequenceState.RUNNING, SequenceState.HOLDING)
 
 
 def _utcnow_dt() -> datetime:
@@ -296,11 +303,9 @@ class SequenceRunner:
     async def delete_sequence(self, seq_id: str) -> None:
         if seq_id not in self._sequences:
             raise KeyError(f"Unknown sequence: '{seq_id}'")
-        # Refuse to delete if an armed/running run references it
+        # Refuse to delete if an armed/running/holding run references it
         for run in self._runs.values():
-            if run.sequence_id == seq_id and run.state in (
-                SequenceState.ARMED, SequenceState.RUNNING
-            ):
+            if run.sequence_id == seq_id and run.state in _ACTIVE_STATES:
                 raise ValueError("cannot delete a sequence with an active run")
         async with self._lock:
             del self._sequences[seq_id]
@@ -308,8 +313,8 @@ class SequenceRunner:
         logger.info("Sequence %s deleted", seq_id)
 
     def _has_active_run(self, seq_id: str) -> bool:
-        return any(r.sequence_id == seq_id and r.state in (
-            SequenceState.ARMED, SequenceState.RUNNING) for r in self._runs.values())
+        return any(r.sequence_id == seq_id and r.state in _ACTIVE_STATES
+                   for r in self._runs.values())
 
     async def apply_sequences(self, sequences: List[Sequence], prune: bool):
         """Converge this unit's sequences to `sequences`, PRESERVING their ids so
@@ -366,6 +371,31 @@ class SequenceRunner:
         return start, end
 
     @staticmethod
+    def _split_hold_windows(
+        steps: List[SequenceStep],
+    ) -> Tuple[List[SequenceStep], List[SequenceStep], Optional[float]]:
+        """Split a Hold-bearing sequence into (window_A, window_B, hold_offset).
+
+        Window A = start/both-anchored work (the HOLD marker is dropped — it fires
+        nothing). Window B = the hold-/stop-anchored steps, deferred until proceed.
+        hold_offset is the HOLD marker's offset from T0 (None if there is no Hold —
+        the caller only uses this in hold mode). Structure is already validated by
+        _validate_steps, so exactly one HOLD is assumed here.
+        """
+        window_a: List[SequenceStep] = []
+        window_b: List[SequenceStep] = []
+        hold_offset: Optional[float] = None
+        for s in steps:
+            if _step_action(s) == "hold":
+                hold_offset = s.offset_s
+                continue          # the marker itself is not an executable step
+            if s.anchor in ("hold", "stop"):
+                window_b.append(s)
+            else:                 # "start" / "both"
+                window_a.append(s)
+        return window_a, window_b, hold_offset
+
+    @staticmethod
     def _validate_overrides(
         steps: List[SequenceStep], overrides: List[StepOverride],
     ) -> Dict[int, StepOverride]:
@@ -392,12 +422,17 @@ class SequenceRunner:
         self, steps: List[SequenceStep], on_air_at: datetime,
         on_air_end: Optional[datetime], resume_offset_s: float,
         open_ended: bool = False, overrides: Optional[Dict[int, StepOverride]] = None,
+        hold_at: Optional[datetime] = None,
     ) -> List[StepFire]:
         """
-        Compute absolute fire times for every step around the two anchors.
+        Compute absolute fire times for every step around the anchors.
         If open_ended is True, stop-anchored steps are skipped entirely — the run
         fires only the start-anchored (warm-up + on-air-start) steps and stays
         on-air until aborted. on_air_end may be None in that case.
+
+        hold_at (the resume instant, T_resume) is the base for anchor="hold" steps —
+        window B, resolved only at proceed (docs/sequence-hold-step.md §5.3). A HOLD
+        MARKER step (action="hold") is a pure boundary and produces no fire.
 
         overrides maps a step's index (its position in `steps`) to a StepOverride
         whose args/replace_args replace the step's — so a plan can run a sequence
@@ -408,10 +443,16 @@ class SequenceRunner:
         fires: List[StepFire] = []
         for i, s in enumerate(steps):
             action = s.action.value if hasattr(s.action, "value") else str(s.action)
+            if action == "hold":
+                continue   # the Hold boundary marker itself never fires (no task work)
             if action == "ramp":
-                fires.extend(self._resolve_ramp(s, on_air_at, on_air_end, open_ended))
+                fires.extend(self._resolve_ramp(s, on_air_at, on_air_end, open_ended, hold_at))
                 continue
-            if s.anchor == "stop":
+            if s.anchor == "hold":
+                if hold_at is None:
+                    continue   # window B is unresolved until proceed supplies T_resume
+                base = hold_at
+            elif s.anchor == "stop":
                 if open_ended:
                     continue   # no stop in an open-ended run; abort handles shutdown
                 base = on_air_end
@@ -443,13 +484,18 @@ class SequenceRunner:
         return fires
 
     def _resolve_ramp(self, s: SequenceStep, on_air_at: datetime,
-                      on_air_end: Optional[datetime], open_ended: bool) -> List[StepFire]:
+                      on_air_end: Optional[datetime], open_ended: bool,
+                      hold_at: Optional[datetime] = None) -> List[StepFire]:
         """Expand a RAMP step into a series of `tune` fires. A both-anchored ramp
         fills the on-air window (skipped when the run is open-ended, since there's
-        no window). A bad/under-specified ramp is logged and dropped rather than
-        sinking the whole run."""
+        no window). A hold-anchored ramp (window B) runs FORWARD from the resume
+        instant (hold_at) — the same geometry as a start-anchored ramp, so we reuse
+        place_ramp's forward layout and rebase to hold_at. A bad/under-specified ramp
+        is logged and dropped rather than sinking the whole run."""
         if s.ramp is None:
             return []
+        if s.anchor == "hold" and hold_at is None:
+            return []      # window B is unresolved until proceed supplies T_resume
         r = s.ramp
         window_s = None
         if s.anchor == "both":
@@ -459,18 +505,24 @@ class SequenceRunner:
             # duration is the window minus whatever the insets carve off.
             end_inset = s.offset_end_s or 0.0
             window_s = (on_air_end - on_air_at).total_seconds() - (s.offset_s or 0.0) + end_inset
+        # A hold-anchored ramp runs forward from the resume instant; place it with the
+        # start layout (forward from offset_s) and rebase every point to hold_at below.
+        place_anchor = "start" if s.anchor == "hold" else s.anchor
         try:
             resolved = ramp.resolve_ramp(r.start, r.stop, steps=r.steps, step=r.step, hold_s=r.hold_s,
                                          duration_s=r.duration_s, window_s=window_s,
                                          include_first=r.include_first, include_last=r.include_last)
-            points = ramp.place_ramp(s.anchor, s.offset_s, resolved)
+            points = ramp.place_ramp(place_anchor, s.offset_s, resolved)
         except ValueError as exc:
             logger.error("Ramp step for '%s' could not be resolved: %s", s.task_name, exc)
             return []
         is_run = getattr(r, "mode", "tune") == "run"
         out: List[StepFire] = []
         for fire_anchor, off, value in points:
-            if fire_anchor == "stop":
+            if s.anchor == "hold":
+                base = hold_at            # window B: forward from the resume instant
+                fire_anchor = "hold"      # keep the fire tagged as window B
+            elif fire_anchor == "stop":
                 if open_ended or on_air_end is None:
                     continue
                 base = on_air_end
@@ -512,37 +564,57 @@ class SequenceRunner:
         else:
             eff_steps = seq.steps
 
-        # Phase-0 guard (docs/sequence-hold-step.md Appendix A.2.3): a Hold-bearing
-        # sequence is not yet EXECUTABLE. The holding runtime — arm resolves window A
-        # only, _tick enters HOLDING, proceed resolves window B from T_resume, the
-        # max_hold deadman — all land in Phase 1. Until then, refuse to arm one rather
-        # than run it half-built. REMOVE THIS GUARD IN PHASE 1. (Every arm of a
-        # sequence with no HOLD is untouched.)
-        if any(_step_action(s) == "hold" for s in eff_steps):
-            raise ValueError("Hold steps are not yet executable (Phase 1)")
+        # ── Hold step (docs/sequence-hold-step.md §5.2 + §7) ─────────────────────
+        # A Hold-bearing sequence must be armed hold_aware (the interactive Library
+        # path), OR have the Hold compiled out before arming (the scheduled path does
+        # that client-side). The agent refuses to run a Hold un-held — that would leave
+        # RF live at an indefinite pause the runner does not understand.
+        has_hold = any(_step_action(s) == "hold" for s in eff_steps)
+        if has_hold and not req.hold_aware:
+            raise ValueError(
+                "this sequence contains a Hold; arm it hold_aware (run it from the "
+                "Library), or compile the Hold out for the schedule")
+        hold_mode = has_hold and req.hold_aware
+        if hold_mode and req.step_overrides:
+            raise ValueError("step overrides are not supported with a Hold")
 
         on_air_at  = _parse(req.on_air_at)
         now = _utcnow_dt()
 
-        open_ended = req.open_ended
         on_air_end: Optional[datetime] = None
-        if not open_ended:
-            if not on_air_end_iso:
-                raise ValueError("a fixed-window run requires on_air_end or on_air_duration_s")
-            on_air_end = _parse(on_air_end_iso)
-            if on_air_end <= on_air_at:
-                raise ValueError("on_air_end must be after on_air_at")
-            # Hard block: the on-air window must fit the sequence's fixed-duration
-            # content (e.g. a 60s ramp-up + a 60s ramp-down ⇒ ≥120s).
-            window_s = (on_air_end - on_air_at).total_seconds()
-            min_dur = ramp.min_on_air_duration(eff_steps)
-            if window_s + 1e-6 < min_dur:
-                raise ValueError(
-                    f"on-air window is {window_s:.0f}s but this sequence needs at "
-                    f"least {min_dur:.0f}s (its ramps don't fit)")
+        window_b_defs: List[SequenceStep] = []
+        hold_at_offset_s: Optional[float] = None
+
+        if hold_mode:
+            # Resolve ONLY window A now (start-anchored work up to the hold). Window B
+            # (hold-/stop-anchored) is deferred and resolved at proceed relative to the
+            # resume instant. The run is armed OPEN-ENDED — no scheduled off-air while
+            # it holds — exactly the machinery an open-ended run already uses.
+            window_a_defs, window_b_defs, hold_at_offset_s = self._split_hold_windows(eff_steps)
+            open_ended = True
+            resolve_defs = window_a_defs
+            overrides: Dict[int, StepOverride] = {}
+        else:
+            open_ended = req.open_ended
+            if not open_ended:
+                if not on_air_end_iso:
+                    raise ValueError("a fixed-window run requires on_air_end or on_air_duration_s")
+                on_air_end = _parse(on_air_end_iso)
+                if on_air_end <= on_air_at:
+                    raise ValueError("on_air_end must be after on_air_at")
+                # Hard block: the on-air window must fit the sequence's fixed-duration
+                # content (e.g. a 60s ramp-up + a 60s ramp-down ⇒ ≥120s).
+                window_s = (on_air_end - on_air_at).total_seconds()
+                min_dur = ramp.min_on_air_duration(eff_steps)
+                if window_s + 1e-6 < min_dur:
+                    raise ValueError(
+                        f"on-air window is {window_s:.0f}s but this sequence needs at "
+                        f"least {min_dur:.0f}s (its ramps don't fit)")
+            resolve_defs = eff_steps
+            overrides = self._validate_overrides(eff_steps, req.step_overrides)
 
         # The earliest step (most negative start-anchored offset) must be in the future
-        lead_in = self._lead_offset(eff_steps)   # most negative offset, e.g. -120
+        lead_in = self._lead_offset(resolve_defs)   # most negative offset, e.g. -120
         earliest_fire = on_air_at + timedelta(seconds=lead_in)
         if earliest_fire <= now:
             raise ValueError(
@@ -550,8 +622,7 @@ class SequenceRunner:
                 f"(on-air start needs {abs(lead_in):.0f}s lead-in; choose a later on_air_at)"
             )
 
-        overrides = self._validate_overrides(eff_steps, req.step_overrides)
-        steps = self._resolve_steps(eff_steps, on_air_at, on_air_end, req.resume_offset_s,
+        steps = self._resolve_steps(resolve_defs, on_air_at, on_air_end, req.resume_offset_s,
                                     open_ended, overrides)
 
         run = SequenceRun(
@@ -568,6 +639,10 @@ class SequenceRunner:
             steps=steps,
             plan_id=req.plan_id,
             plan_name=req.plan_name,
+            hold_aware=hold_mode,
+            max_hold_s=req.max_hold_s,
+            hold_at_offset_s=hold_at_offset_s,
+            window_b_steps=list(window_b_defs),
         )
 
         async with self._lock:
@@ -581,13 +656,14 @@ class SequenceRunner:
                     "cannot arm: task(s) already running on this unit: "
                     + ", ".join(f"'{t}'" for t in already))
 
-            # A. Don't arm a run whose active span overlaps another armed/running run
-            # on this unit — overlapping windows would both drive the single TX channel
+            # A. Don't arm a run whose active span overlaps another armed/running/holding
+            # run on this unit — overlapping windows would both drive the single TX channel
             # and produce confusing "device busy" crashes instead of a clean rejection.
+            # A HOLDING run is open-ended (spans to +∞), so a new arm can't overlap it.
             new_start = earliest_fire
             new_end = on_air_end   # None ⇒ open-ended ⇒ +∞
             for other in self._runs.values():
-                if other.state not in (SequenceState.ARMED, SequenceState.RUNNING):
+                if other.state not in _ACTIVE_STATES:
                     continue
                 o_start, o_end = self._active_span(other)
                 if _spans_overlap(new_start, new_end, o_start, o_end):
@@ -677,9 +753,67 @@ class SequenceRunner:
         logger.info("Run %s on-air end changed %s → %s", run_id, old_end, run.on_air_end)
         return run
 
+    async def proceed(self, run_id: str, req: ProceedRequest) -> SequenceRun:
+        """Resume a HOLDING run (docs/sequence-hold-step.md §5.3).
+
+        Resolve window B relative to the operator's chosen resume instant T_resume:
+        the hold-anchored content runs forward from T_resume, and its span sets where
+        the off-air / stop-anchored steps land (on_air_end = T_resume + content). The
+        resolved fires are appended, the run leaves open-ended, and it returns to
+        RUNNING so the tick loop drives window B to completion exactly like a normal run.
+        """
+        async with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise KeyError(f"Unknown run: '{run_id}'")
+            if run.state != SequenceState.HOLDING:
+                raise ValueError(f"cannot proceed a run in state '{run.state}' (it is not holding)")
+
+            t_resume = _parse(req.proceed_at)
+            on_air_at = _parse(run.on_air_at)
+
+            # Window-B definitions were stored at arm. (Editing them via req.steps —
+            # edit-while-holding — is Phase 3; Phase 1 uses the stored window B.)
+            wb_defs = list(run.window_b_steps)
+            hold_defs = [s for s in wb_defs if s.anchor == "hold"]
+            stop_defs = [s for s in wb_defs if s.anchor == "stop"]
+
+            # Hold-anchored content forward from T_resume; its span fixes on_air_end so
+            # the off-air (stop-anchored) steps land after the post-hold work completes.
+            hold_fires = self._resolve_steps(hold_defs, on_air_at, None, run.resume_offset_s,
+                                             open_ended=True, hold_at=t_resume)
+            content_s = max(
+                ((_parse(f.fire_at) - t_resume).total_seconds() for f in hold_fires),
+                default=0.0)
+            content_s = max(0.0, content_s)
+            on_air_end = t_resume + timedelta(seconds=content_s)
+            stop_fires = self._resolve_steps(stop_defs, on_air_at, on_air_end, run.resume_offset_s,
+                                             open_ended=False, hold_at=t_resume)
+
+            new_fires = hold_fires + stop_fires
+            new_fires.sort(key=lambda f: _parse(f.fire_at))
+
+            run.steps = list(run.steps) + new_fires
+            run.on_air_end = on_air_end.isoformat()
+            run.open_ended = False
+            run.resumed_actual = _utcnow_iso()
+            run.state = SequenceState.RUNNING
+            # The end is now known — let the off-air marker fire at it.
+            self._off_air_marked.discard(run.id)
+            self._persist_runs()
+
+        rl = self._run_logs.get(run.id)
+        if rl is not None:
+            rl.annotate(f"PROCEED @ {t_resume.isoformat()} → off-air {run.on_air_end}")
+        await self._fire(run, "sequence_proceed",
+                         detail=f"resume {t_resume.isoformat()} → off-air {run.on_air_end}")
+        logger.info("Run %s PROCEED: resume %s → off-air %s",
+                    run.id, t_resume.isoformat(), run.on_air_end)
+        return run
+
     async def cancel_or_abort(self, run_id: str) -> SequenceRun:
         """
-        Cancel an ARMED run (never fires), or ABORT a RUNNING run:
+        Cancel an ARMED run (never fires), or ABORT a RUNNING/HOLDING run:
         stop every task the sequence touches and halt all remaining steps.
         """
         async with self._lock:
@@ -696,7 +830,9 @@ class SequenceRunner:
             logger.info("Run %s cancelled before start", run_id)
             return run
 
-        if state == SequenceState.RUNNING:
+        if state in (SequenceState.RUNNING, SequenceState.HOLDING):
+            # A HOLDING run is live (RF on, parked at the hold); aborting drops RF and
+            # stops every task, exactly as for a RUNNING run.
             await self._abort_run(run, reason="cancelled by operator")
             return run
 
@@ -740,6 +876,9 @@ class SequenceRunner:
         # reached those moments.
         await self._emit_on_air(now)
         await self._emit_off_air(now)
+
+        # Hold step: park a hold-aware run at its hold, and enforce the max-hold deadman.
+        await self._service_holds(now)
 
     # ── On-air / off-air markers ──────────────────────────────────────────────────
 
@@ -801,6 +940,54 @@ class SequenceRunner:
                 rl.annotate("OFF AIR (T_end)")
             await self._fire(run, "sequence_off_air", detail="off air")
             logger.info("Run %s off air (on_air_end reached)", run.id)
+
+    # ── Hold step (park at the hold; deadman) ──────────────────────────────────────
+
+    async def _service_holds(self, now: datetime) -> None:
+        """Two Hold responsibilities per tick (docs/sequence-hold-step.md §5.2, §5.6):
+
+        1. ENTER HOLDING — a hold-aware run whose window A has all fired and whose
+           hold instant (T0 + hold_at_offset_s) has arrived transitions RUNNING →
+           HOLDING once, stamps held_actual, and emits `sequence_hold`. No window-B
+           steps are scheduled, so the signal simply holds its last commanded value.
+        2. DEADMAN — a run HOLDING longer than max_hold_s (0 = unlimited) auto-aborts
+           (RF off, tasks stopped) and emits `sequence_hold_timeout`.
+        """
+        entering: List[SequenceRun] = []
+        timed_out: List[SequenceRun] = []
+        async with self._lock:
+            for run in self._runs.values():
+                if (run.state == SequenceState.RUNNING and run.hold_aware
+                        and run.hold_at_offset_s is not None and run.held_actual is None):
+                    hold_time = _parse(run.on_air_at) + timedelta(seconds=run.hold_at_offset_s)
+                    window_a_done = all(s.fired_actual is not None for s in run.steps)
+                    if now >= hold_time and window_a_done:
+                        run.state = SequenceState.HOLDING
+                        run.held_actual = now.isoformat()
+                        entering.append(run)
+                elif (run.state == SequenceState.HOLDING and run.max_hold_s
+                        and run.held_actual is not None):
+                    elapsed = (now - _parse(run.held_actual)).total_seconds()
+                    if elapsed > run.max_hold_s:
+                        timed_out.append(run)
+            if entering:
+                self._persist_runs()
+
+        for run in entering:
+            rl = self._run_logs.get(run.id)
+            if rl is not None:
+                rl.annotate("HELD (awaiting proceed)")
+            await self._fire(run, "sequence_hold", detail="holding — awaiting proceed")
+            logger.info("Run %s HOLDING (hold reached; awaiting proceed)", run.id)
+
+        for run in timed_out:
+            rl = self._run_logs.get(run.id)
+            if rl is not None:
+                rl.annotate(f"HOLD TIMEOUT (> {run.max_hold_s:.0f}s) — auto-aborting")
+            await self._fire(run, "sequence_hold_timeout",
+                             detail=f"held longer than {run.max_hold_s:.0f}s")
+            await self._abort_run(run, reason=f"max hold time ({run.max_hold_s:.0f}s) exceeded")
+            logger.warning("Run %s hold timed out after %.0fs — aborted", run.id, run.max_hold_s)
 
     # ── Step firing ──────────────────────────────────────────────────────────────
 
@@ -927,19 +1114,18 @@ class SequenceRunner:
         logger.warning("Run %s ABORTED (%s) — stopped tasks: %s", run.id, reason, task_names)
 
     def tasks_touched_by_active_runs(self) -> List[str]:
-        """All task names referenced by armed/running runs (used by panic)."""
+        """All task names referenced by armed/running/holding runs (used by panic)."""
         names: set[str] = set()
         for run in self._runs.values():
-            if run.state in (SequenceState.ARMED, SequenceState.RUNNING):
+            if run.state in _ACTIVE_STATES:
                 seq = self._sequences.get(run.sequence_id)
                 src = seq.steps if seq else run.steps
                 names.update(s.task_name for s in src)
         return sorted(names)
 
     async def abort_all_active(self, reason: str) -> List[str]:
-        """Abort every armed/running run. Returns the run ids aborted."""
-        active = [r for r in self._runs.values()
-                  if r.state in (SequenceState.ARMED, SequenceState.RUNNING)]
+        """Abort every armed/running/holding run. Returns the run ids aborted."""
+        active = [r for r in self._runs.values() if r.state in _ACTIVE_STATES]
         aborted: List[str] = []
         for run in active:
             if run.state == SequenceState.ARMED:
@@ -957,6 +1143,13 @@ class SequenceRunner:
     async def _reconcile_on_startup(self) -> None:
         now = _utcnow_dt()
         for run in list(self._runs.values()):
+            if run.state == SequenceState.HOLDING:
+                # A run parked at a Hold is in-flight (RF live). We never resume across
+                # a restart automatically, so fail-safe abort it — RF dropped, tasks
+                # stopped — exactly like a mid-run RUNNING run (docs §5.5).
+                logger.warning("Reconcile: run %s was HOLDING at startup — aborting (fail-safe)", run.id)
+                await self._abort_run(run, reason="agent restarted while holding")
+                continue
             if run.state not in (SequenceState.ARMED, SequenceState.RUNNING):
                 continue
 
