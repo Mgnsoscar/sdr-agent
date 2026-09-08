@@ -27,8 +27,11 @@ apt-get update -qq
 apt-get install -y python3-psutil
 
 echo "==> Installing Python dependencies (pip)"
+# NO --upgrade: install only what's missing and leave already-satisfied deps alone, so pip never
+# tries to UPGRADE (and therefore UNINSTALL) an apt/dpkg-managed transitive dep with no RECORD file
+# — e.g. python3-typing-extensions on a Python-3.13 Pi (same class as the psutil note above). The
+# `==` pins are still enforced normally.
 pip3 install --break-system-packages --root-user-action=ignore \
-    --upgrade --upgrade-strategy only-if-needed \
     -r "$INSTALL_DIR/requirements.txt"
 
 echo "==> Installing systemd service"

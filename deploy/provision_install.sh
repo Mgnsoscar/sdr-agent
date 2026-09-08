@@ -93,8 +93,14 @@ if "${PIP_BASE[@]}" --no-index ${WHEELS:+--find-links "$WHEELS"} -r "$REL/requir
     echo "    dependencies satisfied offline"
 else
     echo "    offline install incomplete — falling back to online (fast fail-out)"
-    "${PIP_BASE[@]}" --retries 1 --timeout 15 \
-        --upgrade --upgrade-strategy only-if-needed -r "$REL/requirements.txt"
+    # NO --upgrade: install only what's missing and leave already-satisfied deps alone. With
+    # --upgrade, pip would try to UPGRADE (and therefore UNINSTALL) an apt/dpkg-managed transitive
+    # dep that has no RECORD file — e.g. python3-typing-extensions on a Python-3.13 Pi, which fails
+    # with "no RECORD file was found … installed by debian" and aborts the whole provision. This is
+    # the same class of problem as psutil (see requirements.txt). The `==` pins are still enforced
+    # normally (a mismatched pip-owned version is replaced), so re-provisioning to a newer bundle
+    # still upgrades the pinned packages.
+    "${PIP_BASE[@]}" --retries 1 --timeout 15 -r "$REL/requirements.txt"
 fi
 
 echo "==> Installing systemd units"
