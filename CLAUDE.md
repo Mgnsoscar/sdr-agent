@@ -58,6 +58,15 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — Hold-step client authoring fixes (window-B ramps + duration tasks): agent test-only
+Client-side Hold UI fixes (see `sdr-client/CLAUDE.md`) let an operator anchor a RAMP (the down-ramp)
+AND a DURATION task's START to the Hold — both are window-B, `anchor="hold"`. The agent already
+resolves these (a hold-anchored ramp via `_resolve_ramp(hold_at=…)`, and a `START(anchor="hold")` like
+any window-B step through `_split_hold_windows` → `proceed`), so there is **no agent code change** — only
+a regression test pinning the contract: `tests/test_sequence_hold_model.py::
+test_split_hold_windows_routes_window_b_start_and_ramp` (a window-B START + ramp land in window B, the
+on-air START stays in window A). Suite 425 → 426.
+
 ## Current state — Hold step Phase 3c (edit-while-holding): COMPLETE (branch `claude/hold-step-phase-0-wwwxf7`, cross-repo)
 Design §6.4. `SequenceRunner.proceed` now honours `ProceedRequest.steps`: when the operator edits the
 post-hold window while holding and sends the **full edited sequence**, `proceed` runs `_validate_steps`

@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from agent.models import (
-    ArmSequenceRequest, CreateSequenceRequest, ProceedRequest, SequenceRun,
+    ArmSequenceRequest, CreateSequenceRequest, ProceedRequest, RampSpec, SequenceRun,
     SequenceState, SequenceStep, StepAction, TaskConfig,
 )
 from agent.process_manager import ProcessManager
@@ -101,6 +101,27 @@ def test_hold_step_round_trips_through_json():
     assert again.anchor == "start"
     assert again.offset_s == 45.0
     assert again.args == [] and again.params == {} and again.ramp is None
+
+
+# ── Window split (client authors window-B ramps AND duration tasks) ──────────
+
+def test_split_hold_windows_routes_window_b_start_and_ramp():
+    # The client can anchor a RAMP (down-ramp) or a duration task's START to the Hold
+    # (anchor="hold") — both belong to window B, resolved at proceed. window A keeps the
+    # start-anchored work; the HOLD marker itself fires nothing.
+    steps = [
+        SequenceStep(anchor="start", offset_s=0.0, action=StepAction.START, task_name="tx"),
+        _hold(30.0),
+        SequenceStep(anchor="hold", offset_s=0.0, action=StepAction.START, task_name="tx"),   # window-B duration task
+        SequenceStep(anchor="hold", offset_s=0.0, action=StepAction.RAMP, task_name="tx",
+                     ramp=RampSpec(param="gain", start=40, stop=20, steps=2, hold_s=0.5)),
+        SequenceStep(anchor="stop", offset_s=0.0, action=StepAction.STOP, task_name="tx"),
+    ]
+    window_a, window_b, hold_off = SequenceRunner._split_hold_windows(steps)
+    assert hold_off == 30.0
+    assert [s.action for s in window_a] == [StepAction.START]          # only the on-air start
+    wb_actions = sorted(str(getattr(s.action, "value", s.action)) for s in window_b)
+    assert wb_actions == ["ramp", "start", "stop"]                     # both hold-anchored + the off-air stop
 
 
 # ── Validation: the good case ────────────────────────────────────────────────
