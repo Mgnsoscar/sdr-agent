@@ -107,6 +107,16 @@ client renders the real power card and you can arm / hold / proceed them with no
 logs the SDR gain it *would* command instead of transmitting). The mock scripts live in
 `sdr-scripts` (`mock_gps_ca_code_1.023Mcps_tx.py`, `mock_fm_chirp_tx.py`, `mock_cw_tx.py`).
 
+**One RF-gated sequence per signal.** It also seeds a `sequences.json` with `seq-mock-prn`,
+`seq-mock-chirp` and `seq-mock-cw`, so each signal is armable end to end from the client's
+**Sequences** tab. Each has the same shape: the transmit task launches **1 s before on-air with
+RF off** (muted pre-roll), a TUNE turns **RF on at the on-air anchor** and **off at the off-air
+anchor**, and the task stops **1 s after off-air**. `--power` is in each signal's calibrated
+quantity (dBm for CW, dBm/Hz base density for the PRN/chirp), mid-range for the seeded chain; the
+agent auto-commands the `atten_set` attenuator to realize the requested delivered power (no
+explicit attenuator step needed). The sequences carry no Hold — add one in the editor to exercise
+the hold/proceed flow.
+
 See it in the client: `python3 ../sdr-client/tools/screenshot.py --tab calibration --out /tmp/cal.png`
 (drills into the unit's Calibration panel). Regenerate/validate the doc against the
 resolver by editing `deploy/sample-calibration/` and re-running `run_local.sh` (delete
