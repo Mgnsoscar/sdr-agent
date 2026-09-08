@@ -55,6 +55,22 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — provisioning: don't `--upgrade` pip deps (Python 3.13 apt-package clash): COMPLETE (branch `claude/provision-python313-fix`)
+Provisioning a fresh **Python 3.13** Pi aborted at the pip step: `typing_extensions` is an
+**apt/dpkg** package there (`/usr/lib/python3/dist-packages`, no `RECORD` file), and the online-
+fallback pip line ran with `--upgrade`, so pip tried to pull a newer `typing_extensions` and
+**uninstall the apt one first** — impossible → `no RECORD file was found … installed by debian`,
+aborting the whole provision. Same class as the `psutil` note in `requirements.txt`, one level down.
+Fix (deploy scripts only, no agent code/version change): drop `--upgrade --upgrade-strategy
+only-if-needed` from the online fallback in `deploy/provision_install.sh` (and the classic
+`install.sh`). Plain `pip install -r requirements.txt` installs only what's MISSING and leaves
+already-satisfied deps — the apt `typing_extensions` and `PyYAML` — untouched, so pip never attempts
+the impossible uninstall; the `==` pins are still enforced, so a newer bundle still upgrades pinned
+packages. (The bundle ships no wheelhouse, so a fresh internet-connected Pi always uses the online
+fallback — that's by design, not the bug.) The client bundle (`sdr-agent-<ver>.tar.gz`, gitignored
+build artifact from `deploy/build_bundle.sh`) must be rebuilt + re-staged into `sdr-client/bundles/`
+for the client's "Provision unit" flow to ship the fixed script.
+
 ## Planned — Hold step (operator-gated sequence pause): DESIGN AGREED, building in phases
 Design doc lives in the client repo: **`sdr-client/docs/sequence-hold-step.md`** (cross-repo spec +
 owner decisions + a self-contained Phase 0 checklist in Appendix A). A new **Hold** sequence step
