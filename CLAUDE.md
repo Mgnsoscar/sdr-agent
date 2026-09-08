@@ -32,9 +32,15 @@ the unit **online** ("clocks: synced ✓"); `sdr: none` / `temp —` are the exp
 A Claude session should launch the agent with Bash `run_in_background: true`, never as a foreground server.
 It also seeds a realistic **sample calibration** (`deploy/sample-calibration/{calibration.json,components.yaml}`
 → the unit's `data/`) so the unit is calibrated by default: Source flatness (TX-bias `source_bias`) → cable
-→ programmable attenuator (0–95 dB / 0.25 step, −4.5 dB insertion) → output cable, resolving `cw_tone` +
-`mock` to ~−187…−5 dBm — good for troubleshooting power-step/achievable bugs. See
-`docs/local-integration-run.md`; view it with `screenshot.py --tab calibration`.
+→ programmable attenuator (0–95 dB / 0.25 step, −4.5 dB insertion) → output cable (SDR gain 0–89.75 / 0.25).
+The first cable is also the measurement de-embed cable (TX bias + every signal). Exactly **three test
+signals**, one per family: `cw_tone` (dBm), `GPS C/A (1.023 Mcps)` and `Chirp/Sweep` (both spectral density
+dBm/Hz, ceiling gauged through a full-/total-power law). `run_local.sh` also seeds a `tasks.yaml` wiring
+three NO-HARDWARE **mock transmit tasks** — `mock_prn`/`mock_chirp`/`mock_cw` (from `sdr-scripts`
+`mock_gps_ca_code_1.023Mcps_tx.py` / `mock_fm_chirp_tx.py` / `mock_cw_tx.py`, each mirroring the real
+script's params + `CAL_POWER_LAWS`) + `atten_set` (`mock_atten.py`) — so all three are ARMABLE (real power
+card, arm/hold/proceed) with no radio. See `docs/local-integration-run.md`; view it with
+`screenshot.py --tab calibration`.
 
 ## Cross-repo invariants (do not break)
 - **Drift guard (`tests/test_shared_source_drift.py`):** `agent/argspec.py` and `agent/ramp.py`

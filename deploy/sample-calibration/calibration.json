@@ -56,20 +56,53 @@
         }
       }
     },
-    "mock": {
-      "center_freq_hz": 1500000000,
-      "measurement": { "quantity": "power", "unit": "dBm" },
+    "GPS C/A (1.023 Mcps)": {
+      "center_freq_hz": 1575420000,
+      "measurement": { "quantity": "spectral density", "unit": "dBm/Hz" },
+      "limiting": {
+        "kind": "law",
+        "law": {
+          "id": "full_power", "name": "Full signal power (filter passband)", "unit": "dBm",
+          "in": "density", "out": "abs",
+          "k": 60.0, "param": "enbw_mhz", "coeff": 10.0, "ref": 1.0, "rep": 0.988638
+        }
+      },
       "curves": {
         "Source": {
           "measurement_deembed": "sma_cable_sdr_atten",
           "interp": "linear",
           "points": [
-            { "gain_db": 0.0,   "power_dbm": -85.0 },
-            { "gain_db": 20.0,  "power_dbm": -65.0 },
-            { "gain_db": 40.0,  "power_dbm": -45.0 },
-            { "gain_db": 60.0,  "power_dbm": -25.0 },
-            { "gain_db": 80.0,  "power_dbm": -5.0 },
-            { "gain_db": 89.75, "power_dbm": 2.5 }
+            { "gain_db": 0.0,   "power_dbm": -145.0 },
+            { "gain_db": 20.0,  "power_dbm": -125.0 },
+            { "gain_db": 40.0,  "power_dbm": -105.0 },
+            { "gain_db": 60.0,  "power_dbm": -85.0 },
+            { "gain_db": 80.0,  "power_dbm": -65.0 },
+            { "gain_db": 89.75, "power_dbm": -57.5 }
+          ]
+        }
+      }
+    },
+    "Chirp/Sweep": {
+      "center_freq_hz": 1575420000,
+      "measurement": { "quantity": "spectral density", "unit": "dBm/Hz" },
+      "limiting": {
+        "kind": "law",
+        "law": {
+          "id": "fbw_power", "name": "Full-bandwidth (total) power", "unit": "dBm",
+          "in": "density", "out": "abs", "k": 70.0, "rep": 10.0
+        }
+      },
+      "curves": {
+        "Source": {
+          "measurement_deembed": "sma_cable_sdr_atten",
+          "interp": "linear",
+          "points": [
+            { "gain_db": 0.0,   "power_dbm": -155.0 },
+            { "gain_db": 20.0,  "power_dbm": -135.0 },
+            { "gain_db": 40.0,  "power_dbm": -115.0 },
+            { "gain_db": 60.0,  "power_dbm": -95.0 },
+            { "gain_db": 80.0,  "power_dbm": -75.0 },
+            { "gain_db": 89.75, "power_dbm": -67.5 }
           ]
         }
       }

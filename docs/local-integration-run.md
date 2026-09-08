@@ -92,12 +92,25 @@ Source (SDR)  →  Cable to attenuator  →  Attenuator          →  Output cab
 - **Attenuator** — a programmable `atten_set` control (0–95 dB, 0.25 dB step) whose passive
   baseline `delta_db: -4.5` is its insertion loss at 0 dB attenuation.
 - Two bench cables as **catalog components** (loss-vs-frequency), the second the operating
-  plane (delivered `--power`). Signals `cw_tone` and `mock` (both real staged scripts)
-  resolve to ~**−187…−5 dBm** at 1.5 GHz, rolling off with frequency.
+  plane (delivered `--power`); the first (`sma_cable_sdr_atten`) is ALSO the measurement
+  de-embed cable for the TX bias and every signal's measured curve (its loss is removed).
+- **Three test signals**, one per family, each measured in its own quantity: `cw_tone`
+  (dBm, ~−186…−5), `GPS C/A (1.023 Mcps)` and `Chirp/Sweep` (both spectral density dBm/Hz,
+  ~−246…−65 / ~−256…−75). The two density signals gauge the `Source` dBm ceiling through a
+  law (full-signal / total power) since a density can't be capped by a bare dBm.
+
+**Armable, no radio.** `run_local.sh` also seeds a `tasks.yaml` wiring three NO-HARDWARE
+**mock transmit tasks** — `mock_prn` (mock GPS C/A), `mock_chirp`, `mock_cw` — plus `atten_set`
+(the mock step attenuator the chain drives). Each transmit mock mirrors the real script's
+parameter schema + `CAL_POWER_LAWS` and opts into calibration via `SDR_CAL_SIGNAL_ID`, so the
+client renders the real power card and you can arm / hold / proceed them with no SDR (the mock
+logs the SDR gain it *would* command instead of transmitting). The mock scripts live in
+`sdr-scripts` (`mock_gps_ca_code_1.023Mcps_tx.py`, `mock_fm_chirp_tx.py`, `mock_cw_tx.py`).
 
 See it in the client: `python3 ../sdr-client/tools/screenshot.py --tab calibration --out /tmp/cal.png`
 (drills into the unit's Calibration panel). Regenerate/validate the doc against the
-resolver by editing `deploy/sample-calibration/` and re-running `run_local.sh`.
+resolver by editing `deploy/sample-calibration/` and re-running `run_local.sh` (delete
+`/tmp/sdr-local` first — the calibration + tasks re-seed only when absent).
 
 ## What is (correctly) absent with no hardware
 

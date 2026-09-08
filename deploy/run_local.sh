@@ -51,6 +51,42 @@ for f in calibration.json components.yaml; do
     fi
 done
 
+# Register the three no-hardware MOCK transmit tasks (a PRN, a chirp and a CW tone) plus the mock
+# step attenuator the calibration chain drives, so the seeded signals are actually ARMABLE with no
+# radio. Each transmit task opts into calibration via SDR_CAL_SIGNAL_ID = its script's CAL_SIGNAL_ID
+# (the agent injects this unit's resolved calibration), so the client renders the real power card.
+# Only written if absent — a fresh RUN_DIR re-seeds. See docs/local-integration-run.md.
+TASKS="$STATE/configs/tasks.yaml"
+if [ ! -e "$TASKS" ] || ! grep -q "mock_prn" "$TASKS" 2>/dev/null; then
+    cat > "$TASKS" <<YAML
+# Seeded by deploy/run_local.sh for the local, headless, no-hardware unit. The three mock signals
+# (PRN / chirp / CW) mirror the real scripts' parameters + power laws but transmit nothing; the
+# attenuator is the mock the calibration chain's "atten_set" control drives. Delete this file (or
+# the whole RUN_DIR) to re-seed. NOT for real units — deploy tasks from the client's Library there.
+tasks:
+  - name: mock_prn
+    description: "Mock GPS C/A (1.023 Mcps) — no hardware; same params + power laws as the real PRN"
+    command: [python3, "$BASE/scripts/mock_gps_ca_code_1.023Mcps_tx.py"]
+    working_dir: "$BASE/scripts"
+    env: { SDR_CAL_SIGNAL_ID: "GPS C/A (1.023 Mcps)" }
+  - name: mock_chirp
+    description: "Mock FM chirp / sweep — no hardware; same params + power laws as the real chirp"
+    command: [python3, "$BASE/scripts/mock_fm_chirp_tx.py"]
+    working_dir: "$BASE/scripts"
+    env: { SDR_CAL_SIGNAL_ID: "Chirp/Sweep" }
+  - name: mock_cw
+    description: "Mock CW tone — no hardware; same params as the real cw_tx (calibrated dBm)"
+    command: [python3, "$BASE/scripts/mock_cw_tx.py"]
+    working_dir: "$BASE/scripts"
+    env: { SDR_CAL_SIGNAL_ID: "cw_tone" }
+  - name: atten_set
+    description: "Mock step attenuator — the active component the calibration chain drives (no HW)"
+    command: [python3, "$BASE/scripts/mock_atten.py"]
+    working_dir: "$BASE/scripts"
+YAML
+    echo "seeded tasks.yaml (mock_prn / mock_chirp / mock_cw / atten_set)"
+fi
+
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 echo "==> agent base=$BASE state=$STATE"
 echo "==> serving on http://${IP:-0.0.0.0}:$PORT  (point the client at ${IP:-<this-host>})"
