@@ -296,7 +296,11 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # 1.18.0 adds the "sequence-hold-now" capability (below): POST /sequence-runs/{id}/hold-now
 # fast-forwards a RUNNING hold-aware run straight to its Hold (Phase 3b, docs/sequence-hold-step.md
 # §5.4) — the up-ramp stops emitting and the task holds its current live value.
-AGENT_VERSION = "1.18.0"
+# 1.19.0 adds "sequence-hold-edit": POST …/proceed now honours ProceedRequest.steps (the operator's
+# EDITED sequence — edit-while-holding, Phase 3c §6.4), re-extracting window B from it instead of the
+# window B stored at arm. A ≤1.18 agent ignores req.steps (uses the stored window B), so the client
+# gates its window-B edit UI on this capability — a safety gate, else an edit would be silently lost.
+AGENT_VERSION = "1.19.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -392,6 +396,11 @@ AGENT_CAPABILITIES = [
                                          # hold-aware run straight to its Hold (skip the rest of
                                          # window A, hold the current live value). Phase 3b; the
                                          # client gates the "Hold now" button on this string.
+    "sequence-hold-edit",                # POST …/proceed honours ProceedRequest.steps (the edited
+                                         # sequence) — edit-while-holding re-resolves window B from
+                                         # the operator's revision. Phase 3c; the client gates its
+                                         # window-B edit UI on this string (a ≤1.18 agent ignores
+                                         # req.steps, so an edit would be silently lost).
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

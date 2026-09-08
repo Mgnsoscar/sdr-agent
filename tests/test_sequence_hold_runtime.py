@@ -350,6 +350,60 @@ def test_hold_now_requires_a_running_hold_aware_run(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+# ── Edit-while-holding (§6.4) ────────────────────────────────────────────────
+
+def _edited_hold_steps():
+    """Same shape as _hold_steps but the FIRST window-B tune is retargeted 21 → 33 (the operator
+    edited the down-ramp target while holding). Window A (START, tune 41, HOLD) is unchanged."""
+    return [
+        SequenceStep(anchor="start", offset_s=0.0, action=StepAction.START, task_name="tx"),
+        SequenceStep(anchor="start", offset_s=1.0, action=StepAction.TUNE,
+                     task_name="tx", params={"gain": 41}),
+        SequenceStep(anchor="start", offset_s=1.2, action=StepAction.HOLD, task_name=""),
+        SequenceStep(anchor="hold", offset_s=0.0, action=StepAction.TUNE,
+                     task_name="tx", params={"gain": 33}),      # edited: was 21
+        SequenceStep(anchor="hold", offset_s=0.8, action=StepAction.TUNE,
+                     task_name="tx", params={"gain": 15}),
+        SequenceStep(anchor="stop", offset_s=0.0, action=StepAction.STOP, task_name="tx"),
+    ]
+
+
+def test_proceed_honours_edited_window_b_steps(tmp_path, monkeypatch):
+    async def scenario():
+        mgr, runner = _mk(tmp_path, monkeypatch)
+        await mgr.startup()
+        await runner.startup()
+        try:
+            seq = await runner.create_sequence(CreateSequenceRequest(
+                name="edit-while-holding", steps=_hold_steps()))
+            now = datetime.now(timezone.utc)
+            run = await runner.arm(
+                seq.id,
+                ArmSequenceRequest(on_air_at=(now + timedelta(seconds=0.4)).isoformat(),
+                                   open_ended=True, hold_aware=True, max_hold_s=0),
+                None,
+            )
+            rid = run.id
+            await asyncio.sleep(2.8)
+            assert runner.get_run(rid).state == SequenceState.HOLDING
+
+            # Proceed with an EDITED full sequence — the first window-B tune is 33, not the stored 21.
+            resumed = await runner.proceed(rid, ProceedRequest(
+                proceed_at=datetime.now(timezone.utc).isoformat(), steps=_edited_hold_steps()))
+            assert resumed.state == SequenceState.RUNNING
+            # The resolved window B fires the EDITED target (33), proving req.steps overrode storage.
+            await asyncio.sleep(0.5)
+            got = await mgr.get_params("tx")
+            assert got["current"]["gain"] == 33
+        finally:
+            await runner.shutdown()
+            if mgr.is_running("tx"):
+                await mgr.stop("tx")
+            await mgr.shutdown()
+
+    asyncio.run(scenario())
+
+
 # ── Abort while holding ──────────────────────────────────────────────────────
 
 def test_abort_while_holding_drops_rf(tmp_path, monkeypatch):

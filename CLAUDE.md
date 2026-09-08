@@ -27,10 +27,11 @@ the drift guard is pytest-only.
 - **Capabilities + version:** a new client-visible feature adds a string to
   `AGENT_CAPABILITIES` and bumps `AGENT_VERSION` (both in `agent/config.py`); `test_meta_endpoint.py`
   asserts the capability set. The client feature-gates on these exact strings. Current version is
-  in `config.py` (`1.18.0`: Fast-Forward-to-Hold — Phase 3b — `POST …/hold-now` behind the new
-  `sequence-hold-now` capability; `1.17.0` shipped the Hold-step HOLDING runtime — Phase 1 — behind
-  `sequence-hold` (added 1.16.0): a hold-aware arm parks at the hold and `POST …/proceed` resolves
-  the post-hold window).
+  in `config.py` (`1.19.0`: edit-while-holding — Phase 3c — `POST …/proceed` honours
+  `ProceedRequest.steps` behind `sequence-hold-edit`; `1.18.0`: Fast-Forward-to-Hold — Phase 3b —
+  `POST …/hold-now` behind `sequence-hold-now`; `1.17.0`: the Hold-step HOLDING runtime — Phase 1 —
+  behind `sequence-hold` (added 1.16.0): a hold-aware arm parks at the hold and `POST …/proceed`
+  resolves the post-hold window).
 
 ## Where things live
 - `agent/calibration.py` (~1.7k lines) — the **calibration resolver**. `resolve(unit_doc, …,
@@ -56,6 +57,23 @@ declared **laws** (affine in log10 of task params; `in`/`out` families abs↔den
 between quantities. Safety **limits** are dBm ceilings on stage boundaries; the LIMITING reading
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
+
+## Current state — Hold step Phase 3c (edit-while-holding): COMPLETE (branch `claude/hold-step-phase-0-wwwxf7`, cross-repo)
+Design §6.4. `SequenceRunner.proceed` now honours `ProceedRequest.steps`: when the operator edits the
+post-hold window while holding and sends the **full edited sequence**, `proceed` runs `_validate_steps`
+on it and re-extracts window B via `_split_hold_windows` (window A has already fired and is ignored),
+instead of the window B stored at arm. Absent `req.steps`, behaviour is byte-identical (stored window
+B). One-line change in `proceed` (the `wb_defs` source). `config.py` bumps `AGENT_VERSION 1.18.0 →
+1.19.0` and adds capability **`sequence-hold-edit`** (a ≤1.18 agent silently ignores `req.steps` and
+runs the stored window B, so the client gates its window-B edit UI on this string — else an edit would
+be lost). Tests: `tests/test_sequence_hold_runtime.py::test_proceed_honours_edited_window_b_steps`
+(arm→hold→proceed with an edited window-B tune 21→33; the resumed run fires the EDITED target) +
+`test_meta_endpoint.py` asserts the capability; suite 424 → 425. Client side (Phase 3c, `sdr-client`):
+`ui/hold_edit_dialog.py::HoldEditDialog` (hosts the timeline editor on the running sequence, OK returns
+the edited full step list), an **"Edit…"** row button on a HOLDING run gated on `sequence-hold-edit`
+(`ui/sequences_panel.py`; the edit is held per-run in `_wb_edits` and sent as `ProceedRequest.steps` on
+the next Proceed, cleared once the run leaves HOLDING), and `SEQUENCE_HOLD_EDIT_CAPABILITY`. **The Hold
+step is now feature-complete** (Phases 0–3). `place_ramp`/`ramp.py` untouched (drift guard intact).
 
 ## Current state — Hold step Phase 3b (Fast-Forward-to-Hold): COMPLETE (branch `claude/hold-step-phase-0-wwwxf7`, cross-repo)
 Design §5.4. `POST /sequence-runs/{id}/hold-now` → `SequenceRunner.hold_now(run_id)` jumps a RUNNING

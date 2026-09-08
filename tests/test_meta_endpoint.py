@@ -28,6 +28,7 @@ def test_capabilities_advertised_and_stable():
     assert "calibration-extrapolate" in cfg.AGENT_CAPABILITIES            # measured-curve extrapolation
     assert "sequence-hold" in cfg.AGENT_CAPABILITIES                       # Hold step (operator-gated pause)
     assert "sequence-hold-now" in cfg.AGENT_CAPABILITIES                   # Fast-Forward-to-Hold (Phase 3b)
+    assert "sequence-hold-edit" in cfg.AGENT_CAPABILITIES                  # edit-while-holding (Phase 3c)
 
 
 def test_agent_info_carries_capabilities():

@@ -772,9 +772,15 @@ class SequenceRunner:
             t_resume = _parse(req.proceed_at)
             on_air_at = _parse(run.on_air_at)
 
-            # Window-B definitions were stored at arm. (Editing them via req.steps —
-            # edit-while-holding — is Phase 3; Phase 1 uses the stored window B.)
-            wb_defs = list(run.window_b_steps)
+            # Window-B definitions: the operator's EDITED sequence when supplied
+            # (edit-while-holding, §6.4) — the FULL sequence with an immutable window A and a
+            # revised window B; the agent validates it and re-extracts window B (window A has
+            # already fired and is ignored here). Absent, the window B stored at arm is used.
+            if req.steps:
+                self._validate_steps(req.steps)
+                _, wb_defs, _ = self._split_hold_windows(req.steps)
+            else:
+                wb_defs = list(run.window_b_steps)
             hold_defs = [s for s in wb_defs if s.anchor == "hold"]
             stop_defs = [s for s in wb_defs if s.anchor == "stop"]
 
