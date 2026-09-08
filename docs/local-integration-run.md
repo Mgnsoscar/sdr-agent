@@ -68,6 +68,37 @@ A connected client shows **"clocks: synced ✓"** (top bar) and the unit card as
    From source with no override, `paths.data_dir()` is the repo root — do not point a test run
    there or it reads/writes the tracked dev `units.yaml`.
 
+## Seeded sample calibration
+
+`run_local.sh` also seeds a realistic calibration into the unit's data store
+(`<state>/data/{calibration.json,components.yaml}`, from `deploy/sample-calibration/`),
+if absent — so the unit is **calibrated by default** for exercising the power/step
+and calibration paths. It round-trips through the client (Save uploads it back via
+`/files`), and a fresh `/tmp/sdr-local` re-seeds it.
+
+The chain (a plain-dBm broadcaster) is:
+
+```
+Source (SDR)  →  Cable to attenuator  →  Attenuator          →  Output cable
++ source_bias    sma_cable_sdr_atten     0–95 dB / 0.25 step     sma_cable_atten_out
+ (TX flatness,    (~1–2 dB, f-dep)        −4.5 dB insertion       (~1–2 dB, f-dep)
+  8-pt dBm/f)                             (delta_db baseline)      = operating plane
+```
+
+- **Source / TX bias** — the measured SDR gain→power curve (0…89.75 dB gain, 0.25 dB
+  grid, ~−85…+2.5 dBm) plus a `source_bias.power_by_freq` flatness table (the "TX Bias"
+  freq→dBm table, ~4.5 dB of roll-off 70 MHz→6 GHz, normalized to each signal's rep freq).
+  A `Source` dBm ceiling (`max_dbm: 2.0`, "SDR P1dB") caps it and grid-snaps just below max.
+- **Attenuator** — a programmable `atten_set` control (0–95 dB, 0.25 dB step) whose passive
+  baseline `delta_db: -4.5` is its insertion loss at 0 dB attenuation.
+- Two bench cables as **catalog components** (loss-vs-frequency), the second the operating
+  plane (delivered `--power`). Signals `cw_tone` and `mock` (both real staged scripts)
+  resolve to ~**−187…−5 dBm** at 1.5 GHz, rolling off with frequency.
+
+See it in the client: `python3 ../sdr-client/tools/screenshot.py --tab calibration --out /tmp/cal.png`
+(drills into the unit's Calibration panel). Regenerate/validate the doc against the
+resolver by editing `deploy/sample-calibration/` and re-running `run_local.sh`.
+
 ## What is (correctly) absent with no hardware
 
 `sdr: none`, `temp —`, `clock —` on the unit card, and `/sdr` reporting no device are

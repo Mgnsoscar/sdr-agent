@@ -1,0 +1,22 @@
+# Sample component catalog for the local integration unit (Broadcaster Lab).
+# Two short bench SMA jumpers, characterised as loss-vs-frequency (signed dB;
+# negative = loss). Loss rises with frequency (~sqrt(f)), realistic for ~1 m of
+# RG316/SMA. Referenced by planes in the sibling calibration.json.
+# Schema: components.<id>.{kind, delta_db_by_freq: [[freq_hz, delta_db], ...]}.
+# Seeded into the unit's data store by deploy/run_local.sh; see
+# docs/local-integration-run.md.
+components:
+  sma_cable_sdr_atten:          # SDR output -> programmable attenuator
+    kind: cable
+    delta_db_by_freq:
+      - [70000000, -0.30]       # 70 MHz
+      - [1000000000, -0.90]     # 1.0 GHz
+      - [2400000000, -1.40]     # 2.4 GHz
+      - [6000000000, -2.30]     # 6.0 GHz
+  sma_cable_atten_out:          # attenuator -> unit output (final stage)
+    kind: cable
+    delta_db_by_freq:
+      - [70000000, -0.40]
+      - [1000000000, -1.10]
+      - [2400000000, -1.70]
+      - [6000000000, -2.80]

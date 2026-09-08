@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "unit_type": "broadcaster",
+  "chain": {
+    "gain_limits": { "min_gain_db": 0.0, "max_gain_db": 89.75, "gain_step_db": 0.25 },
+    "operating_plane": "Output cable",
+    "limits": [
+      { "plane": "Source", "max_dbm": 2.0, "reason": "SDR TX P1dB (output compression)" }
+    ],
+    "planes": {
+      "Source": { "type": "measured", "quantity": "power" },
+      "Cable to attenuator": {
+        "type": "derived", "from": "Source", "component": "sma_cable_sdr_atten"
+      },
+      "Attenuator": {
+        "type": "derived", "from": "Cable to attenuator", "delta_db": -4.5,
+        "control": {
+          "task": "atten_set", "param": "attenuation", "sense": "attenuation",
+          "min_db": 0.0, "max_db": 95.0, "step_db": 0.25, "engage_pct": 0.0
+        }
+      },
+      "Output cable": {
+        "type": "derived", "from": "Attenuator", "component": "sma_cable_atten_out"
+      }
+    }
+  },
+  "source_bias": {
+    "power_by_freq": [
+      [70000000, -7.5],
+      [500000000, -6.0],
+      [1000000000, -5.5],
+      [1500000000, -5.0],
+      [2400000000, -5.5],
+      [3500000000, -6.5],
+      [5000000000, -8.0],
+      [6000000000, -9.5]
+    ]
+  },
+  "signals": {
+    "cw_tone": {
+      "center_freq_hz": 1500000000,
+      "measurement": { "quantity": "power", "unit": "dBm" },
+      "curves": {
+        "Source": {
+          "interp": "linear",
+          "points": [
+            { "gain_db": 0.0,   "power_dbm": -85.0 },
+            { "gain_db": 20.0,  "power_dbm": -65.0 },
+            { "gain_db": 40.0,  "power_dbm": -45.0 },
+            { "gain_db": 60.0,  "power_dbm": -25.0 },
+            { "gain_db": 80.0,  "power_dbm": -5.0 },
+            { "gain_db": 89.75, "power_dbm": 2.5 }
+          ]
+        }
+      }
+    },
+    "mock": {
+      "center_freq_hz": 1500000000,
+      "measurement": { "quantity": "power", "unit": "dBm" },
+      "curves": {
+        "Source": {
+          "interp": "linear",
+          "points": [
+            { "gain_db": 0.0,   "power_dbm": -85.0 },
+            { "gain_db": 20.0,  "power_dbm": -65.0 },
+            { "gain_db": 40.0,  "power_dbm": -45.0 },
+            { "gain_db": 60.0,  "power_dbm": -25.0 },
+            { "gain_db": 80.0,  "power_dbm": -5.0 },
+            { "gain_db": 89.75, "power_dbm": 2.5 }
+          ]
+        }
+      }
+    }
+  }
+}

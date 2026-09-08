@@ -30,6 +30,11 @@ dir; the repo nests scripts) and starts `uvicorn agent.main:app` with dev env (`
 `SDR_STATE_DIR` under `/tmp/sdr-local`). A connected client reads `/info`, opens the SSE stream, and shows
 the unit **online** ("clocks: synced ✓"); `sdr: none` / `temp —` are the expected no-hardware readouts.
 A Claude session should launch the agent with Bash `run_in_background: true`, never as a foreground server.
+It also seeds a realistic **sample calibration** (`deploy/sample-calibration/{calibration.json,components.yaml}`
+→ the unit's `data/`) so the unit is calibrated by default: Source flatness (TX-bias `source_bias`) → cable
+→ programmable attenuator (0–95 dB / 0.25 step, −4.5 dB insertion) → output cable, resolving `cw_tone` +
+`mock` to ~−187…−5 dBm — good for troubleshooting power-step/achievable bugs. See
+`docs/local-integration-run.md`; view it with `screenshot.py --tab calibration`.
 
 ## Cross-repo invariants (do not break)
 - **Drift guard (`tests/test_shared_source_drift.py`):** `agent/argspec.py` and `agent/ramp.py`

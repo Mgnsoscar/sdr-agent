@@ -39,6 +39,18 @@ else
     echo "   (set SDR_SCRIPTS_REPO=/path/to/sdr-scripts)"
 fi
 
+# Seed a realistic sample calibration (Source flatness + cable → programmable
+# attenuator → output cable) into the unit's data store, if absent — so the unit
+# has calibration by default. The client edits/round-trips it via /files. See
+# deploy/sample-calibration/ and docs/local-integration-run.md.
+DATA="$STATE/data"; mkdir -p "$DATA"
+for f in calibration.json components.yaml; do
+    if [ ! -e "$DATA/$f" ] && [ -f "$HERE/deploy/sample-calibration/$f" ]; then
+        cp "$HERE/deploy/sample-calibration/$f" "$DATA/$f"
+        echo "seeded $f into the unit's data store"
+    fi
+done
+
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 echo "==> agent base=$BASE state=$STATE"
 echo "==> serving on http://${IP:-0.0.0.0}:$PORT  (point the client at ${IP:-<this-host>})"
