@@ -55,21 +55,27 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
-## Current state — provisioning: don't `--upgrade` pip deps (Python 3.13 apt-package clash): COMPLETE (branch `claude/provision-python313-fix`)
+## Current state — provisioning: pip `--ignore-installed` past apt-managed transitive deps (Python 3.13): COMPLETE (branch `claude/provision-python313-fix`)
 Provisioning a fresh **Python 3.13** Pi aborted at the pip step: `typing_extensions` is an
-**apt/dpkg** package there (`/usr/lib/python3/dist-packages`, no `RECORD` file), and the online-
-fallback pip line ran with `--upgrade`, so pip tried to pull a newer `typing_extensions` and
-**uninstall the apt one first** — impossible → `no RECORD file was found … installed by debian`,
-aborting the whole provision. Same class as the `psutil` note in `requirements.txt`, one level down.
-Fix (deploy scripts only, no agent code/version change): drop `--upgrade --upgrade-strategy
-only-if-needed` from the online fallback in `deploy/provision_install.sh` (and the classic
-`install.sh`). Plain `pip install -r requirements.txt` installs only what's MISSING and leaves
-already-satisfied deps — the apt `typing_extensions` and `PyYAML` — untouched, so pip never attempts
-the impossible uninstall; the `==` pins are still enforced, so a newer bundle still upgrades pinned
-packages. (The bundle ships no wheelhouse, so a fresh internet-connected Pi always uses the online
-fallback — that's by design, not the bug.) The client bundle (`sdr-agent-<ver>.tar.gz`, gitignored
-build artifact from `deploy/build_bundle.sh`) must be rebuilt + re-staged into `sdr-client/bundles/`
-for the client's "Provision unit" flow to ship the fixed script.
+**apt/dpkg** package there (`/usr/lib/python3/dist-packages`, no `RECORD` file). The pinned stack
+(`fastapi`/`pydantic`/…) resolves a `typing_extensions` **NEWER** than the apt-shipped `4.13.2`, so
+pip tries to **uninstall the apt copy first** — impossible → `no RECORD file was found … installed by
+debian`, aborting the whole provision. **First fix (WRONG, superseded): dropping `--upgrade`.** It
+didn't work — the resolver picks the newer version because a requirement *needs* it, not because of
+an upgrade flag, so plain `pip install -r requirements.txt` still tried the impossible uninstall (the
+owner confirmed the identical error persisted, both via the client and running pip directly on the
+Pi). **Correct fix (deploy scripts only, no agent code/version change): add `--ignore-installed`** to
+the online fallback in `deploy/provision_install.sh` (and to the classic `install.sh`). pip then
+installs every requirement + its transitive deps FRESH into `/usr/local/lib/python3.x/dist-packages`
+WITHOUT trying to uninstall anything — the pip copies precede `dist-packages` on `sys.path`, so they
+shadow the apt `typing_extensions`/`PyYAML`; `psutil` stays apt-only (not in `requirements.txt`, so
+pip never touches it) and the `==` pins are still enforced. The offline pass (`--no-index`) runs
+first and is unaffected — with no candidates it never tries to uninstall, and on a fresh
+internet-connected Pi it fails fast to the online fallback (the bundle ships no wheelhouse — by
+design). Immediate Pi-side unblock for a unit stuck now: `sudo pip3 install --break-system-packages
+--ignore-installed -r /opt/sdr-agent/requirements.txt`. The client bundle (`sdr-agent-<ver>.tar.gz`,
+gitignored build artifact from `deploy/build_bundle.sh`) must be rebuilt + re-staged into
+`sdr-client/bundles/` for the client's "Provision unit" flow to ship the fixed script.
 
 ## Planned — Hold step (operator-gated sequence pause): DESIGN AGREED, building in phases
 Design doc lives in the client repo: **`sdr-client/docs/sequence-hold-step.md`** (cross-repo spec +

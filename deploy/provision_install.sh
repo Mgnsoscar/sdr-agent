@@ -92,15 +92,21 @@ WHEELS=""; [ -d "$HERE/wheels" ] && WHEELS="$HERE/wheels"
 if "${PIP_BASE[@]}" --no-index ${WHEELS:+--find-links "$WHEELS"} -r "$REL/requirements.txt"; then
     echo "    dependencies satisfied offline"
 else
-    echo "    offline install incomplete — falling back to online (fast fail-out)"
-    # NO --upgrade: install only what's missing and leave already-satisfied deps alone. With
-    # --upgrade, pip would try to UPGRADE (and therefore UNINSTALL) an apt/dpkg-managed transitive
-    # dep that has no RECORD file — e.g. python3-typing-extensions on a Python-3.13 Pi, which fails
-    # with "no RECORD file was found … installed by debian" and aborts the whole provision. This is
-    # the same class of problem as psutil (see requirements.txt). The `==` pins are still enforced
-    # normally (a mismatched pip-owned version is replaced), so re-provisioning to a newer bundle
-    # still upgrades the pinned packages.
-    "${PIP_BASE[@]}" --retries 1 --timeout 15 -r "$REL/requirements.txt"
+    echo "    offline install incomplete — falling back to online"
+    # --ignore-installed: install every requirement (and its transitive deps) fresh into
+    # /usr/local WITHOUT trying to uninstall anything already on the system. This is the
+    # documented remedy for Raspberry Pi OS / Python 3.13, where transitive deps like
+    # typing_extensions (and PyYAML) are apt/dpkg-managed under /usr/lib/python3/dist-packages
+    # with NO RECORD file. The pinned stack (fastapi/pydantic/…) resolves a typing_extensions
+    # NEWER than the apt-shipped 4.13.2, so pip tries to UNINSTALL the Debian copy first and
+    # aborts the whole provision with "no RECORD file was found … installed by debian" — this
+    # happens with OR without --upgrade, because the resolver picks the newer version to satisfy
+    # the requirement, not because of an upgrade flag. --ignore-installed sidesteps the uninstall
+    # entirely: the pip copies land in /usr/local/lib/python3.x/dist-packages, which precedes
+    # dist-packages on sys.path, so they shadow the apt ones. psutil stays apt-only (it is not in
+    # requirements.txt, so pip never touches it), and the `==` pins are still enforced. Same class
+    # as the psutil note in requirements.txt, one level down into the transitive deps.
+    "${PIP_BASE[@]}" --ignore-installed --retries 1 --timeout 15 -r "$REL/requirements.txt"
 fi
 
 echo "==> Installing systemd units"
