@@ -128,6 +128,58 @@ def test_hold_aware_run_parks_then_proceeds(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+# ── A single-unit PLAN arm (inline plan-local steps + plan_id) parks and keeps its id ─
+
+def test_hold_aware_arm_with_inline_steps_and_plan_id_parks(tmp_path, monkeypatch):
+    """The single-unit, operator-present PLAN path (sdr-client plans_tab, docs
+    §6–§7): a plan arms the unit hold_aware with an INLINE plan-local step copy (the
+    Hold intact) and a plan_id, even though the unit's STORED sequence is Hold-free.
+    The run must park at the hold and carry the plan_id so the client can regroup it
+    and drive Proceed. No agent code change — this pins the contract the client relies
+    on (arm never rejects hold_aware for a plan-stamped / inline-steps arm)."""
+    async def scenario():
+        mgr, runner = _mk(tmp_path, monkeypatch)
+        await mgr.startup()
+        await runner.startup()
+        try:
+            stored = await runner.create_sequence(CreateSequenceRequest(
+                name="plain", steps=[
+                    SequenceStep(anchor="start", offset_s=0.0, action=StepAction.START,
+                                 task_name="tx"),
+                    SequenceStep(anchor="stop", offset_s=0.0, action=StepAction.STOP,
+                                 task_name="tx")]))
+            now = datetime.now(timezone.utc)
+            run = await runner.arm(
+                stored.id,
+                ArmSequenceRequest(on_air_at=(now + timedelta(seconds=0.4)).isoformat(),
+                                   open_ended=True, hold_aware=True, max_hold_s=0,
+                                   plan_id="plan-x", plan_name="LoL plan",
+                                   steps=_hold_steps()),
+                None,
+            )
+            rid = run.id
+            assert run.plan_id == "plan-x"                     # stamped at arm
+
+            await asyncio.sleep(2.8)
+            held = runner.get_run(rid)
+            assert held.state == SequenceState.HOLDING
+            assert held.hold_aware is True and held.plan_id == "plan-x"
+            assert held.held_actual is not None and held.open_ended is True
+            got = await mgr.get_params("tx")
+            assert got["current"]["gain"] == 41                # holds window A's last value
+
+            resumed = await runner.proceed(rid, ProceedRequest(
+                proceed_at=datetime.now(timezone.utc).isoformat()))
+            assert resumed.state == SequenceState.RUNNING and resumed.plan_id == "plan-x"
+        finally:
+            await runner.shutdown()
+            if mgr.is_running("tx"):
+                await mgr.stop("tx")
+            await mgr.shutdown()
+
+    asyncio.run(scenario())
+
+
 # ── Proceed resolves a hold-anchored down-ramp (the motivating case) ─────────
 
 def test_proceed_resolves_a_window_b_ramp(tmp_path, monkeypatch):

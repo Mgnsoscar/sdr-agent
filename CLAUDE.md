@@ -58,6 +58,17 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — Hold step runnable in PLANS (single-unit, operator-present): agent test-only
+Client-side scope expansion (see `sdr-client/CLAUDE.md`): a single-unit, operator-present PLAN armed
+directly now honours the Hold (arms the unit `hold_aware` with an inline plan-local step copy + a
+`plan_id`), while multi-unit plans and the unattended schedule still compile the Hold out. The agent
+already supports this — `arm` accepts ANY `hold_aware` arm (it never keys the decision on `plan_id` or
+inline `steps`; it refuses only a Hold armed WITHOUT `hold_aware`, §5.2/§7) and stamps `plan_id` onto the
+run — so there is **no agent code change**, only a regression test pinning the contract the client now
+relies on: `tests/test_sequence_hold_runtime.py::test_hold_aware_arm_with_inline_steps_and_plan_id_parks`
+(a hold-aware arm with inline Hold-bearing steps + a plan_id, over a Hold-free STORED sequence, parks at
+the hold, carries the plan_id, and proceeds). Suite 426 → 427.
+
 ## Current state — Hold-step client authoring fixes (window-B ramps + duration tasks): agent test-only
 Client-side Hold UI fixes (see `sdr-client/CLAUDE.md`) let an operator anchor a RAMP (the down-ramp)
 AND a DURATION task's START to the Hold — both are window-B, `anchor="hold"`. The agent already
