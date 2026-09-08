@@ -285,7 +285,22 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # for every engage_pct, and the engagement % only steers WHEN the attenuator engages (paramkit/
 # achievable.py, mirrored to sdr-client/state/achievable.py). The version bump lets the OTA/"Update
 # agent…" flow push the corrected resolver onto already-deployed units.
-AGENT_VERSION = "1.15.1"
+# 1.16.0 added the "sequence-hold" capability (below): the Hold-step data model + validation vocabulary
+# (StepAction.HOLD, SequenceState.HOLDING, anchor="hold", the SequenceRun/ArmSequenceRequest fields).
+# Phase 0 was data-model only — a Hold-bearing sequence stored/round-tripped but was refused at arm.
+# 1.17.0 ships the Phase-1 HOLDING RUNTIME behind that same capability: a hold-aware arm resolves only
+# window A and parks the run at the hold (SequenceState.HOLDING, RF live); POST /sequence-runs/{id}/
+# proceed resolves window B from the resume instant; a max_hold_s deadman auto-aborts; a HOLDING run is
+# abort-on-restart. The capability set is unchanged, but the version bump lets the OTA/"Update agent…"
+# flow push the working runtime onto units still on 1.16.0 (docs/sequence-hold-step.md §5).
+# 1.18.0 adds the "sequence-hold-now" capability (below): POST /sequence-runs/{id}/hold-now
+# fast-forwards a RUNNING hold-aware run straight to its Hold (Phase 3b, docs/sequence-hold-step.md
+# §5.4) — the up-ramp stops emitting and the task holds its current live value.
+# 1.19.0 adds "sequence-hold-edit": POST …/proceed now honours ProceedRequest.steps (the operator's
+# EDITED sequence — edit-while-holding, Phase 3c §6.4), re-extracting window B from it instead of the
+# window B stored at arm. A ≤1.18 agent ignores req.steps (uses the stored window B), so the client
+# gates its window-B edit UI on this capability — a safety gate, else an edit would be silently lost.
+AGENT_VERSION = "1.19.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -368,6 +383,24 @@ AGENT_CAPABILITIES = [
                                          # wasn't measured. Gain is still clamped to the ceiling.
                                          # A ≤1.14.0 agent clamps instead, so the client's wider
                                          # range wouldn't match what the unit delivers — a gate
+    "sequence-hold",                     # a sequence may contain a HOLD step (StepAction.HOLD +
+                                         # anchor="hold" window-B steps): an operator-gated pause
+                                         # that parks a run at the hold (RF live) until the operator
+                                         # proceeds. Phase 0 is the data model + validation only (a
+                                         # Hold-bearing sequence stores/round-trips but is refused at
+                                         # arm); the holding runtime is Phase 1. The client gates Hold
+                                         # authoring/arming on this string so it never offers the
+                                         # feature to an agent that can't run it (a safety gate —
+                                         # docs/sequence-hold-step.md)
+    "sequence-hold-now",                 # POST /sequence-runs/{id}/hold-now: fast-forward a RUNNING
+                                         # hold-aware run straight to its Hold (skip the rest of
+                                         # window A, hold the current live value). Phase 3b; the
+                                         # client gates the "Hold now" button on this string.
+    "sequence-hold-edit",                # POST …/proceed honours ProceedRequest.steps (the edited
+                                         # sequence) — edit-while-holding re-resolves window B from
+                                         # the operator's revision. Phase 3c; the client gates its
+                                         # window-B edit UI on this string (a ≤1.18 agent ignores
+                                         # req.steps, so an edit would be silently lost).
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

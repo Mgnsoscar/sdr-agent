@@ -51,7 +51,9 @@ POST   /sequences/{id}/arm            → arm → SequenceRun    body: ArmSequen
 GET    /sequence-runs                 → list[SequenceRun]
 GET    /sequence-runs/{id}            → SequenceRun
 PATCH  /sequence-runs/{id}            → move on-air stop     body: PatchSequenceRunRequest
-DELETE /sequence-runs/{id}            → cancel (armed) or abort (running)
+DELETE /sequence-runs/{id}            → cancel (armed) or abort (running/holding)
+POST   /sequence-runs/{id}/proceed    → resume a HOLDING run body: ProceedRequest
+POST   /sequence-runs/{id}/hold-now    → fast-forward a RUNNING run to its Hold
 
 POST   /panic                         → emergency stop everything → PanicResult
 """
@@ -82,7 +84,7 @@ from .models import (
     AgentInfo, AgentRelease, ArmSequenceRequest, CreateEventRequest, CreateSequenceRequest,
     DeployLibraryRequest, DeployLibraryResult, ExitRecord, Library, LibraryScript,
     PanicResult, PatchEventRequest, PatchSequenceRunRequest, Plan,
-    ProcessStatus, PutPlansRequest, PutScheduleRequest, ScheduledEvent,
+    ProceedRequest, ProcessStatus, PutPlansRequest, PutScheduleRequest, ScheduledEvent,
     ScheduledPlan, SdrStatus, Sequence, SequenceRun,
     SetParamsRequest, SetTimeRequest, SetTimeResult, StartRequest, SystemHealth,
     TaskConfig, UpdateResult,
@@ -1558,7 +1560,7 @@ async def patch_sequence_run(
 @app.delete("/sequence-runs/{run_id}", response_model=SequenceRun, tags=["sequence-runs"],
             dependencies=[Depends(verify_key)])
 async def cancel_sequence_run(run_id: str, runner: SequenceRunner = Depends(get_runner)):
-    """Cancel an armed run, or abort a running run (stops every task it touches,
+    """Cancel an armed run, or abort a running/holding run (stops every task it touches,
     halts all remaining steps so nothing re-fires)."""
     try:
         return await runner.cancel_or_abort(run_id)
@@ -1566,6 +1568,39 @@ async def cancel_sequence_run(run_id: str, runner: SequenceRunner = Depends(get_
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/sequence-runs/{run_id}/proceed", response_model=SequenceRun, tags=["sequence-runs"],
+          dependencies=[Depends(verify_key)])
+async def proceed_sequence_run(
+    run_id: str,
+    req: ProceedRequest,
+    runner: SequenceRunner = Depends(get_runner),
+):
+    """Resume a HOLDING run at the operator's chosen instant. Window B (the post-hold
+    steps — e.g. the down-ramp and off-air) is resolved relative to proceed_at and the
+    run returns to RUNNING. 409 if the run is not holding (docs/sequence-hold-step.md §5.3)."""
+    try:
+        return await runner.proceed(run_id, req)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.post("/sequence-runs/{run_id}/hold-now", response_model=SequenceRun, tags=["sequence-runs"],
+          dependencies=[Depends(verify_key)])
+async def hold_now_sequence_run(run_id: str, runner: SequenceRunner = Depends(get_runner)):
+    """Fast-Forward-to-Hold: jump a RUNNING hold-aware run straight to its Hold now, skipping
+    the rest of window A (the up-ramp stops emitting; the task holds its current live value).
+    409 if the run is not a RUNNING hold-aware run with a pending Hold (docs/sequence-hold-step.md
+    §5.4)."""
+    try:
+        return await runner.hold_now(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 # ── Panic / emergency stop ────────────────────────────────────────────────────
