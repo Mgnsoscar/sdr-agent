@@ -27,6 +27,7 @@ def test_capabilities_advertised_and_stable():
     assert "calibration-deembed-per-signal" in cfg.AGENT_CAPABILITIES  # per-signal + source-bias de-embed
     assert "calibration-extrapolate" in cfg.AGENT_CAPABILITIES            # measured-curve extrapolation
     assert "sequence-hold" in cfg.AGENT_CAPABILITIES                       # Hold step (operator-gated pause)
+    assert "sequence-hold-now" in cfg.AGENT_CAPABILITIES                   # Fast-Forward-to-Hold (Phase 3b)
 
 
 def test_agent_info_carries_capabilities():

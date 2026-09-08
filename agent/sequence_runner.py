@@ -811,6 +811,47 @@ class SequenceRunner:
                     run.id, t_resume.isoformat(), run.on_air_end)
         return run
 
+    async def hold_now(self, run_id: str) -> SequenceRun:
+        """Fast-Forward-to-Hold (docs/sequence-hold-step.md §5.4): jump a RUNNING hold-aware
+        run straight to its Hold NOW, without waiting out the rest of window A.
+
+        Un-fired window-A steps are marked skipped so the tick loop won't fire them (the
+        in-progress up-ramp simply stops emitting further TUNE points), the task keeps its
+        CURRENT live value (the last TUNE that fired — the state we freeze), and the run
+        enters HOLDING immediately, stamping held_actual = now (so the max-hold deadman runs
+        from here). The operator then edits/schedules window B and proceeds, exactly as for a
+        run that reached its hold on its own — the test jumps to the interesting state without
+        waiting out a ramp whose outcome is already known.
+        """
+        async with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise KeyError(f"Unknown run: '{run_id}'")
+            if run.state != SequenceState.RUNNING:
+                raise ValueError(
+                    f"cannot fast-forward a run in state '{run.state}' (it is not running)")
+            if not (run.hold_aware and run.hold_at_offset_s is not None):
+                raise ValueError("this run has no Hold to fast-forward to")
+            if run.held_actual is not None:
+                raise ValueError("run is already at its Hold")
+
+            now = _utcnow_dt()
+            skipped = sum(1 for s in run.steps if s.fired_actual is None)
+            for s in run.steps:
+                if s.fired_actual is None:
+                    s.fired_actual = "skipped"       # sentinel: never fired, don't fire (see _tick)
+            run.state = SequenceState.HOLDING
+            run.held_actual = now.isoformat()
+            self._persist_runs()
+
+        rl = self._run_logs.get(run.id)
+        if rl is not None:
+            rl.annotate(f"HELD (fast-forward — {skipped} window-A step(s) skipped) — awaiting proceed")
+        await self._fire(run, "sequence_hold",
+                         detail="holding (fast-forwarded) — awaiting proceed")
+        logger.info("Run %s HOLDING (fast-forwarded; %d window-A step(s) skipped)", run.id, skipped)
+        return run
+
     async def cancel_or_abort(self, run_id: str) -> SequenceRun:
         """
         Cancel an ARMED run (never fires), or ABORT a RUNNING/HOLDING run:

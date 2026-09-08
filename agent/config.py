@@ -293,7 +293,10 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # proceed resolves window B from the resume instant; a max_hold_s deadman auto-aborts; a HOLDING run is
 # abort-on-restart. The capability set is unchanged, but the version bump lets the OTA/"Update agent…"
 # flow push the working runtime onto units still on 1.16.0 (docs/sequence-hold-step.md §5).
-AGENT_VERSION = "1.17.0"
+# 1.18.0 adds the "sequence-hold-now" capability (below): POST /sequence-runs/{id}/hold-now
+# fast-forwards a RUNNING hold-aware run straight to its Hold (Phase 3b, docs/sequence-hold-step.md
+# §5.4) — the up-ramp stops emitting and the task holds its current live value.
+AGENT_VERSION = "1.18.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -385,6 +388,10 @@ AGENT_CAPABILITIES = [
                                          # authoring/arming on this string so it never offers the
                                          # feature to an agent that can't run it (a safety gate —
                                          # docs/sequence-hold-step.md)
+    "sequence-hold-now",                 # POST /sequence-runs/{id}/hold-now: fast-forward a RUNNING
+                                         # hold-aware run straight to its Hold (skip the rest of
+                                         # window A, hold the current live value). Phase 3b; the
+                                         # client gates the "Hold now" button on this string.
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

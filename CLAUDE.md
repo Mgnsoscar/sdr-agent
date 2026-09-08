@@ -27,9 +27,10 @@ the drift guard is pytest-only.
 - **Capabilities + version:** a new client-visible feature adds a string to
   `AGENT_CAPABILITIES` and bumps `AGENT_VERSION` (both in `agent/config.py`); `test_meta_endpoint.py`
   asserts the capability set. The client feature-gates on these exact strings. Current version is
-  in `config.py` (`1.17.0`: the Hold-step HOLDING runtime — Phase 1 — behind the `sequence-hold`
-  capability added in 1.16.0; a hold-aware arm parks at the hold and `POST …/proceed` resolves the
-  post-hold window).
+  in `config.py` (`1.18.0`: Fast-Forward-to-Hold — Phase 3b — `POST …/hold-now` behind the new
+  `sequence-hold-now` capability; `1.17.0` shipped the Hold-step HOLDING runtime — Phase 1 — behind
+  `sequence-hold` (added 1.16.0): a hold-aware arm parks at the hold and `POST …/proceed` resolves
+  the post-hold window).
 
 ## Where things live
 - `agent/calibration.py` (~1.7k lines) — the **calibration resolver**. `resolve(unit_doc, …,
@@ -55,6 +56,29 @@ declared **laws** (affine in log10 of task params; `in`/`out` families abs↔den
 between quantities. Safety **limits** are dBm ceilings on stage boundaries; the LIMITING reading
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
+
+## Current state — Hold step Phase 3b (Fast-Forward-to-Hold): COMPLETE (branch `claude/hold-step-phase-0-wwwxf7`, cross-repo)
+Design §5.4. `POST /sequence-runs/{id}/hold-now` → `SequenceRunner.hold_now(run_id)` jumps a RUNNING
+hold-aware run straight to its Hold NOW, without waiting out the rest of window A — for the real
+workflow (loss-of-lock happens far below the estimated ramp top, so the remaining run-up is pure
+waste). Requires `run.state == RUNNING`, `hold_aware`, a pending Hold (`hold_at_offset_s` set,
+`held_actual` None); else `ValueError` → **409**. It marks every un-fired `run.steps` entry
+`fired_actual = "skipped"` (a sentinel — `fired_actual` is only ever tested `is (not) None`, never
+parsed, so this is safe; the up-ramp simply stops emitting further TUNE points and the task holds its
+CURRENT live value), transitions `RUNNING → HOLDING`, stamps `held_actual = now` (so the `max_hold_s`
+deadman runs from here), and emits `sequence_hold` (annotated "fast-forward"). From there `proceed`,
+the deadman, abort and restart-abort all behave exactly as for a run that reached its hold on its own.
+`agent/main.py` adds the endpoint (404 unknown / 409 wrong-state); `config.py` bumps
+`AGENT_VERSION 1.17.0 → 1.18.0` and adds capability **`sequence-hold-now`** (the client gates its
+"Hold now" button on it). Tests: `tests/test_sequence_hold_runtime.py`
+(`test_hold_now_fast_forwards_to_the_hold` — fast-forward mid-run-up skips the remaining window-A
+tune, holds the current value, then proceeds to window B; `test_hold_now_requires_a_running_hold_aware_run`
+— refuses a Hold-free and an already-holding run) + `test_meta_endpoint.py` asserts the capability;
+suite 422 → 424. Client side (Phase 3b, `sdr-client`): `api/client.py::hold_now_sequence_run` +
+`SEQUENCE_HOLD_NOW_CAPABILITY` + a "Hold now" row button in `ui/sequences_panel.py` (shown only on a
+RUNNING hold-aware not-yet-held run when the agent advertises the capability). `place_ramp`/`ramp.py`
+untouched (drift guard intact). **NEXT — Phase 3c**: edit-while-holding (the agent's `proceed`
+honours `ProceedRequest.steps` + a client window-B edit flow, §6.4).
 
 ## Current state — Hold step Phase 1 (HOLDING runtime): COMPLETE (branch `claude/hold-step-phase-0-wwwxf7`, agent-only)
 Design doc lives in the client repo: **`sdr-client/docs/sequence-hold-step.md`** (cross-repo spec +

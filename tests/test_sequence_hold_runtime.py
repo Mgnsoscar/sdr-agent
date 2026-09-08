@@ -213,6 +213,143 @@ def test_max_hold_deadman_auto_aborts(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+# ── Fast-Forward-to-Hold (§5.4) ──────────────────────────────────────────────
+
+def _ff_steps():
+    """START @0 → tune gain=41 @1.0 → tune gain=55 @3.0 → HOLD @3.2 → (window B: tune 21 @0,
+    tune 15 @1.0) → STOP.
+
+    Two window-A tunes with a wide gap, so a fast-forward can land AFTER the first (41) has
+    applied but BEFORE the second (55), proving the run holds its current value and skips the rest.
+    Window B carries two tunes so the run stays on air ~1 s after proceed (long enough to read the
+    resumed value before the stop lands)."""
+    return [
+        SequenceStep(anchor="start", offset_s=0.0, action=StepAction.START, task_name="tx"),
+        SequenceStep(anchor="start", offset_s=1.0, action=StepAction.TUNE,
+                     task_name="tx", params={"gain": 41}),
+        SequenceStep(anchor="start", offset_s=3.0, action=StepAction.TUNE,
+                     task_name="tx", params={"gain": 55}),
+        SequenceStep(anchor="start", offset_s=3.2, action=StepAction.HOLD, task_name=""),
+        SequenceStep(anchor="hold", offset_s=0.0, action=StepAction.TUNE,
+                     task_name="tx", params={"gain": 21}),
+        SequenceStep(anchor="hold", offset_s=1.0, action=StepAction.TUNE,
+                     task_name="tx", params={"gain": 15}),
+        SequenceStep(anchor="stop", offset_s=0.0, action=StepAction.STOP, task_name="tx"),
+    ]
+
+
+def test_hold_now_fast_forwards_to_the_hold(tmp_path, monkeypatch):
+    async def scenario():
+        mgr, runner = _mk(tmp_path, monkeypatch)
+        await mgr.startup()
+        await runner.startup()
+        try:
+            seq = await runner.create_sequence(CreateSequenceRequest(
+                name="fast-forward", steps=_ff_steps()))
+            now = datetime.now(timezone.utc)
+            run = await runner.arm(
+                seq.id,
+                ArmSequenceRequest(on_air_at=(now + timedelta(seconds=0.4)).isoformat(),
+                                   open_ended=True, hold_aware=True, max_hold_s=0),
+                None,
+            )
+            rid = run.id
+
+            # +2.8s: START fired (~+0.4), the first tune (41 @+1.4) applied, the run is RUNNING and
+            # the second tune (55 @+3.4) + the natural hold (+3.6) are still ahead.
+            await asyncio.sleep(2.8)
+            assert runner.get_run(rid).state == SequenceState.RUNNING
+            got = await mgr.get_params("tx")
+            assert got["current"]["gain"] == 41
+
+            # Fast-forward to the hold NOW — the run parks immediately, holding gain 41.
+            held = await runner.hold_now(rid)
+            assert held.state == SequenceState.HOLDING
+            assert held.held_actual is not None
+            assert held.on_air_end is None and held.open_ended is True
+            # The un-fired window-A tune (55) is skipped (never fires); START/41 kept their times.
+            skipped = [s for s in held.steps if s.fired_actual == "skipped"]
+            assert len(skipped) == 1 and skipped[0].params.get("gain") == 55
+            assert not any(s.anchor == "hold" for s in held.steps)     # window B still deferred
+            assert len(held.window_b_steps) == 3                        # 2 hold tunes + the stop
+
+            # The skipped tune never applies — the signal holds 41, not 55, past its would-be time.
+            await asyncio.sleep(1.2)
+            got = await mgr.get_params("tx")
+            assert got["current"]["gain"] == 41
+
+            # Proceed from the fast-forwarded hold → window B (tune 21) resolves and applies.
+            resumed = await runner.proceed(
+                rid, ProceedRequest(proceed_at=datetime.now(timezone.utc).isoformat()))
+            assert resumed.state == SequenceState.RUNNING
+            await asyncio.sleep(0.6)
+            got = await mgr.get_params("tx")
+            assert got["current"]["gain"] == 21
+        finally:
+            await runner.shutdown()
+            if mgr.is_running("tx"):
+                await mgr.stop("tx")
+            await mgr.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_hold_now_requires_a_running_hold_aware_run(tmp_path, monkeypatch):
+    async def scenario():
+        mgr, runner = _mk(tmp_path, monkeypatch)
+        await mgr.startup()
+        await runner.startup()
+        try:
+            # A Hold-FREE run can't be fast-forwarded (no Hold to jump to).
+            seq = await runner.create_sequence(CreateSequenceRequest(
+                name="no-hold", steps=[
+                    SequenceStep(anchor="start", offset_s=0.0, action=StepAction.START,
+                                 task_name="tx"),
+                    SequenceStep(anchor="stop", offset_s=0.0, action=StepAction.STOP,
+                                 task_name="tx")]))
+            now = datetime.now(timezone.utc)
+            run = await runner.arm(
+                seq.id,
+                ArmSequenceRequest(on_air_at=(now + timedelta(seconds=0.4)).isoformat(),
+                                   on_air_end=(now + timedelta(seconds=8)).isoformat()),
+                (now + timedelta(seconds=8)).isoformat(),
+            )
+            await asyncio.sleep(0.9)                                     # on air, RUNNING
+            try:
+                await runner.hold_now(run.id)
+                assert False, "expected hold_now to refuse a Hold-free run"
+            except ValueError as exc:
+                assert "no Hold" in str(exc)
+            # Free the single TX channel before arming the next run.
+            await runner.cancel_or_abort(run.id)
+            await asyncio.sleep(0.4)
+
+            # And an already-HOLDING run can't be fast-forwarded again.
+            hseq = await runner.create_sequence(CreateSequenceRequest(
+                name="held", steps=_hold_steps()))
+            hrun = await runner.arm(
+                hseq.id,
+                ArmSequenceRequest(on_air_at=(datetime.now(timezone.utc)
+                                              + timedelta(seconds=0.4)).isoformat(),
+                                   open_ended=True, hold_aware=True, max_hold_s=0),
+                None,
+            )
+            await asyncio.sleep(2.6)
+            assert runner.get_run(hrun.id).state == SequenceState.HOLDING
+            try:
+                await runner.hold_now(hrun.id)
+                assert False, "expected hold_now to refuse an already-holding run"
+            except ValueError as exc:
+                assert "not running" in str(exc)
+        finally:
+            await runner.shutdown()
+            if mgr.is_running("tx"):
+                await mgr.stop("tx")
+            await mgr.shutdown()
+
+    asyncio.run(scenario())
+
+
 # ── Abort while holding ──────────────────────────────────────────────────────
 
 def test_abort_while_holding_drops_rf(tmp_path, monkeypatch):

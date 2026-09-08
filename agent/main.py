@@ -53,6 +53,7 @@ GET    /sequence-runs/{id}            → SequenceRun
 PATCH  /sequence-runs/{id}            → move on-air stop     body: PatchSequenceRunRequest
 DELETE /sequence-runs/{id}            → cancel (armed) or abort (running/holding)
 POST   /sequence-runs/{id}/proceed    → resume a HOLDING run body: ProceedRequest
+POST   /sequence-runs/{id}/hold-now    → fast-forward a RUNNING run to its Hold
 
 POST   /panic                         → emergency stop everything → PanicResult
 """
@@ -1581,6 +1582,21 @@ async def proceed_sequence_run(
     run returns to RUNNING. 409 if the run is not holding (docs/sequence-hold-step.md §5.3)."""
     try:
         return await runner.proceed(run_id, req)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.post("/sequence-runs/{run_id}/hold-now", response_model=SequenceRun, tags=["sequence-runs"],
+          dependencies=[Depends(verify_key)])
+async def hold_now_sequence_run(run_id: str, runner: SequenceRunner = Depends(get_runner)):
+    """Fast-Forward-to-Hold: jump a RUNNING hold-aware run straight to its Hold now, skipping
+    the rest of window A (the up-ramp stops emitting; the task holds its current live value).
+    409 if the run is not a RUNNING hold-aware run with a pending Hold (docs/sequence-hold-step.md
+    §5.4)."""
+    try:
+        return await runner.hold_now(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
