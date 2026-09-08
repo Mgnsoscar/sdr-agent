@@ -39,11 +39,16 @@ dBm/Hz, ceiling gauged through a full-/total-power law). `run_local.sh` also see
 three NO-HARDWARE **mock transmit tasks** — `mock_prn`/`mock_chirp`/`mock_cw` (from `sdr-scripts`
 `mock_gps_ca_code_1.023Mcps_tx.py` / `mock_fm_chirp_tx.py` / `mock_cw_tx.py`, each mirroring the real
 script's params + `CAL_POWER_LAWS`) + `atten_set` (`mock_atten.py`) — so all three are ARMABLE (real power
-card, arm/hold/proceed) with no radio. It also seeds a `sequences.json` with **one RF-gated sequence per
-signal** (`seq-mock-prn`/`seq-mock-chirp`/`seq-mock-cw`): the task launches 1 s before on-air with `--rf
-off` (muted pre-roll), a TUNE turns RF ON at the on-air anchor and OFF at off-air, and the task stops 1 s
-after off-air; `--power` is calibrated mid-range and the agent auto-commands `atten_set` to realize it.
-See `docs/local-integration-run.md`; view it with `screenshot.py --tab calibration`.
+card, arm/hold/proceed) with no radio. It also copies a `sequences.json` seed (from
+`deploy/sample-calibration/`) with **one RF-gated sequence per signal**
+(`seq-mock-prn`/`seq-mock-chirp`/`seq-mock-cw`): the task launches 1 s before on-air with `--rf off`
+(muted pre-roll), a TUNE turns RF ON at the on-air anchor and OFF at off-air, and the task stops 1 s after
+off-air; `--power` is calibrated mid-range and the agent auto-commands `atten_set` to realize it. That
+seed is **authored through the client** — `deploy/make_sample_sequences.py` builds each with the client's
+own timeline authoring code (`ui.timeline_model` → `items_to_steps`, as `TimelineEditor.steps()` does) +
+`api.models`, so a fresh session shows exactly what the client produces (regenerate: `python3
+deploy/make_sample_sequences.py`, needs a sibling `sdr-client`). See `docs/local-integration-run.md`;
+view it with `screenshot.py --tab calibration`.
 
 ## Cross-repo invariants (do not break)
 - **Drift guard (`tests/test_shared_source_drift.py`):** `agent/argspec.py` and `agent/ramp.py`

@@ -117,6 +117,14 @@ agent auto-commands the `atten_set` attenuator to realize the requested delivere
 explicit attenuator step needed). The sequences carry no Hold — add one in the editor to exercise
 the hold/proceed flow.
 
+These were **authored through the client**, not hand-written: `deploy/make_sample_sequences.py`
+builds each one with the client's own timeline authoring code (`ui.timeline_model` item model →
+`items_to_steps`, the flattener `TimelineEditor.steps()` uses) and the client's `api.models`, then
+writes `deploy/sample-calibration/sequences.json`. `run_local.sh` copies that file verbatim into
+the unit's `configs/` (like `calibration.json`/`components.yaml`), and the agent loads it with the
+ids preserved — so a fresh session shows exactly what the client produced. Regenerate with
+`python3 deploy/make_sample_sequences.py` (needs a sibling `sdr-client` checkout; no agent/radio).
+
 See it in the client: `python3 ../sdr-client/tools/screenshot.py --tab calibration --out /tmp/cal.png`
 (drills into the unit's Calibration panel). Regenerate/validate the doc against the
 resolver by editing `deploy/sample-calibration/` and re-running `run_local.sh` (delete

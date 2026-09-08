@@ -88,62 +88,17 @@ YAML
 fi
 
 # One RF-gated broadcast sequence per signal, so each is armable end to end from the client's
-# Sequences tab with no hardware. The shape the owner asked for: the transmit task launches 1 s
-# BEFORE on-air with RF OFF (muted pre-roll — set the level, radio silent), a TUNE turns RF ON at
-# the on-air anchor and OFF again at the off-air anchor, and the task stops 1 s AFTER off-air.
-# --power is in each signal's calibrated quantity (dBm for CW; dBm/Hz base density for PRN/chirp),
-# mid-range for the seeded calibration. Only written if absent — a fresh RUN_DIR re-seeds.
+# Sequences tab with no hardware. These were AUTHORED IN THE CLIENT (the timeline editor's
+# item→step flattener + the create-sequence API) and snapshotted to deploy/sample-calibration/
+# sequences.json; seeded verbatim here (copied like calibration.json/components.yaml), so a fresh
+# session gets the exact sequences the client produced. Each has the shape the owner asked for: the
+# transmit task launches 1 s BEFORE on-air with RF OFF (muted pre-roll), a TUNE turns RF ON at the
+# on-air anchor and OFF again at the off-air anchor, and the task stops 1 s AFTER off-air. Only
+# copied if absent — a fresh RUN_DIR re-seeds. To regenerate, see deploy/make_sample_sequences.py.
 SEQS="$STATE/configs/sequences.json"
-if [ ! -e "$SEQS" ] || ! grep -q "seq-mock-prn" "$SEQS" 2>/dev/null; then
-    cat > "$SEQS" <<'JSON'
-{
-  "sequences": [
-    {
-      "id": "seq-mock-prn",
-      "name": "Mock PRN (GPS C/A) — RF-gated",
-      "description": "Launch the GPS C/A mock 1 s before on-air with RF off; RF on at on-air, off at off-air; stop 1 s after. No hardware.",
-      "types": ["broadcaster"],
-      "steps": [
-        {"anchor": "start", "offset_s": -1.0, "action": "start", "task_name": "mock_prn",
-         "args": ["--prn", "1", "--freq", "1575.42", "--sidelobes", "5", "--power", "-150", "--rf", "off"],
-         "replace_args": true},
-        {"anchor": "start", "offset_s": 0.0, "action": "tune", "task_name": "mock_prn", "params": {"rf": "on"}},
-        {"anchor": "stop", "offset_s": 0.0, "action": "tune", "task_name": "mock_prn", "params": {"rf": "off"}},
-        {"anchor": "stop", "offset_s": 1.0, "action": "stop", "task_name": "mock_prn"}
-      ]
-    },
-    {
-      "id": "seq-mock-chirp",
-      "name": "Mock chirp / sweep — RF-gated",
-      "description": "Launch the FM-chirp mock 1 s before on-air with RF off; RF on at on-air, off at off-air; stop 1 s after. No hardware.",
-      "types": ["broadcaster"],
-      "steps": [
-        {"anchor": "start", "offset_s": -1.0, "action": "start", "task_name": "mock_chirp",
-         "args": ["--band-mode", "center_bw", "--freq", "1575.42", "--bw", "20", "--rate", "200", "--power", "-180", "--rf", "off"],
-         "replace_args": true},
-        {"anchor": "start", "offset_s": 0.0, "action": "tune", "task_name": "mock_chirp", "params": {"rf": "on"}},
-        {"anchor": "stop", "offset_s": 0.0, "action": "tune", "task_name": "mock_chirp", "params": {"rf": "off"}},
-        {"anchor": "stop", "offset_s": 1.0, "action": "stop", "task_name": "mock_chirp"}
-      ]
-    },
-    {
-      "id": "seq-mock-cw",
-      "name": "Mock CW tone — RF-gated",
-      "description": "Launch the CW mock 1 s before on-air with RF off; RF on at on-air, off at off-air; stop 1 s after. No hardware.",
-      "types": ["broadcaster"],
-      "steps": [
-        {"anchor": "start", "offset_s": -1.0, "action": "start", "task_name": "mock_cw",
-         "args": ["--freq", "1575420000", "--power", "-60", "--rf", "off"],
-         "replace_args": true},
-        {"anchor": "start", "offset_s": 0.0, "action": "tune", "task_name": "mock_cw", "params": {"rf": "on"}},
-        {"anchor": "stop", "offset_s": 0.0, "action": "tune", "task_name": "mock_cw", "params": {"rf": "off"}},
-        {"anchor": "stop", "offset_s": 1.0, "action": "stop", "task_name": "mock_cw"}
-      ]
-    }
-  ]
-}
-JSON
-    echo "seeded sequences.json (seq-mock-prn / seq-mock-chirp / seq-mock-cw)"
+if [ ! -e "$SEQS" ] && [ -f "$HERE/deploy/sample-calibration/sequences.json" ]; then
+    cp "$HERE/deploy/sample-calibration/sequences.json" "$SEQS"
+    echo "seeded sequences.json (client-authored: mock PRN / chirp / CW, RF-gated)"
 fi
 
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"

@@ -1,0 +1,245 @@
+{
+  "sequences": [
+    {
+      "id": "seq-mock-prn",
+      "name": "Mock PRN (GPS C/A) \u2014 RF-gated",
+      "description": "Launch the GPS C/A mock 1 s before on-air with RF off; RF on at on-air, off at off-air; stop 1 s after. No hardware.",
+      "steps": [
+        {
+          "anchor": "start",
+          "offset_s": -1.0,
+          "offset_end_s": null,
+          "action": "start",
+          "task_name": "mock_prn",
+          "args": [
+            "--prn",
+            "1",
+            "--freq",
+            "1575.42",
+            "--sidelobes",
+            "5",
+            "--power",
+            "-150",
+            "--rf",
+            "off"
+          ],
+          "replace_args": true,
+          "inject_resume_offset": false,
+          "params": {},
+          "ramp": null,
+          "power_view": null,
+          "power_hold_dest": null
+        },
+        {
+          "anchor": "stop",
+          "offset_s": 1.0,
+          "offset_end_s": null,
+          "action": "stop",
+          "task_name": "mock_prn",
+          "args": [],
+          "replace_args": false,
+          "inject_resume_offset": false,
+          "params": {},
+          "ramp": null,
+          "power_view": null,
+          "power_hold_dest": null
+        },
+        {
+          "anchor": "start",
+          "offset_s": 0.0,
+          "offset_end_s": null,
+          "action": "tune",
+          "task_name": "mock_prn",
+          "args": [],
+          "replace_args": false,
+          "inject_resume_offset": false,
+          "params": {
+            "rf": "on"
+          },
+          "ramp": null,
+          "power_view": null,
+          "power_hold_dest": null
+        },
+        {
+          "anchor": "stop",
+          "offset_s": 0.0,
+          "offset_end_s": null,
+          "action": "tune",
+          "task_name": "mock_prn",
+          "args": [],
+          "replace_args": false,
+          "inject_resume_offset": false,
+          "params": {
+            "rf": "off"
+          },
+          "ramp": null,
+          "power_view": null,
+          "power_hold_dest": null
+        }
+      ],
+      "types": [
+        "broadcaster"
+      ]
+    },
+    {
+      "id": "seq-mock-chirp",
+      "name": "Mock chirp / sweep \u2014 RF-gated",
+      "description": "Launch the FM-chirp mock 1 s before on-air with RF off; RF on at on-air, off at off-air; stop 1 s after. No hardware.",
+      "steps": [
+        {
+          "anchor": "start",
+          "offset_s": -1.0,
+          "offset_end_s": null,
+          "action": "start",
+          "task_name": "mock_chirp",
+          "args": [
+            "--band-mode",
+            "center_bw",
+            "--freq",
+            "1575.42",
+            "--bw",
+            "20",
+            "--rate",
+            "200",
+            "--power",
+            "-180",
+            "--rf",
+            "off"
+          ],
+          "replace_args": true,
+          "inject_resume_offset": false,
+          "params": {},
+          "ramp": null,
+          "power_view": null,
+          "power_hold_dest": null
+        },
+        {
+          "anchor": "stop",
+          "offset_s": 1.0,
+          "offset_end_s": null,
+          "action": "stop",
+          "task_name": "mock_chirp",
+          "args": [],
+          "replace_args": false,
+          "inject_resume_offset": false,
+          "params": {},
+          "ramp": null,
+          "power_view": null,
+          "power_hold_dest": null
+        },
+        {
+          "anchor": "start",
+          "offset_s": 0.0,
+          "offset_end_s": null,
+          "action": "tune",
+          "task_name": "mock_chirp",
+          "args": [],
+          "replace_args": false,
+          "inject_resume_offset": false,
+          "params": {
+            "rf": "on"
+          },
+          "ramp": null,
+          "power_view": null,
+          "power_hold_dest": null
+        },
+        {
+          "anchor": "stop",
+          "offset_s": 0.0,
+          "offset_end_s": null,
+          "action": "tune",
+          "task_name": "mock_chirp",
+          "args": [],
+          "replace_args": false,
+          "inject_resume_offset": false,
+          "params": {
+            "rf": "off"
+          },
+          "ramp": null,
+          "power_view": null,
+          "power_hold_dest": null
+        }
+      ],
+      "types": [
+        "broadcaster"
+      ]
+    },
+    {
+      "id": "seq-mock-cw",
+      "name": "Mock CW tone \u2014 RF-gated",
+      "description": "Launch the CW mock 1 s before on-air with RF off; RF on at on-air, off at off-air; stop 1 s after. No hardware.",
+      "steps": [
+        {
+          "anchor": "start",
+          "offset_s": -1.0,
+          "offset_end_s": null,
+          "action": "start",
+          "task_name": "mock_cw",
+          "args": [
+            "--freq",
+            "1575420000",
+            "--power",
+            "-60",
+            "--rf",
+            "off"
+          ],
+          "replace_args": true,
+          "inject_resume_offset": false,
+          "params": {},
+          "ramp": null,
+          "power_view": null,
+          "power_hold_dest": null
+        },
+        {
+          "anchor": "stop",
+          "offset_s": 1.0,
+          "offset_end_s": null,
+          "action": "stop",
+          "task_name": "mock_cw",
+          "args": [],
+          "replace_args": false,
+          "inject_resume_offset": false,
+          "params": {},
+          "ramp": null,
+          "power_view": null,
+          "power_hold_dest": null
+        },
+        {
+          "anchor": "start",
+          "offset_s": 0.0,
+          "offset_end_s": null,
+          "action": "tune",
+          "task_name": "mock_cw",
+          "args": [],
+          "replace_args": false,
+          "inject_resume_offset": false,
+          "params": {
+            "rf": "on"
+          },
+          "ramp": null,
+          "power_view": null,
+          "power_hold_dest": null
+        },
+        {
+          "anchor": "stop",
+          "offset_s": 0.0,
+          "offset_end_s": null,
+          "action": "tune",
+          "task_name": "mock_cw",
+          "args": [],
+          "replace_args": false,
+          "inject_resume_offset": false,
+          "params": {
+            "rf": "off"
+          },
+          "ramp": null,
+          "power_view": null,
+          "power_hold_dest": null
+        }
+      ],
+      "types": [
+        "broadcaster"
+      ]
+    }
+  ]
+}
