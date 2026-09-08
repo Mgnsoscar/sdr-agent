@@ -18,6 +18,19 @@ python3 -m pytest -q            # ~361 tests
 A few `paramkit`/`argspec` test files are also runnable directly (`python3 tests/<file>.py`);
 the drift guard is pytest-only.
 
+## Run it live, headless (agent + real client, no hardware)
+Exercise the agent against the real PyQt6 client on one machine, no SDR/Pi and no monitor —
+full recipe + gotchas in **`docs/local-integration-run.md`**. Two committed helpers:
+```bash
+bash deploy/run_local.sh                                  # agent → 0.0.0.0:8765 (run BACKGROUNDED)
+python3 ../sdr-client/tools/screenshot.py --tab units --out /tmp/units.png   # or ../sdr-client/tools/run_local.sh
+```
+`run_local.sh` stages a FLAT `<base>/scripts/` dir from the sibling `sdr-scripts` (the agent serves a flat
+dir; the repo nests scripts) and starts `uvicorn agent.main:app` with dev env (`SDR_AGENT_BASE`/
+`SDR_STATE_DIR` under `/tmp/sdr-local`). A connected client reads `/info`, opens the SSE stream, and shows
+the unit **online** ("clocks: synced ✓"); `sdr: none` / `temp —` are the expected no-hardware readouts.
+A Claude session should launch the agent with Bash `run_in_background: true`, never as a foreground server.
+
 ## Cross-repo invariants (do not break)
 - **Drift guard (`tests/test_shared_source_drift.py`):** `agent/argspec.py` and `agent/ramp.py`
   MUST stay **byte-identical** to `sdr-client/api/argspec.py` and `sdr-client/api/ramp.py`. The
