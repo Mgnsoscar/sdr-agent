@@ -602,6 +602,8 @@ class ProcessManager:
         self._oneshot_seq = 0
         # Active-component control-param → CLI flag, cached per script (see _active_flag).
         self._active_flags: Dict[str, dict] = {}
+        # Full extracted argspec, cached per script (see tune_log_context).
+        self._script_specs: Dict[str, Optional[dict]] = {}
 
     def _make_proc(self, cfg: TaskConfig) -> ManagedProcess:
         return ManagedProcess(
@@ -840,6 +842,56 @@ class ProcessManager:
                 flags = {}
             self._active_flags[script] = flags
         return self._active_flags[script].get(param, fallback)
+
+    def _script_spec(self, task_name: str) -> Optional[dict]:
+        """The full extracted argspec (params + calibration laws) for a task's script, cached
+        per script path. None when the task is unknown or the script can't be read/parsed."""
+        try:
+            cfg = self._get(task_name).config
+        except KeyError:
+            return None
+        script = next((a for a in cfg.command
+                       if isinstance(a, str) and a.endswith(".py")), None)
+        if not script:
+            return None
+        if script not in self._script_specs:
+            p = Path(script)
+            if not p.is_absolute() and cfg.working_dir:
+                p = Path(cfg.working_dir) / script
+            try:
+                self._script_specs[script] = extract_params(
+                    p.read_text(encoding="utf-8", errors="replace")) or None
+            except OSError:
+                self._script_specs[script] = None
+        return self._script_specs[script]
+
+    def tune_log_context(self, task_name: str):
+        """(argspec, resolved public calibration artifact) for a task — the inputs the sequence
+        run log's tune-step quantity blocks fold from. Either may be None (script unreadable /
+        task didn't opt into calibration / unit uncalibrated for its signal). Never raises."""
+        spec = self._script_spec(task_name)
+        artifact = None
+        try:
+            cfg = self._get(task_name).config
+        except KeyError:
+            return spec, None
+        signal_id = cfg.env.get(_agentcfg.CAL_SIGNAL_ID_ENV)
+        if signal_id:
+            freq_hz = None
+            raw = cfg.env.get(_agentcfg.CAL_FREQ_HZ_ENV)
+            if raw:
+                try:
+                    freq_hz = float(raw)
+                except (TypeError, ValueError):
+                    freq_hz = None
+            try:
+                artifact = _calib.resolve_public(
+                    _agentcfg.CALIBRATION_DOC, _agentcfg.CALIBRATION_DEFAULTS, signal_id,
+                    unit_type=_agentcfg.UNIT_TYPE,
+                    components_path=_agentcfg.CALIBRATION_COMPONENTS, freq_hz=freq_hz)
+            except Exception:                        # noqa: BLE001 — the log never breaks a run
+                artifact = None
+        return spec, artifact
 
     async def _launch_oneshot_wait(self, name: str, args: List[str],
                                    timeout: float = _ACTIVE_SET_TIMEOUT_S) -> Optional[int]:

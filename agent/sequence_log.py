@@ -53,6 +53,19 @@ class RunLog:
     def annotate(self, text: str) -> None:
         self._write(f"[{_clock()}] {text}\n")
 
+    def emit_block(self, text: str) -> None:
+        """Write a pre-formatted, already-timestamped multi-line block in ONE append, so a
+        step's whole block lands atomically — two steps firing at the same instant can't
+        interleave line-by-line (the tune-step quantity blocks rely on this)."""
+        if not text:
+            return
+        self._write(text if text.endswith("\n") else text + "\n")
+
+    def clock(self) -> str:
+        """The timestamp the log stamps right now — so a caller can build a block whose
+        header lines carry the same instant this RunLog would annotate with."""
+        return _clock()
+
     def close(self, footer: str = "") -> None:
         if self._fh is None:
             return

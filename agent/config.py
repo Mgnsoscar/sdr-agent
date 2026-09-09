@@ -300,7 +300,7 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # EDITED sequence — edit-while-holding, Phase 3c §6.4), re-extracting window B from it instead of the
 # window B stored at arm. A ≤1.18 agent ignores req.steps (uses the stored window B), so the client
 # gates its window-B edit UI on this capability — a safety gate, else an edit would be silently lost.
-AGENT_VERSION = "1.19.0"
+AGENT_VERSION = "1.20.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list

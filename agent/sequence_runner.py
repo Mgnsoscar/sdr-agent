@@ -44,6 +44,7 @@ from .models import (
 )
 from .process_manager import ProcessManager
 from .sequence_log import RunLog
+from . import tune_log
 
 logger = logging.getLogger(__name__)
 
@@ -1038,6 +1039,67 @@ class SequenceRunner:
 
     # ── Step firing ──────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _args_to_params(args: list, flag_to_dest: dict) -> dict:
+        """Parse a launch command's ``args`` into ``{dest: value}`` using the script's
+        flag→dest map. A token that is itself a known flag ends the previous flag as a
+        boolean (store_true); otherwise it is the flag's value (numeric coerced when it
+        parses — negative numbers included, since they are never known flags)."""
+        out: dict = {}
+        i = 0
+        while i < len(args):
+            dest = flag_to_dest.get(str(args[i]))
+            if dest is None:
+                i += 1
+                continue
+            nxt = args[i + 1] if i + 1 < len(args) else None
+            if nxt is not None and str(nxt) not in flag_to_dest:
+                try:
+                    out[dest] = float(nxt)
+                except (TypeError, ValueError):
+                    out[dest] = nxt
+                i += 2
+            else:
+                out[dest] = True
+                i += 1
+        return out
+
+    def _effective_params(self, run: SequenceRun, step: StepFire, spec: Optional[dict]) -> dict:
+        """The task's effective live-parameter state as of ``step``: seeded from each start/run
+        step's args and updated by every tune, walking run.steps in order up to and INCLUDING
+        ``step``. Lets a power view fold at the bridge params (e.g. the sidelobe count) that a
+        power-only tune didn't itself set."""
+        flag_to_dest: dict = {}
+        for p in (spec or {}).get("params", []) or []:
+            for f in p.get("flags") or []:
+                if p.get("dest"):
+                    flag_to_dest[str(f)] = p["dest"]
+        state: dict = {}
+        for s in run.steps:
+            if s.task_name == step.task_name:
+                if s.action in ("start", "run") and s.args:
+                    state.update(self._args_to_params(list(s.args), flag_to_dest))
+                elif s.action == "tune" and s.params:
+                    state.update(dict(s.params))
+            if s is step:
+                break
+        return state
+
+    def _tune_block(self, run: SequenceRun, step: StepFire, rl: RunLog) -> Optional[str]:
+        """The grouped, multi-quantity log text for a tune step, or None to fall back to the
+        plain one-line annotation. Never raises — a formatting problem must not derail a run."""
+        if not step.params:
+            return None
+        try:
+            spec, artifact = self._manager.tune_log_context(step.task_name)
+            effective = self._effective_params(run, step, spec)
+            return tune_log.format_tune_step(
+                step.task_name, dict(step.params), effective, spec, artifact, rl.clock())
+        except Exception:                            # noqa: BLE001 — the log never breaks a run
+            logger.debug("tune-log block failed for run %s step %s",
+                         run.id, step.task_name, exc_info=True)
+            return None
+
     async def _fire_step(self, run: SequenceRun, step: StepFire) -> None:
         # Mark first to avoid double-firing if a step's action is slow
         first_step = run.state == SequenceState.ARMED
@@ -1048,16 +1110,22 @@ class SequenceRunner:
 
         rl = self._run_logs.get(run.id)
         if rl is not None:
-            glyph = {"start": "▶ start", "run": "⚡ run", "stop": "⏹ stop",
-                     "tune": "◈ tune"}.get(step.action, step.action)
-            line = f"{glyph} {step.task_name}"
-            if step.action == "tune" and step.params:
-                line += " " + " ".join(f"{k}={v}" for k, v in step.params.items())
-            elif step.args:
-                line += " " + " ".join(step.args)
-            if step.resume_offset_s:
-                line += f"  (resume +{step.resume_offset_s:.0f}s)"
-            rl.annotate(line)
+            block = self._tune_block(run, step, rl) if step.action == "tune" else None
+            if block:
+                # A calibrated tune renders every quantity it moved, as ONE atomic block
+                # (see agent/tune_log.py) so simultaneous tunes never interleave.
+                rl.emit_block(block)
+            else:
+                glyph = {"start": "▶ start", "run": "⚡ run", "stop": "⏹ stop",
+                         "tune": "◈ tune"}.get(step.action, step.action)
+                line = f"{glyph} {step.task_name}"
+                if step.action == "tune" and step.params:
+                    line += " " + " ".join(f"{k}={v}" for k, v in step.params.items())
+                elif step.args:
+                    line += " " + " ".join(step.args)
+                if step.resume_offset_s:
+                    line += f"  (resume +{step.resume_offset_s:.0f}s)"
+                rl.annotate(line)
             if step.action in ("start", "run"):
                 rl.watch_task(step.task_name)   # collect this task's output from here
 
