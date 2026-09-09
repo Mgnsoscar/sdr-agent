@@ -1085,6 +1085,48 @@ class SequenceRunner:
                 break
         return state
 
+    @staticmethod
+    def _post_script_args(cmd: list) -> list:
+        """A launch command's arguments AFTER the script path — the flags a param parse reads."""
+        for i, a in enumerate(cmd):
+            if isinstance(a, str) and a.endswith(".py"):
+                return list(cmd[i + 1:])
+        return list(cmd[1:]) if len(cmd) > 1 else []
+
+    def _launch_params(self, step: StepFire, spec: Optional[dict]) -> dict:
+        """The effective ``{dest: value}`` a start/run step launches with: the task's base
+        command args merged with the step's (replaced when ``replace_args``), parsed via the
+        script's flag→dest map. Lets the run log show every launch parameter, not just the
+        step's overrides."""
+        flag_to_dest: dict = {}
+        for p in (spec or {}).get("params", []) or []:
+            for f in p.get("flags") or []:
+                if p.get("dest"):
+                    flag_to_dest[str(f)] = p["dest"]
+        base: list = []
+        try:
+            base = self._post_script_args(list(self._manager.get_config(step.task_name).command))
+        except Exception:                            # noqa: BLE001 — best effort
+            base = []
+        if step.replace_args and step.args:
+            args = list(step.args)
+        else:
+            args = base + list(step.args or [])
+        return self._args_to_params(args, flag_to_dest)
+
+    def _launch_block(self, step: StepFire, rl: RunLog) -> Optional[str]:
+        """The grouped, labelled log text for a start/run step (a --power expands to every
+        quantity), or None to fall back to the plain command line. Never raises."""
+        try:
+            spec, artifact = self._manager.tune_log_context(step.task_name)
+            values = self._launch_params(step, spec)
+            glyph = "▶ start" if step.action == "start" else "⚡ run"
+            return tune_log.format_launch_step(
+                step.task_name, values, spec, artifact, rl.clock(), glyph)
+        except Exception:                            # noqa: BLE001 — the log never breaks a run
+            logger.debug("launch-log block failed for step %s", step.task_name, exc_info=True)
+            return None
+
     def _tune_block(self, run: SequenceRun, step: StepFire, rl: RunLog) -> Optional[str]:
         """The grouped, multi-quantity log text for a tune step, or None to fall back to the
         plain one-line annotation. Never raises — a formatting problem must not derail a run."""
@@ -1110,10 +1152,16 @@ class SequenceRunner:
 
         rl = self._run_logs.get(run.id)
         if rl is not None:
-            block = self._tune_block(run, step, rl) if step.action == "tune" else None
+            if step.action == "tune":
+                block = self._tune_block(run, step, rl)
+            elif step.action in ("start", "run"):
+                block = self._launch_block(step, rl)
+            else:
+                block = None
             if block:
-                # A calibrated tune renders every quantity it moved, as ONE atomic block
-                # (see agent/tune_log.py) so simultaneous tunes never interleave.
+                # A calibrated tune/launch renders every parameter (a --power as all its
+                # quantities) as ONE atomic block (see agent/tune_log.py) so simultaneous
+                # steps never interleave.
                 rl.emit_block(block)
             else:
                 glyph = {"start": "▶ start", "run": "⚡ run", "stop": "⏹ stop",

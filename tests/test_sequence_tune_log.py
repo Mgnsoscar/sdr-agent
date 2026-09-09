@@ -16,6 +16,8 @@ from agent.log_manager import LogManager
 # with a VISIBLE derived passband bandwidth and a HIDDEN enbw the full-power law keys on.
 _SPEC = {
     "params": [
+        {"dest": "prn", "flags": ["-PRN", "--prn"], "unit": ""},
+        {"dest": "freq", "flags": ["-Center-frequency", "--freq"], "unit": "MHz"},
         {"dest": "power", "flags": ["-Power", "--power"], "unit": "dBm"},
         {"dest": "sidelobes", "flags": ["-Sidelobes", "--sidelobes"], "unit": ""},
         {"dest": "passband_bw_mhz", "flags": ["-Passband-bandwidth"], "unit": "MHz",
@@ -23,7 +25,7 @@ _SPEC = {
         {"dest": "enbw_mhz", "flags": ["-Full-power-bandwidth"], "unit": "MHz", "hidden": True,
          "formula": {"table": ["sidelobes", 0.923588, 0.971788, 0.988638, 0.997168,
                                1.002311, 1.005749]}},
-        {"dest": "rf", "flags": ["--rf"], "unit": ""},
+        {"dest": "rf", "flags": ["-RF", "--rf"], "unit": ""},
     ],
     "calibration_power_laws": [
         {"id": "full_power", "name": "Full signal power (filter passband)", "unit": "dBm",
@@ -82,6 +84,29 @@ def test_uncalibrated_power_falls_back_to_the_bare_value():
 
 def test_empty_change_returns_none():
     assert tune_log.format_tune_step("t", {}, {}, _SPEC, _ART, "00:00:00") is None
+
+
+def test_launch_step_lists_every_parameter_with_labels():
+    vals = {"prn": 1.0, "freq": 1575.42, "sidelobes": 5.0, "power": -104.654784, "rf": "on"}
+    txt = tune_log.format_launch_step("mock_prn", vals, _SPEC, _ART, "07:55:36", "▶ start")
+    lines = txt.splitlines()
+    assert lines[0] == "[07:55:36] ▶ start mock_prn"                 # ONE header, no --flag dump
+    body = "\n".join(lines[1:])
+    # Every launch parameter is a labelled row, in command order.
+    assert "• PRN" in body and "• Center frequency" in body and "• Sidelobes" in body
+    assert "on" in body and "• RF" in body
+    # --power expands to the base measured quantity + every law view (no bare "power=").
+    assert "power=" not in body
+    assert "dBm/Hz" in body and "Spectral density" in body
+    assert "Main-lobe integrated power" in body and "Full signal power (filter passband)" in body
+    # The visible passband bandwidth is listed under Sidelobes; the hidden enbw is not.
+    assert "Passband bandwidth" in body and "enbw" not in body
+    # Ordering: the passband readout sits right after the Sidelobes value it tracks.
+    assert body.index("Sidelobes") < body.index("Passband bandwidth")
+
+
+def test_launch_step_none_without_params():
+    assert tune_log.format_launch_step("t", {}, _SPEC, _ART, "00:00:00") is None
 
 
 def test_simultaneous_tunes_do_not_interleave(tmp_path):

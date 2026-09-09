@@ -239,6 +239,55 @@ def format_tune_step(task_name: str, changed: Dict[str, Any], effective: Dict[st
     return "\n".join(blocks) if blocks else None
 
 
+def format_launch_step(task_name: str, values: Dict[str, Any], spec: Optional[dict],
+                       artifact: Optional[dict], clock: str, glyph: str = "▶ start"
+                       ) -> Optional[str]:
+    """The full log text for a START/RUN step: ONE header, then a labelled row per launch
+    parameter — a calibrated ``--power`` expands to all its quantities (base + every law view),
+    and a VISIBLE derived field is listed directly under the parameter it tracks. Parameters
+    keep their command-line order. Returns None when there is nothing to show (the runner then
+    keeps its plain command line)."""
+    if not values:
+        return None
+    spec = spec or {}
+    params = spec.get("params") or []
+    by_dest = {p.get("dest"): p for p in params if p.get("dest")}
+    laws = spec.get("calibration_power_laws") or []
+    resolver = _make_resolver(by_dest, values)
+
+    rows: List[tuple] = []
+    seen_derived: set = set()
+    for dest, value in values.items():
+        param = by_dest.get(dest)
+        if _is_power_dest(dest, param) and artifact and laws:
+            base = _num(value)
+            if base is not None:
+                rows += _quantity_lines(base, artifact, laws, resolver)
+                continue
+        unit = (param or {}).get("unit") or ""
+        v = _num(value)
+        rows.append((_fmt_num(v) if v is not None else str(value), unit, _label(param, dest)))
+        for p in params:                             # a visible derived readout that tracks this param
+            d = p.get("dest")
+            if not d or d in seen_derived or p.get("hidden"):
+                continue
+            f = p.get("formula")
+            if not isinstance(f, dict):
+                continue
+            fa = next(iter(f.values()), None)
+            srcs = [str(a) for a in fa if isinstance(a, str)] if isinstance(fa, (list, tuple)) else []
+            if dest not in srcs:
+                continue
+            dv = eval_formula(f, resolver)
+            if dv is None:
+                continue
+            seen_derived.add(d)
+            rows.append((_fmt_num(dv), p.get("unit") or "", _label(p, d)))
+    if not rows:
+        return None
+    return _render_block(f"[{clock}] {glyph} {task_name}", rows)
+
+
 def _render_block(header: str, rows: List[tuple]) -> str:
     """Header line + aligned ``value unit • name`` body lines (name omitted when blank)."""
     vw = max((len(v) for v, _u, _n in rows), default=0)

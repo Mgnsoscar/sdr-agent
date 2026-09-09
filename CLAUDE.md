@@ -90,37 +90,47 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
-## Current state — sequence run log: calibrated tune steps show every power quantity (grouped, atomic): COMPLETE (branch `claude/hold-step-phase-0-wwwxf7-lty0i5`, agent-only)
+## Current state — sequence run log: calibrated tune AND start/run steps show every power quantity (grouped, atomic): COMPLETE (branch `claude/hold-step-phase-0-wwwxf7-lty0i5`, agent-only)
 Owner ask: a TUNE step that changes a calibrated `--power` logged only the raw base wire value (a
-spectral density in dBm/Hz), so the run log was unreadable in the quantity the operator actually set.
-Now each changed parameter is rendered as its own grouped block: a calibrated `--power` lists the base
-measured quantity AND every declared power-law view (main-lobe, full-signal, …) folded at the step's
-live operating point; any other parameter shows its value plus any VISIBLE derived readout that tracks
-it (e.g. a passband bandwidth from the sidelobe count). Example:
+spectral density in dBm/Hz), and a START step dumped the raw `--flag value` command line — both
+unreadable in the quantities the operator thinks in. Now:
+- a **TUNE** step renders one grouped block PER changed parameter (`◈ task • ParamName`); a calibrated
+  `--power` lists the base measured quantity AND every declared power-law view; any other parameter
+  shows its value plus any VISIBLE derived readout that tracks it.
+- a **START/RUN** step renders ONE header (`▶ start task` / `⚡ run task`) then a labelled row per
+  launch parameter, in command order — a calibrated `--power` expands to all its quantities and a
+  visible derived field is listed directly under the parameter it tracks (no `--flag value` dump).
 ```
-[07:55:39] ◈ mock_prn    •    Power
-            -99.6548 dBm/Hz  • Spectral density
-            -39.6299 dBm     • Full signal power (filter passband)
-                 -40 dBm     • Main-lobe integrated power
+[07:55:36] ▶ start mock_prn                     [07:55:39] ◈ mock_prn    •    Power
+            1         • PRN                                  -99.6548 dBm/Hz  • Spectral density
+      1575.42 MHz     • Center frequency                    -39.6299 dBm     • Full signal power (…)
+            5         • Sidelobes                                 -40 dBm     • Main-lobe integrated power
+       12.276 MHz     • Passband bandwidth
+    -104.6548 dBm/Hz  • Spectral density
+     -44.6299 dBm     • Full signal power (filter passband)
+          -45 dBm     • Main-lobe integrated power
+           on         • RF
 ```
 Agent-only (the run log is server-rendered text the client just displays). Pieces:
-- **`agent/tune_log.py`** (new, pure/dependency-light) — `format_tune_step(task, changed, effective,
-  spec, artifact, clock)` returns the FULL step text (one block per changed param, every header
-  stamped with the same `clock`) or None. Fold uses `paramkit.power_law` for the law views and a small
-  ported `eval_formula` (linear/table/…) for derived fields — incl. the HIDDEN bridge (`enbw_mhz`) the
-  full-power law keys on. Base unit is the artifact's `operating_unit`; each law's own `unit`/`name`.
+- **`agent/tune_log.py`** (new, pure/dependency-light) — `format_tune_step(...)` (per-changed-param
+  blocks) and `format_launch_step(task, values, spec, artifact, clock, glyph)` (one block, all launch
+  params). Fold uses `paramkit.power_law` for the law views and a small ported `eval_formula`
+  (linear/table/…) for derived fields — incl. the HIDDEN bridge (`enbw_mhz`) the full-power law keys
+  on. Base unit is the artifact's `operating_unit`; each law's own `unit`/`name`; labels come from a
+  param's capitalised metavar flag (`-Center-frequency` → "Center frequency").
 - **`agent/sequence_log.py`** — `RunLog.emit_block(text)` writes the whole block in ONE append (+
-  `clock()`), so two tunes firing the same instant never interleave line-by-line.
-- **`agent/sequence_runner.py`** `_fire_step` — for a tune, builds the block (`_tune_block` +
-  `_effective_params`, which walks the run's prior start/tune steps for the task to carry the bridge
-  params a power-only tune didn't set) and `emit_block`s it; ANY failure falls back to the old
-  one-line annotation (the log never breaks a run).
+  `clock()`), so two steps firing the same instant never interleave line-by-line.
+- **`agent/sequence_runner.py`** `_fire_step` — tune → `_tune_block` (+ `_effective_params`, walking
+  the run's prior start/tune steps to carry bridge params a power-only tune didn't set); start/run →
+  `_launch_block` (+ `_launch_params`, base command args merged with the step's, `replace_args`
+  honoured). ANY failure falls back to the old one-line annotation (the log never breaks a run).
 - **`agent/process_manager.py`** — `tune_log_context(task)` → (cached argspec, resolved public
   artifact); `_script_spec` caches `extract_params` per script.
 - **`config.py`** — `AGENT_VERSION 1.19.0 → 1.20.0` (no capability — the client parses nothing; older
   agents just show the old one-line format). `place_ramp`/`argspec`/`ramp` untouched (drift guard
   intact). Tests: `tests/test_sequence_tune_log.py` (every quantity; derived readout; one grouped
-  block per step; uncalibrated fallback; two blocks don't interleave). Suite 427 → 433.
+  block per tune step; the start block lists every param in order with `--power` expanded; uncalibrated
+  fallback; two blocks don't interleave). Suite 427 → 435.
 
 ## Current state — provisioning: pip `--ignore-installed` past apt-managed transitive deps (Python 3.13): COMPLETE (branch `claude/provision-python313-fix`)
 Provisioning a fresh **Python 3.13** Pi aborted at the pip step: `typing_extensions` is an
