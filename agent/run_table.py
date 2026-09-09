@@ -30,11 +30,16 @@ def _fnum(v: Optional[float], places: int = 6):
 
 
 def _hhmmss(iso: Optional[str]) -> str:
+    """Fire time as HH:MM:SS.mmm. Millisecond precision matters: a ramp can fire points
+    well under a second apart, so whole-second truncation would print two DISTINCT,
+    sequential state changes under one timestamp (they look simultaneous in the sheet)."""
     if not iso or not isinstance(iso, str):
         return ""
-    # "2026-09-09T09:00:27.071796+00:00" → "09:00:27"
+    # "2026-09-09T09:00:27.071796+00:00" → "09:00:27.071"
     t = iso.split("T", 1)[1] if "T" in iso else iso
-    return t.split(".", 1)[0].split("+", 1)[0][:8]
+    t = t.split("+", 1)[0].split("Z", 1)[0]          # drop the timezone suffix
+    hms, _, frac = t.partition(".")
+    return f"{hms[:8]}.{(frac + '000')[:3]}"
 
 
 def _args_to_params(args: list, flag_to_dest: dict) -> dict:

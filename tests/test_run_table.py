@@ -79,7 +79,9 @@ def test_row_per_change_and_no_op_tune_is_dropped():
     ci = {c: i for i, c in enumerate(cols)}
     rf, sl = ci["RF on"], ci["Sidelobes"]
     full = ci["Full signal power (filter passband) [dBm]"]
-    assert [r[ci["Time"]] for r in t["rows"]] == ["09:00:00", "09:00:02", "09:00:06"]
+    # Time is HH:MM:SS.mmm — millisecond precision so two sub-second-apart ramp fires
+    # never collapse to one displayed timestamp.
+    assert [r[ci["Time"]] for r in t["rows"]] == ["09:00:00.000", "09:00:02.000", "09:00:06.000"]
     assert [r[rf] for r in t["rows"]] == [0, 1, 1]                              # RF 0/1
     assert [r[sl] for r in t["rows"]] == [2, 2, 3]
     # full-signal power tracks the sidelobe count (enbw), so it changes on the last row only
@@ -90,6 +92,23 @@ def test_row_per_change_and_no_op_tune_is_dropped():
     assert t["rows"][0][pb] == 6.138 and t["rows"][2][pb] == 8.184
     # fixed columns are constant
     assert all(r[ci["PRN"]] == 1 and r[ci["Center frequency [MHz]"]] == 1575.42 for r in t["rows"])
+
+
+def test_subsecond_fires_get_distinct_timestamps():
+    # Two ramp tunes < 1 s apart that straddle a second boundary must NOT collapse to one
+    # displayed timestamp (the fast-forward report: -120 @ ...43.974 and -160 @ ...44.796
+    # both printed "10:39:..." truncated to the second). Millisecond precision keeps them
+    # distinct AND ordered.
+    steps = [
+        _launch(),
+        _step("tune", "2026-09-09T09:00:43.974602+00:00", params={"power": -120.0}),
+        _step("tune", "2026-09-09T09:00:44.796660+00:00", params={"power": -160.0}),
+    ]
+    t = run_table.build_task_table("mock_prn", steps, _SPEC, _ART, _realize)
+    ci = {c: i for i, c in enumerate(t["columns"])}
+    times = [r[ci["Time"]] for r in t["rows"]]
+    assert times == ["09:00:00.000", "09:00:43.974", "09:00:44.796"]
+    assert len(set(times)) == len(times)              # all distinct — no shared timestamp
 
 
 def test_uncalibrated_run_has_no_quantity_or_realized_columns():
