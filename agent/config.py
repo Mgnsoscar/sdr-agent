@@ -313,7 +313,11 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # time plot has no points during a muted warm-up. Agent-rendered/behaviour only; the client parses
 # nothing new, so no capability string (an older agent just shows the pre-mute values). The bump
 # lets OTA push the new argspec (`is_rf`) + muting onto deployed units.
-AGENT_VERSION = "1.22.0"
+# 1.22.1: co-timed step ordering — at the SAME fire instant a step that SETS POWER fires before a
+# step that turns the RF output gate ON (SequenceRunner._co_time_rank), so a ramp whose first point
+# is co-timed with RF-on opens the gate at the intended level instead of flashing the stale standing
+# power for one fire. Behaviour only, no capability; the bump lets OTA push it onto deployed units.
+AGENT_VERSION = "1.22.1"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list

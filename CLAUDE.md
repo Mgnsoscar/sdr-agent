@@ -90,6 +90,29 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — co-timed steps: a power step fires before RF-on (no gate-open blip): COMPLETE (branch `claude/sdr-logging-export-wvrni4`, agent-only)
+Owner report: a sequence launches a duration task with a fixed `--power` (RF off, muted pre-roll),
+then AT T0 both turns RF ON and starts a power ramp (e.g. −90 → −50). For ~one fire the output flashed
+the LAUNCH power (the ramp's top, −50) before the ramp's first point (−90) landed — a real hot burst
+(the export showed a −50 row then a −90 row ~110 ms apart). Root cause: the RF-on tune and the ramp's
+first point are BOTH at on-air offset 0 → identical `fire_at`; `_resolve_steps`/`_tick` sort by
+`fire_at` with a STABLE sort, so the RF-on (earlier in the step list) fired first and the agent un-muted
+at the stale standing `--power` (−50); the ramp's first point (−90) only landed on the next fire (the
+tick awaits each fire, so ~110 ms later). Fix (agent-only, owner-requested rule): at the SAME fire
+instant a step that SETS POWER fires BEFORE a step that turns the RF output gate ON. `_tick` now sorts
+by `(fire_at, SequenceRunner._co_time_rank(step))` — power-setter 0, neutral 1, rf-on 2 — so the power
+tune/ramp-point runs first (updating the intended level while still muted) and RF-on then opens the gate
+at that level. `_co_time_rank` classifies via the task's RF gate (`ProcessManager._rf_gate`,
+`paramkit.rf`): a tune/ramp point carrying `--power` in `params` or a launch carrying `-Power`/`--power`
+= power (0); a step driving the gate dest / gate flag to an ON value = rf-on (2); an OFF pre-roll launch
+is NOT rf-on. Never raises (a resolution problem → neutral). `config.py` bumps `AGENT_VERSION 1.22.0 →
+1.22.1` (behaviour only, no capability — the bump lets OTA push it to units). Tests:
+`tests/test_sequence_step_ordering.py` (power ranks 0 / rf-on 2 / neutral 1; a co-timed sort puts the
+power point first; an rf-off launch isn't rf-on; a power launch ranks first). Suite 450 → 454. Verified
+live: the user's start(−50, rf off)/tune(rf on)@0/ramp(−90→−50)@0 now opens the gate at −90 (first
+RF-on row = the ramp start), no −50 flash. Operator note: no re-author needed — the tool no longer
+requires matching the launch `--power` to the ramp's start.
+
 ## Current state — run-log / export spec resolves a subfolder-filed script (regression fix): COMPLETE (branch `claude/sdr-logging-export-wvrni4`, agent-only)
 Owner report (after the RF-gate work): a PLAN/sequence run of a real signal logged every launch param
 on ONE raw fallback line (`▶ start CA -Power -50 -Center-frequency 1575.42 …`), a calibrated `--power`

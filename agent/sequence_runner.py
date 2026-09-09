@@ -42,10 +42,11 @@ from .models import (
     SequenceState, SequenceStep, StepAction, StepFire, StepOverride,
     SequenceWebhook,
 )
-from .process_manager import ProcessManager
+from .process_manager import ProcessManager, _POWER_FLAGS
 from .sequence_log import RunLog
 from . import tune_log
 from . import run_table
+from paramkit import rf as _rf
 
 logger = logging.getLogger(__name__)
 
@@ -947,8 +948,12 @@ class SequenceRunner:
                     if step.fired_actual is None and _parse(step.fire_at) <= now:
                         due.append((run, step))
 
-        # Fire due steps in time order across all runs
-        due.sort(key=lambda rs: _parse(rs[1].fire_at))
+        # Fire due steps in time order across all runs. At the SAME fire instant a step
+        # that SETS POWER goes before one that turns the RF output gate ON, so the gate
+        # opens at the intended level instead of the stale standing power (e.g. a ramp
+        # whose first point is co-timed with RF-on — otherwise RF flashes the launch
+        # power for one fire before the ramp's first point lands). See _co_time_rank.
+        due.sort(key=lambda rs: (_parse(rs[1].fire_at), self._co_time_rank(rs[1])))
         for run, step in due:
             await self._fire_step(run, step)
 
@@ -1173,6 +1178,47 @@ class SequenceRunner:
             logger.debug("tune-log block failed for run %s step %s",
                          run.id, step.task_name, exc_info=True)
             return None
+
+    @staticmethod
+    def _step_sets_power(step: StepFire) -> bool:
+        """The step commands an absolute ``--power`` — a tune / ramp point carrying it in
+        ``params`` (a power ramp emits ``{"power": value}``), or a launch carrying it on the
+        command line (``-Power``/``--power``)."""
+        if step.params and "power" in step.params:
+            return True
+        return any(str(a) in _POWER_FLAGS for a in (step.args or []))
+
+    @staticmethod
+    def _step_turns_rf_on(step: StepFire, gate: dict, gate_dest: str) -> bool:
+        """The step drives the RF output gate to ON — the gate dest in a tune's ``params``, or
+        the gate flag on a launch's ``args`` (an OFF value, e.g. a muted pre-roll launch, is
+        NOT rf-on)."""
+        if step.params and gate_dest in step.params:
+            return _rf.is_on(step.params.get(gate_dest))
+        flags = {str(f) for f in (gate.get("flags") or [])}
+        val = None
+        args = step.args or []
+        for i, a in enumerate(args):
+            if str(a) in flags and i + 1 < len(args):
+                val = args[i + 1]
+        return _rf.is_on(val) if val is not None else False
+
+    def _co_time_rank(self, step: StepFire) -> int:
+        """Tie-break among steps that fire at the SAME instant: a step that SETS POWER (0) fires
+        before a neutral step (1), which fires before a step that turns the RF output gate ON (2).
+        So when a ramp's first point (or any power tune) is co-timed with RF-on, the power is set
+        while still muted and the gate then opens at the intended level — no one-fire flash of the
+        stale standing power. Never raises (a resolution problem just leaves the step neutral)."""
+        try:
+            gate = self._manager._rf_gate(step.task_name)
+        except Exception:                                # noqa: BLE001
+            gate = None
+        gate_dest = (gate.get("dest") or gate.get("name")) if gate else None
+        if gate_dest is not None and self._step_turns_rf_on(step, gate, gate_dest):
+            return 2
+        if self._step_sets_power(step):
+            return 0
+        return 1
 
     async def _fire_step(self, run: SequenceRun, step: StepFire) -> None:
         # Mark first to avoid double-firing if a step's action is slow
