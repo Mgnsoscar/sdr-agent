@@ -9,7 +9,7 @@
 # Lays down:
 #   /opt/sdr-agent            -> symlink to the active release
 #   /opt/sdr-agent-releases/<version>/{agent,scripts,paramkit,requirements.txt}
-#   /opt/sdr-agent-shared/{configs,logs,run}          (state; survives updates)
+#   /opt/sdr-agent-shared/{configs,logs,run,scripts}  (state; survives updates)
 #   /etc/systemd/system/sdr-agent.service.d/override.conf   (SDR_UNIT_ID/SDR_API_KEY)
 #
 # Non-destructive on re-run: existing shared state (configs/logs) is kept; only the
@@ -37,12 +37,14 @@ echo "==> Provisioning agent $VERSION"
 # symlink) — e.g. a unit still running a pre-OTA agent, which is why the client's
 # Update button 404s (no /admin/update route yet). Preserve its state into $SHARED
 # before we replace it with the symlink, so the unit's sequences/plans/library
-# survive the switch to the OTA layout. A fresh Pi has no $BASE and skips this.
+# survive the switch to the OTA layout. The deployed scripts/ library is state too —
+# it moves into $SHARED/scripts (the persistent SCRIPTS_DIR) so this classic→OTA switch
+# doesn't drop it when $BASE is removed. A fresh Pi has no $BASE and skips this.
 if [ -e "$BASE" ] && [ ! -L "$BASE" ]; then
     echo "==> Existing classic install found at $BASE — migrating its state to $SHARED"
     systemctl stop sdr-agent 2>/dev/null || true
     mkdir -p "$SHARED"
-    for d in configs logs run; do
+    for d in configs logs run scripts; do
         if [ -d "$BASE/$d" ] && [ ! -e "$SHARED/$d" ]; then
             cp -a "$BASE/$d" "$SHARED/$d"
         fi

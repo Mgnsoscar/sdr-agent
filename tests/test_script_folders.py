@@ -14,6 +14,7 @@ UploadFile = pytest.importorskip("starlette.datastructures").UploadFile
 HTTPException = pytest.importorskip("fastapi").HTTPException
 
 from agent import main
+from agent.models import TaskConfig
 from agent.process_manager import ProcessManager, _resolve_script_path
 
 
@@ -90,6 +91,60 @@ def test_read_script_source_relative_to_working_dir(tmp_path):
     (root / "rel.py").write_text(_SCRIPT_SRC)
     # A relative command path resolves against the task's working_dir.
     assert ProcessManager._read_script_source("rel.py", str(root)) == _SCRIPT_SRC
+
+
+# ── _script_spec never negatively-caches; reload drops the cache ─────────────────
+# An agent update wipes the release-local scripts dir, so a task can be registered while its
+# script is momentarily absent. Reading its spec then must NOT poison the argspec cache with a
+# None — otherwise a later library deploy (which restores the script) can't fix the run log /
+# export until the agent restarts (the field report: "run before deploy → deploy no longer fixes").
+
+def _mgr_with_task(tmp_path, script_path):
+    tasks = {"tx": TaskConfig(name="tx", command=["python3", str(script_path)],
+                              working_dir=str(script_path.parent))}
+    return ProcessManager(tasks, tmp_path, "unit-a")
+
+
+def test_script_spec_missing_then_deployed_recovers_without_restart(tmp_path):
+    root = tmp_path / "scripts"
+    root.mkdir()
+    script = root / "tx.py"                               # not yet deployed to this unit
+    mgr = _mgr_with_task(tmp_path, script)
+    assert mgr._script_spec("tx") is None                # absent → None
+    assert mgr._script_specs == {}                       # …and the miss is NOT cached
+    script.write_text(_SCRIPT_SRC)                       # library deployed (no restart)
+    spec = mgr._script_spec("tx")                        # picked up on the next read
+    assert spec is not None and len(spec["params"]) == 3
+
+
+def test_reload_clears_the_script_spec_cache(tmp_path):
+    root = tmp_path / "scripts"
+    root.mkdir()
+    script = root / "tx.py"
+    script.write_text(_SCRIPT_SRC)
+    mgr = _mgr_with_task(tmp_path, script)
+    assert len(mgr._script_spec("tx")["params"]) == 3    # a real spec is cached
+    assert mgr._script_specs != {}
+    # A deploy re-registers the task; the argspec cache is dropped so a changed/re-uploaded
+    # script is re-read rather than served stale from the cache.
+    asyncio.run(mgr.reload({"tx": TaskConfig(name="tx", command=["python3", str(script)],
+                                             working_dir=str(root))}))
+    assert mgr._script_specs == {}
+
+
+def test_active_flag_missing_then_deployed_recovers_without_restart(tmp_path):
+    # _active_flag has the SAME negative-cache hazard as _script_spec (it used to cache {} on a
+    # read miss and never recover). It now memoises only a real read and uses the same
+    # subfolder/SCRIPTS_DIR-aware resolution, so a re-deploy fixes it without a restart.
+    root = tmp_path / "scripts"
+    root.mkdir()
+    script = root / "tx.py"                               # not yet deployed
+    mgr = _mgr_with_task(tmp_path, script)
+    assert mgr._active_flag("tx", "rf") == "--rf"         # absent → fallback flag
+    assert mgr._active_flags == {}                        # …and the miss is NOT cached
+    script.write_text(_SCRIPT_SRC)                        # library deployed (no restart)
+    assert mgr._active_flag("tx", "rf") == "--rf"         # re-read from the deployed script
+    assert mgr._active_flags != {}                        # a real read IS cached now
 
 
 # ── /scripts addresses by basename regardless of subfolder ──────────────────────

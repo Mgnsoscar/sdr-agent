@@ -5,10 +5,13 @@
 # docs/local-integration-run.md.
 #
 # What it does:
-#   • stages a FLAT scripts dir from the sibling sdr-scripts checkout (the agent
-#     serves <base>/scripts as a flat dir; the repo nests scripts under platform
-#     folders), then
+#   • stages a FLAT scripts dir from the sibling sdr-scripts checkout into the
+#     PERSISTENT scripts dir (<state>/scripts, the agent's SCRIPTS_DIR — the repo
+#     nests scripts under platform folders; the agent serves them flat), then
 #   • starts `uvicorn agent.main:app` on 0.0.0.0:<port> with dev-friendly env.
+#
+# The scripts live in <state>/scripts (not the code dir <base>) exactly as on a real
+# OTA install, so the local unit mirrors the "library survives an agent update" layout.
 #
 # Run it BACKGROUNDED (it blocks while serving), then point the client at this
 # host with sdr-client/tools/run_local.sh (or take a screenshot with
@@ -25,15 +28,16 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"                 # sdr-agent repo root
 RUN_DIR="${SDR_LOCAL_RUN_DIR:-/tmp/sdr-local}"
 BASE="$RUN_DIR/agent-base"
 STATE="$RUN_DIR/agent-state"
+SCRIPTS="$STATE/scripts"                                 # persistent SCRIPTS_DIR (survives an update)
 PORT="${SDR_AGENT_PORT:-8765}"
 SCRIPTS_REPO="${SDR_SCRIPTS_REPO:-$(cd "$HERE/../sdr-scripts" 2>/dev/null && pwd || true)}"
 
-mkdir -p "$BASE/scripts" "$STATE/configs" "$STATE/logs"
+mkdir -p "$BASE" "$SCRIPTS" "$STATE/configs" "$STATE/logs"
 
-# Stage the Raspberry Pi + b206 transmit scripts + mocks FLAT into <base>/scripts.
+# Stage the Raspberry Pi + b206 transmit scripts + mocks FLAT into the persistent SCRIPTS_DIR.
 if [ -n "$SCRIPTS_REPO" ] && [ -d "$SCRIPTS_REPO/Raspberry pi + b206 mini-i" ]; then
-    find "$SCRIPTS_REPO/Raspberry pi + b206 mini-i" -name '*.py' -exec cp -f {} "$BASE/scripts/" \;
-    echo "staged $(ls "$BASE/scripts" | wc -l) script(s) from $SCRIPTS_REPO"
+    find "$SCRIPTS_REPO/Raspberry pi + b206 mini-i" -name '*.py' -exec cp -f {} "$SCRIPTS/" \;
+    echo "staged $(ls "$SCRIPTS" | wc -l) script(s) from $SCRIPTS_REPO into $SCRIPTS"
 else
     echo "!! no sibling sdr-scripts checkout at '$SCRIPTS_REPO' — /scripts will be empty"
     echo "   (set SDR_SCRIPTS_REPO=/path/to/sdr-scripts)"
@@ -66,23 +70,23 @@ if [ ! -e "$TASKS" ] || ! grep -q "mock_prn" "$TASKS" 2>/dev/null; then
 tasks:
   - name: mock_prn
     description: "Mock GPS C/A (1.023 Mcps) — no hardware; same params + power laws as the real PRN"
-    command: [python3, "$BASE/scripts/mock_gps_ca_code_1.023Mcps_tx.py"]
-    working_dir: "$BASE/scripts"
+    command: [python3, "$SCRIPTS/mock_gps_ca_code_1.023Mcps_tx.py"]
+    working_dir: "$SCRIPTS"
     env: { SDR_CAL_SIGNAL_ID: "GPS C/A (1.023 Mcps)" }
   - name: mock_chirp
     description: "Mock FM chirp / sweep — no hardware; same params + power laws as the real chirp"
-    command: [python3, "$BASE/scripts/mock_fm_chirp_tx.py"]
-    working_dir: "$BASE/scripts"
+    command: [python3, "$SCRIPTS/mock_fm_chirp_tx.py"]
+    working_dir: "$SCRIPTS"
     env: { SDR_CAL_SIGNAL_ID: "Chirp/Sweep" }
   - name: mock_cw
     description: "Mock CW tone — no hardware; same params as the real cw_tx (calibrated dBm)"
-    command: [python3, "$BASE/scripts/mock_cw_tx.py"]
-    working_dir: "$BASE/scripts"
+    command: [python3, "$SCRIPTS/mock_cw_tx.py"]
+    working_dir: "$SCRIPTS"
     env: { SDR_CAL_SIGNAL_ID: "cw_tone" }
   - name: atten_set
     description: "Mock step attenuator — the active component the calibration chain drives (no HW)"
-    command: [python3, "$BASE/scripts/mock_atten.py"]
-    working_dir: "$BASE/scripts"
+    command: [python3, "$SCRIPTS/mock_atten.py"]
+    working_dir: "$SCRIPTS"
 YAML
     echo "seeded tasks.yaml (mock_prn / mock_chirp / mock_cw / atten_set)"
 fi

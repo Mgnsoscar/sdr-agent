@@ -5,7 +5,12 @@
 #   Before:  /opt/sdr-agent/{agent,scripts,paramkit,configs,logs,run}   (plain dir)
 #   After:   /opt/sdr-agent            -> symlink to the active release
 #            /opt/sdr-agent-releases/<version>/{agent,scripts,paramkit,requirements.txt}
-#            /opt/sdr-agent-shared/{configs,logs,run}                    (state; survives updates)
+#            /opt/sdr-agent-shared/{configs,logs,run,scripts}            (state; survives updates)
+#
+# The deployed transmit LIBRARY (scripts/) moves into the shared state dir too, so an
+# OTA update never wipes it (the agent reads SCRIPTS_DIR=$SHARED/scripts). The release
+# still carries a scripts/ dir as bundled defaults; the agent seeds/migrates from it only
+# when $SHARED/scripts is empty.
 #
 # Idempotent: if /opt/sdr-agent is already a symlink, only the service + timer are
 # refreshed. Safe to re-run.
@@ -27,8 +32,8 @@ systemctl stop sdr-agent 2>/dev/null || true
 mkdir -p "$RELEASES" "$SHARED"
 
 if [ ! -L "$BASE" ]; then
-    echo "==> Moving state into $SHARED"
-    for d in configs logs run; do
+    echo "==> Moving state (incl. the deployed scripts library) into $SHARED"
+    for d in configs logs run scripts; do
         if [ -e "$BASE/$d" ]; then
             mkdir -p "$SHARED/$d"
             cp -a "$BASE/$d/." "$SHARED/$d/" 2>/dev/null || true

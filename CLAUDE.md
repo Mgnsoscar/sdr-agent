@@ -90,6 +90,57 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — the deployed script LIBRARY survives an agent update (+ negative-cache recovery): COMPLETE (branch `claude/scripts-survive-agent-update`, agent-only)
+Owner report: after an agent OTA update the deployed library looked WIPED — a plan/sequence run
+immediately after updating logged the raw one-line fallback and exported only the three time columns;
+re-deploying the library from the client fixed it, EXCEPT if you RAN a plan before re-deploying, after
+which re-deploying no longer fixed it (a restart was needed). Owner need: colleagues must be able to
+just update, and the scripts/tasks/sequences/plans they already have keep working — no post-update
+ritual. Two root causes, both fixed:
+- **Bug A — scripts lived inside the swapped-out release.** `SCRIPTS_DIR` was `BASE_DIR/scripts`,
+  i.e. INSIDE the OTA release dir that an update replaces (`BASE_DIR` is the `current` symlink). Every
+  other part of the library (tasks/sequences/plans/calibration) already persists in `STATE_DIR`;
+  scripts were the one part that didn't, so an update stranded them in the old release. **Fix:** scripts
+  moved to the PERSISTENT `SCRIPTS_DIR = STATE_DIR/scripts` (`config.py`; `BUNDLED_SCRIPTS_DIR =
+  BASE_DIR/scripts` is the release's shipped defaults, empty in the bundle by design). `main.py`
+  `SCRIPTS_DIR = cfg.SCRIPTS_DIR` (reported via `/info` `scripts_dir`, so the client bakes new-task
+  command paths there). New **`main._seed_scripts_dir()`** runs once at boot (in `lifespan`, before
+  tasks load): a no-op when `SCRIPTS_DIR` already holds any `.py` (steady state / classic single-dir
+  install where `SCRIPTS_DIR == BUNDLED_SCRIPTS_DIR`); otherwise it **MIGRATES the previous release's
+  `scripts/`** into the persistent dir (via `Updater.previous_version()`/`release_dir`, falling back to
+  any other release still carrying scripts when the `previous` marker is missing) — so a FIELD unit
+  upgrading from a pre-persistent agent KEEPS its library on the very next update — else **SEEDS** the
+  release's bundled defaults (fresh install). Best-effort, never raises. Because a relocated script no
+  longer sits next to `paramkit`, the launch now prepends `BASE_DIR` to `PYTHONPATH`
+  (`process_manager._ensure_paramkit_on_path`, wired into all three launch env-build sites) so
+  `import paramkit` still resolves, and `_resolve_script_path` (launch) + `_read_script_source` (spec)
+  fall back to searching `SCRIPTS_DIR` for a task still baked with the OLD release-local path (covers a
+  pruned previous release). Deploy scripts: `provision_install.sh` + `migrate_layout.sh` now move a
+  classic install's `scripts/` into `$SHARED/scripts` (was dropped on the classic→OTA switch);
+  `run_local.sh` stages into the persistent `$STATE/scripts` to mirror the real layout. No client change
+  (it already reads `scripts_dir` from `/info`).
+- **Bug B — the argspec cache poisoned a transient miss.** `_script_spec` cached a `None` when a
+  script was momentarily absent (e.g. wiped by Bug A) and `reload()` never dropped the cache, so a
+  library re-deploy couldn't restore the run-log/export until a restart — the "run before deploy →
+  deploy no longer fixes" report. **Fix:** `_script_spec` memoises ONLY a hit (never a miss, so the
+  next read retries), and `reload()` clears `_script_specs` (and `_active_flags`) so a re-uploaded
+  script is re-read fresh.
+- **`config.py`** bumps `AGENT_VERSION 1.22.1 → 1.23.0` (behaviour only, NO capability — the client
+  needs no new gate; the bump just lets OTA push the fix onto deployed units). `argspec`/`ramp`
+  untouched (drift guard intact). Tests: `tests/test_scripts_persist.py` (seed/migrate/no-op/fallback/
+  classic-install/broken-layout + `_ensure_paramkit_on_path` + the SCRIPTS_DIR resolve fallback);
+  `tests/test_script_folders.py` (negative-cache recovery + reload drops the cache). Suite 456 → 466.
+  **Verified LIVE end-to-end** against a synthetic OTA layout (stranded library in a previous release):
+  on boot the agent migrated the library into the persistent dir, `/scripts` + `/scripts/<name>/params`
+  resolved the full 8-param C/A surface + laws, the launch resolved the task both while the old release
+  was kept AND after it was pruned (SCRIPTS_DIR fallback), and a real armed PRN sequence exported an
+  11-column, 4-row `log-table` (base density + both law views + realized SDR gain/atten + live params +
+  derived readouts + fixed PRN/freq) — the "only three time columns" symptom gone.
+- **Field rollout note:** OTA-push 1.23.0; on each unit's first 1.23.0 boot the library migrates
+  automatically (no re-deploy). NOT YET merged to `main` / pushed to field — awaiting owner go-ahead
+  (field-critical); the client bundle must be rebuilt from 1.23.0 (`deploy/build_bundle.sh`) + re-staged
+  into `sdr-client/bundles/` for the "Update agent…"/"Provision unit" flows to ship it.
+
 ## Current state — co-timed steps: a power step fires before RF-on (no gate-open blip): COMPLETE (branch `claude/sdr-logging-export-wvrni4`, agent-only)
 Owner report: a sequence launches a duration task with a fixed `--power` (RF off, muted pre-roll),
 then AT T0 both turns RF ON and starts a power ramp (e.g. −90 → −50). For ~one fire the output flashed

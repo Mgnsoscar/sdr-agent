@@ -146,22 +146,41 @@ def _script_prefix(command: list) -> list:
 
 
 def _resolve_script_path(cmd: list) -> list:
-    """If a task's script argument no longer sits directly in the scripts dir (it was
-    filed into an organizational subfolder), find it there by basename. Scripts keep
+    """If a task's script argument no longer sits directly at its command path, find the file by
+    basename. Two cases: (1) it was filed into an organizational subfolder (search under the
+    command path's own dir); (2) the library moved to the persistent SCRIPTS_DIR (STATE_DIR/scripts)
+    but the task was baked with the OLD release-local path — after an update that path resolves into
+    the new release (bundled defaults only), so fall back to searching SCRIPTS_DIR. Scripts keep
     their basename identity, so a launch command needn't change when a script moves."""
     out = list(cmd)
     for i, a in enumerate(out):
         if isinstance(a, str) and a.endswith(".py"):
             if not os.path.isfile(a):
                 base = os.path.basename(a)
-                root = os.path.dirname(a) or "."
-                if os.path.isdir(root):
-                    for dirpath, _dirs, files in os.walk(root):
-                        if base in files:
-                            out[i] = os.path.join(dirpath, base)
-                            break
+                found = None
+                for root in (os.path.dirname(a) or ".", str(_agentcfg.SCRIPTS_DIR)):
+                    if root and os.path.isdir(root):
+                        for dirpath, _dirs, files in os.walk(root):
+                            if base in files:
+                                found = os.path.join(dirpath, base)
+                                break
+                    if found:
+                        break
+                if found:
+                    out[i] = found
             break
     return out
+
+
+def _ensure_paramkit_on_path(env: dict) -> dict:
+    """Prepend BASE_DIR to the launch env's PYTHONPATH so a transmit script can ``import paramkit``
+    (which ships inside the release, next to the agent) NO MATTER where the script file lives. The
+    deployed library now sits in the persistent SCRIPTS_DIR, no longer beside paramkit, so a script's
+    own 'look next to me' sys.path guess would miss it — this makes the import robust either way."""
+    base = str(_agentcfg.BASE_DIR)
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = base + (os.pathsep + existing if existing else "")
+    return env
 
 
 def _build_command(command: list, args: list, replace: bool) -> list:
@@ -343,6 +362,7 @@ class ManagedProcess:
 
         cmd = _build_command(self.config.command, req.args, req.replace_args)
         env = {**os.environ, **self.config.env, **req.env_overrides}
+        _ensure_paramkit_on_path(env)   # scripts live in the persistent dir now — keep `import paramkit` working
         # stdout is redirected to a file, so Python would block-buffer print()
         # output (appearing only in ~8 KB bursts or at exit) while stderr/logging
         # stays prompt — the "prints sometimes show up, sometimes not" symptom.
@@ -703,6 +723,7 @@ class ProcessManager:
         # command leaves the RF output gate off.
         await self._gate_precommand(name, cmd=cmd)
         env = {**os.environ, **cfg.env}
+        _ensure_paramkit_on_path(env)   # scripts live in the persistent dir now — keep `import paramkit` working
         env.setdefault("PYTHONUNBUFFERED", "1")   # flush print()/stdout live, like logging
         try:
             fh = mp.log.current.open("ab")   # append into the task's single log
@@ -865,26 +886,32 @@ class ProcessManager:
                        if isinstance(a, str) and a.endswith(".py")), None)
         if not script:
             return fallback
-        if script not in self._active_flags:
+        cached = self._active_flags.get(script)
+        if cached is None:
             flags: dict = {}
-            p = Path(script)
-            if not p.is_absolute() and cfg.working_dir:
-                p = Path(cfg.working_dir) / script
-            try:
-                source = p.read_text(encoding="utf-8", errors="replace")
+            # Read via the same subfolder/SCRIPTS_DIR-aware resolution as _script_spec, so a script
+            # filed into a subfolder or relocated to the persistent SCRIPTS_DIR still yields its flags.
+            source = self._read_script_source(script, cfg.working_dir)
+            if source is not None:
                 for s in (extract_params(source) or {}).get("params", []):
                     opts = [f for f in (s.get("flags") or []) if f.startswith("--")] \
                         or (s.get("flags") or [])
                     if s.get("dest") and opts:
                         flags[s["dest"]] = opts[0]
-            except OSError:
-                flags = {}
-            self._active_flags[script] = flags
-        return self._active_flags[script].get(param, fallback)
+                self._active_flags[script] = flags     # memoise only a real read — never a miss
+            cached = flags
+        return cached.get(param, fallback)
 
     def _script_spec(self, task_name: str) -> Optional[dict]:
         """The full extracted argspec (params + calibration laws) for a task's script, cached
-        per script path. None when the task is unknown or the script can't be read/parsed."""
+        per script path. None when the task is unknown or the script can't be read/parsed.
+
+        A MISS is NEVER cached. If the script can't be read/parsed (e.g. it hasn't been
+        deployed to this unit yet — an agent update wipes the release-local scripts dir), the
+        next call retries. Caching the None would leave the run log / spreadsheet export degraded
+        for the LIFE of the process even after the library is re-deployed, since the cache is only
+        dropped on reload() and a script re-upload need not change tasks.yaml. So only a real spec
+        is memoised."""
         try:
             cfg = self._get(task_name).config
         except KeyError:
@@ -893,11 +920,14 @@ class ProcessManager:
                        if isinstance(a, str) and a.endswith(".py")), None)
         if not script:
             return None
-        if script not in self._script_specs:
-            source = self._read_script_source(script, cfg.working_dir)
-            self._script_specs[script] = (
-                extract_params(source) or None) if source is not None else None
-        return self._script_specs[script]
+        cached = self._script_specs.get(script)
+        if cached is not None:
+            return cached
+        source = self._read_script_source(script, cfg.working_dir)
+        spec = (extract_params(source) or None) if source is not None else None
+        if spec is not None:
+            self._script_specs[script] = spec        # memoise only a hit — never a miss
+        return spec
 
     @staticmethod
     def _read_script_source(script: str, working_dir: Optional[str]) -> Optional[str]:
@@ -1004,6 +1034,7 @@ class ProcessManager:
         cfg = mp.config
         cmd = _build_command(cfg.command, list(args), replace=True)
         env = {**os.environ, **cfg.env}
+        _ensure_paramkit_on_path(env)   # scripts live in the persistent dir now — keep `import paramkit` working
         env.setdefault("PYTHONUNBUFFERED", "1")
         try:
             fh = mp.log.current.open("ab")
@@ -1130,6 +1161,12 @@ class ProcessManager:
         return list(self._procs.keys())
 
     async def reload(self, new_tasks: Dict[str, TaskConfig]) -> dict:
+        # A deploy re-registers tasks AND may have re-uploaded scripts (same tasks.yaml, changed
+        # or newly-present script files). Drop the per-script argspec caches so a changed/restored
+        # script is re-read — otherwise a stale (or a previously-missing) spec would persist for
+        # the life of the process. See _script_spec.
+        self._script_specs.clear()
+        self._active_flags.clear()
         current  = set(self._procs.keys())
         incoming = set(new_tasks.keys())
 

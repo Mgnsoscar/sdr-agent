@@ -128,6 +128,11 @@ async def lifespan(app: FastAPI):
     # It only touches the OTA markers, so it has no dependency on that startup.
     asyncio.create_task(_confirm_release_after_grace(), name="ota-confirm")
 
+    # Ensure the persistent script library is populated before anything reads it: a fresh unit
+    # seeds the release's bundled scripts; the first boot after an agent upgrade migrates the
+    # previous release's library into the persistent dir so it isn't lost with the old release.
+    _seed_scripts_dir()
+
     tasks = cfg.load_tasks()
     _manager = ProcessManager(tasks, cfg.LOG_DIR, cfg.UNIT_ID)
     await _manager.startup()
@@ -558,7 +563,79 @@ async def events_stream(
 
 # ── Script upload ─────────────────────────────────────────────────────────────
 
-SCRIPTS_DIR = cfg.BASE_DIR / "scripts"
+# The deployed script library — PERSISTENT (STATE_DIR/scripts), so it survives an OTA update.
+# Seeded / migrated on first boot by _seed_scripts_dir (see lifespan). Reported to the client via
+# GET /info (`scripts_dir`), so newly-authored tasks bake their command path here.
+SCRIPTS_DIR = cfg.SCRIPTS_DIR
+
+
+def _seed_scripts_dir() -> None:
+    """Populate the persistent scripts dir on first boot so an OTA update never leaves a unit
+    without its transmit library. A no-op once SCRIPTS_DIR holds any ``.py`` (the steady state, and
+    a classic single-dir install where SCRIPTS_DIR == the bundled dir). Otherwise:
+      1. MIGRATE the previous release's scripts into it — the deployed library, stranded inside the
+         swapped-out release by an update that predates this persistent layout, so a field unit
+         KEEPS its library across the upgrade; falling back to any other release still carrying
+         scripts (covers a missing ``previous`` marker on a very old agent); else
+      2. SEED the release's BUNDLED default scripts (a fresh install).
+    Best-effort — never raises (a problem is logged; an empty scripts dir behaves as before, and the
+    operator can always re-deploy)."""
+    import shutil
+    from pathlib import Path
+
+    dest = Path(SCRIPTS_DIR)
+
+    def _has_py(d: Path) -> bool:
+        try:
+            return d.is_dir() and any(d.rglob("*.py"))
+        except OSError:
+            return False
+
+    if _has_py(dest):
+        return
+
+    src = None
+    try:
+        up = _make_updater()
+        cur = up.current_version()
+        prev = up.previous_version()
+        if prev and prev != cur and _has_py(up.release_dir(prev) / "scripts"):
+            src = up.release_dir(prev) / "scripts"
+        if src is None:                                  # missing/blank `previous` marker fallback
+            others = [up.release_dir(r.version) / "scripts"
+                      for r in up.list_releases() if r.version != cur]
+            others = [d for d in others if _has_py(d)]
+            others.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+            if others:
+                src = others[0]
+    except Exception as exc:                             # noqa: BLE001 — never block startup
+        logger.warning("Scripts-migration lookup failed: %s", exc)
+        src = None
+
+    if src is None:                                      # fresh install → the release's bundled scripts
+        bundled = Path(cfg.BUNDLED_SCRIPTS_DIR)
+        try:
+            if _has_py(bundled) and bundled.resolve() != dest.resolve():
+                src = bundled
+        except OSError:
+            src = None
+
+    if src is None:
+        return
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        for p in src.rglob("*.py"):
+            if not p.is_file():
+                continue
+            out = dest / p.relative_to(src)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            if not out.exists():
+                shutil.copy2(p, out)
+                copied += 1
+        logger.info("Seeded persistent scripts dir %s from %s (%d file[s])", dest, src, copied)
+    except OSError as exc:
+        logger.warning("Could not seed scripts dir %s from %s: %s", dest, src, exc)
 
 
 @app.post("/scripts/upload", tags=["scripts"], dependencies=[Depends(verify_key)])

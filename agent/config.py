@@ -39,6 +39,19 @@ CTRL_DIR   = Path(os.environ.get("SDR_CTRL_DIR", STATE_DIR / "run" / "ctl"))
 # state) and scripts/ (code). Uploaded via the /files API, validated per known kind.
 DATA_DIR   = Path(os.environ.get("SDR_DATA_DIR", STATE_DIR / "data"))
 
+# ── Transmit scripts (the deployed library) ───────────────────────────────────
+# The client-deployed transmit library (uploaded via /scripts/upload). It lives in STATE_DIR —
+# PERSISTENT, alongside configs/ and data/ — so an OTA update, which REPLACES the release code
+# dir, never wipes it (tasks/sequences/plans/calibration already persist there; scripts used to
+# be the one part of the library that didn't, stranded inside the swapped-out release). The
+# release still SHIPS default scripts at BUNDLED_SCRIPTS_DIR (inside the code dir); on first boot
+# the agent SEEDS an empty SCRIPTS_DIR from there (a fresh unit) or MIGRATES the previous
+# release's scripts into it (the first boot after upgrading from a pre-persistent agent — so a
+# unit in the field keeps its library across the update). A classic single-dir install keeps
+# SCRIPTS_DIR == BUNDLED_SCRIPTS_DIR (STATE_DIR defaults to BASE_DIR), so nothing moves there.
+SCRIPTS_DIR         = Path(os.environ.get("SDR_SCRIPTS_DIR", STATE_DIR / "scripts"))
+BUNDLED_SCRIPTS_DIR = Path(os.environ.get("SDR_BUNDLED_SCRIPTS_DIR", BASE_DIR / "scripts"))
+
 # ── Power calibration (see docs/calibration.md) ───────────────────────────────
 # The per-unit calibration document (this box's measured curves) lives in the data
 # store; the shared, type-keyed defaults it merges over live in configs/ (they're
@@ -317,7 +330,17 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # step that turns the RF output gate ON (SequenceRunner._co_time_rank), so a ramp whose first point
 # is co-timed with RF-on opens the gate at the intended level instead of flashing the stale standing
 # power for one fire. Behaviour only, no capability; the bump lets OTA push it onto deployed units.
-AGENT_VERSION = "1.22.1"
+# 1.23.0: the deployed script LIBRARY now survives an agent update. Scripts moved to the persistent
+# SCRIPTS_DIR (STATE_DIR/scripts), alongside configs/data — an OTA update no longer wipes them (they
+# used to live inside the swapped-out release). On first boot the agent seeds an empty SCRIPTS_DIR
+# from the release's bundled scripts (fresh unit) or MIGRATES the previous release's scripts into it
+# (the first boot after upgrading a pre-persistent agent — so a field unit keeps its library). The
+# launch now also puts BASE_DIR on PYTHONPATH so a relocated script still imports paramkit, and the
+# script/spec resolution falls back to SCRIPTS_DIR for a task baked with the old release path. Also
+# fixes the negative argspec cache (a missing script's spec is never cached; reload drops the cache)
+# so re-deploying after a failed run recovers without a restart. Behaviour only, no capability; the
+# bump lets OTA push it onto deployed units.
+AGENT_VERSION = "1.23.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
