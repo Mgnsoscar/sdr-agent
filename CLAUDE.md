@@ -90,6 +90,31 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — spreadsheet run-log export (agent side: per-change table endpoint): COMPLETE (branch `claude/hold-step-phase-0-wwwxf7-lty0i5`, cross-repo; client side in `sdr-client`)
+Owner ask: export a ran sequence/plan's log as a spreadsheet — one ROW PER STATE CHANGE (a tune that
+changes nothing adds no row), every parameter in its own column, and (for multi-unit plans) one SHEET
+PER UNIT; the run-row "Export log…" offers the last ≤10 runs to pick from; any run with fired steps is
+exportable. The **agent** builds the per-run table (reusing the run-log math so the sheet matches the
+log); the **client** turns each unit's tables into an .xlsx (see `sdr-client/CLAUDE.md`).
+- **`agent/run_table.py`** (new, pure) — `build_task_table(task, steps, spec, artifact, realize,
+  freq_hz)` reconstructs one duration task's time-series: walks the run's fired start/tune steps in
+  order, carries the effective param state, and emits a row only when the resolved row differs from the
+  previous (dedupe). Columns: Time · every power quantity (base measured + each law view, declared
+  order) · realized **SDR gain [dB]** + **Attenuation [dB]** · each LIVE param (excl. power/gain) with
+  any visible derived readout right after it · then the FIXED params (PRN, Frequency) as constant
+  columns. `--power`/`--gain` never get their own column (covered by the quantities / SDR gain); an
+  on/off param renders `0/1` under a "… on" header. Reuses `tune_log` for the quantity/derived fold.
+- **`agent/process_manager.py`** — `power_realizer(task)` → a closure `power → {sdr_gain_db, atten_db}`
+  (the calibration resolved ONCE, reused per row) via `resolve_from_files(...).realize`.
+- **`agent/sequence_runner.py`** — `build_log_table(run_id)` → `{run_id, sequence_name, state,
+  on_air_at, tables:[…]}` (one table per duration task; `tune_log_context` + `power_realizer` per task).
+- **`agent/main.py`** — `GET /sequence-runs/{id}/log-table` (404 unknown).
+- **`config.py`** — capability **`sequence-log-table`** + `AGENT_VERSION 1.20.0 → 1.21.0` (the client
+  gates its "Export log…" button on the capability). `argspec`/`ramp` untouched (drift guard intact).
+  Tests: `tests/test_run_table.py` (quantity + realized + fixed columns; row-per-change drops a no-op
+  tune; RF 0/1; enbw-tracked full power; uncalibrated → no quantity/realized cols) + `test_meta_endpoint`
+  asserts the capability. Suite 435 → 438. Endpoint validated live end-to-end.
+
 ## Current state — sequence run log: calibrated tune AND start/run steps show every power quantity (grouped, atomic): COMPLETE (branch `claude/hold-step-phase-0-wwwxf7-lty0i5`, agent-only)
 Owner ask: a TUNE step that changes a calibrated `--power` logged only the raw base wire value (a
 spectral density in dBm/Hz), and a START step dumped the raw `--flag value` command line — both

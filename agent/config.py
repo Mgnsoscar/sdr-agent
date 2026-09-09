@@ -300,7 +300,7 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # EDITED sequence — edit-while-holding, Phase 3c §6.4), re-extracting window B from it instead of the
 # window B stored at arm. A ≤1.18 agent ignores req.steps (uses the stored window B), so the client
 # gates its window-B edit UI on this capability — a safety gate, else an edit would be silently lost.
-AGENT_VERSION = "1.20.0"
+AGENT_VERSION = "1.21.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -401,6 +401,12 @@ AGENT_CAPABILITIES = [
                                          # the operator's revision. Phase 3c; the client gates its
                                          # window-B edit UI on this string (a ≤1.18 agent ignores
                                          # req.steps, so an edit would be silently lost).
+    "sequence-log-table",                # GET /sequence-runs/{id}/log-table returns the run's
+                                         # spreadsheet-shaped log (per-change rows, every power
+                                         # quantity + realized SDR gain/attenuation + params +
+                                         # derived readouts). The client gates its "Export log…"
+                                         # button on this string and turns each unit's tables
+                                         # into sheets of an .xlsx workbook.
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

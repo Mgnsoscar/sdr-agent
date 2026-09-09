@@ -1540,6 +1540,18 @@ async def get_sequence_run(run_id: str, runner: SequenceRunner = Depends(get_run
         raise HTTPException(status_code=404, detail=str(exc))
 
 
+@app.get("/sequence-runs/{run_id}/log-table", tags=["sequence-runs"],
+         dependencies=[Depends(verify_key)])
+async def get_sequence_run_log_table(run_id: str, runner: SequenceRunner = Depends(get_runner)):
+    """The run's spreadsheet-shaped log: one table per duration task, each a per-change
+    time-series (Time + every power quantity + realized SDR gain/attenuation + each parameter +
+    derived readouts). The client turns each unit's tables into sheets of an .xlsx."""
+    try:
+        return runner.build_log_table(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
 @app.patch("/sequence-runs/{run_id}", response_model=SequenceRun, tags=["sequence-runs"],
            dependencies=[Depends(verify_key)])
 async def patch_sequence_run(

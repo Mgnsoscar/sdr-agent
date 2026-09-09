@@ -45,6 +45,7 @@ from .models import (
 from .process_manager import ProcessManager
 from .sequence_log import RunLog
 from . import tune_log
+from . import run_table
 
 logger = logging.getLogger(__name__)
 
@@ -696,6 +697,37 @@ class SequenceRunner:
         if run_id not in self._runs:
             raise KeyError(f"Unknown run: '{run_id}'")
         return self._runs[run_id]
+
+    def build_log_table(self, run_id: str) -> dict:
+        """The run's spreadsheet-shaped log: one table per duration task (a task with a start
+        step), each a per-change time-series (agent/run_table.py). The client turns each unit's
+        tables into sheets of an .xlsx. Raises KeyError for an unknown run."""
+        run = self.get_run(run_id)
+        seq = self._sequences.get(run.sequence_id)
+        # Duration tasks = those that were launched (a start step); fall back to any task that
+        # fired, so a run made only of tune/run steps still yields a table.
+        ordered: List[str] = []
+        for s in run.steps:
+            if s.action == "start" and s.task_name not in ordered:
+                ordered.append(s.task_name)
+        if not ordered:
+            for s in run.steps:
+                if s.task_name not in ordered:
+                    ordered.append(s.task_name)
+        tables = []
+        for task in ordered:
+            spec, artifact = self._manager.tune_log_context(task)
+            realize = self._manager.power_realizer(task)
+            tables.append(run_table.build_task_table(
+                task, list(run.steps), spec, artifact, realize))
+        return {
+            "run_id": run.id,
+            "sequence_id": run.sequence_id,
+            "sequence_name": getattr(seq, "name", "") if seq else "",
+            "state": run.state.value if hasattr(run.state, "value") else str(run.state),
+            "on_air_at": run.on_air_at,
+            "tables": tables,
+        }
 
     async def patch_on_air_end(self, run_id: str, new_end_iso: str) -> SequenceRun:
         """Move the on-air STOP to a new absolute UTC time. Stop-anchored steps follow."""

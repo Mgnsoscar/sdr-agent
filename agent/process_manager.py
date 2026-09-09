@@ -893,6 +893,43 @@ class ProcessManager:
                 artifact = None
         return spec, artifact
 
+    def power_realizer(self, task_name: str):
+        """A closure ``power_dbm -> {'sdr_gain_db', 'atten_db'}`` for a task's calibrated chain
+        (the calibration is resolved ONCE, then reused for every row), or None when the task
+        isn't calibrated. Fills the run-log table's realized SDR gain / attenuation columns."""
+        try:
+            cfg = self._get(task_name).config
+        except KeyError:
+            return None
+        signal_id = cfg.env.get(_agentcfg.CAL_SIGNAL_ID_ENV)
+        if not signal_id:
+            return None
+        freq_env = None
+        raw = cfg.env.get(_agentcfg.CAL_FREQ_HZ_ENV)
+        if raw:
+            try:
+                freq_env = float(raw)
+            except (TypeError, ValueError):
+                freq_env = None
+        try:
+            resolved = _calib.resolve_from_files(
+                _agentcfg.CALIBRATION_DOC, _agentcfg.CALIBRATION_DEFAULTS, signal_id,
+                components_path=_agentcfg.CALIBRATION_COMPONENTS, freq_hz=freq_env)
+        except Exception:                            # noqa: BLE001 — uncalibrated / bad doc → no columns
+            return None
+        if resolved is None:
+            return None
+
+        def realize(power, freq=None):
+            try:
+                res = resolved.realize(float(power), freq if freq is not None else freq_env)
+            except Exception:                        # noqa: BLE001
+                return None
+            atten = next((s.get("value") for s in res.get("settings", []) or []), None)
+            return {"sdr_gain_db": res.get("sdr_gain_db"), "atten_db": atten}
+
+        return realize
+
     async def _launch_oneshot_wait(self, name: str, args: List[str],
                                    timeout: float = _ACTIVE_SET_TIMEOUT_S) -> Optional[int]:
         """Launch a task's command as a transient process and AWAIT its exit (with a timeout),
