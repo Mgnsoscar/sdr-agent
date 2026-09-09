@@ -76,6 +76,20 @@ def test_a_derived_plane_without_control_stays_passive():
     assert r._planes["atten_out"].is_active is False
 
 
+def test_mute_drives_every_active_component_to_max_attenuation():
+    # RF off ⇒ muted: SDR gain 0 and every attenuator at its most-reducing state (max dB), with
+    # no emitted power. Same settings shape realize() produces, so the agent's one-shot command
+    # path positions the attenuator to max just as it positions it for a --power.
+    r = _resolve(_doc(_control()))
+    m = r.mute()
+    assert m["sdr_gain_db"] == 0.0 and m["power_dbm"] is None
+    assert len(m["settings"]) == 1
+    s = m["settings"][0]
+    assert s["task"] == "atten_set" and s["param"] == "attenuation"
+    assert s["applied_db"] == -95.0                    # most reduction
+    assert s["value"] == 95.0                          # the attenuator's max_db (max attenuation)
+
+
 @pytest.mark.parametrize("bad,frag", [
     (_control(task=""), "task"),
     (_control(param=""), "param"),

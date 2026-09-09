@@ -28,6 +28,11 @@ import math
 from typing import Any, Callable, Dict, List, Optional
 
 from paramkit import power_law
+from paramkit import rf as _rf
+
+# What the power line reads when the RF output gate is off: the unit is muted (gain + amplitude
+# zeroed, attenuators at max), so there is no meaningful emitted power to fold into quantities.
+_MUTED_POWER_ROW = ("—", "", "RF off — muted")
 
 
 # ── Small derived-formula evaluator (mirrors sdr-client state/power_fold.eval_formula) ──
@@ -218,13 +223,16 @@ def format_tune_step(task_name: str, changed: Dict[str, Any], effective: Dict[st
     by_dest = {p.get("dest"): p for p in params if p.get("dest")}
     laws = spec.get("calibration_power_laws") or []
     resolver = _make_resolver(by_dest, effective)
+    muted = _rf.is_muted(params, effective)          # RF gate off ⇒ power is muted, not emitted
 
     blocks: List[str] = []
     for dest, value in changed.items():
         param = by_dest.get(dest)
         header = f"[{clock}] ◈ {task_name}    •    {_label(param, dest)}"
         rows: List[tuple] = []
-        if _is_power_dest(dest, param) and artifact and laws:
+        if _is_power_dest(dest, param) and muted:
+            rows = [_MUTED_POWER_ROW]                 # RF off: no emitted power (with or without laws)
+        elif _is_power_dest(dest, param) and artifact and laws:
             base = _num(value)
             if base is not None:
                 rows = _quantity_lines(base, artifact, laws, resolver)
@@ -254,11 +262,15 @@ def format_launch_step(task_name: str, values: Dict[str, Any], spec: Optional[di
     by_dest = {p.get("dest"): p for p in params if p.get("dest")}
     laws = spec.get("calibration_power_laws") or []
     resolver = _make_resolver(by_dest, values)
+    muted = _rf.is_muted(params, values)             # RF gate off ⇒ power is muted, not emitted
 
     rows: List[tuple] = []
     seen_derived: set = set()
     for dest, value in values.items():
         param = by_dest.get(dest)
+        if _is_power_dest(dest, param) and muted:
+            rows.append(_MUTED_POWER_ROW)             # RF off: no emitted power (with or without laws)
+            continue
         if _is_power_dest(dest, param) and artifact and laws:
             base = _num(value)
             if base is not None:

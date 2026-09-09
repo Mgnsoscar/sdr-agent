@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from . import tune_log
 from paramkit import power_law
+from paramkit import rf as _rf
 
 
 def _fnum(v: Optional[float], places: int = 6):
@@ -142,13 +143,21 @@ def _hdr(name: str, unit: str) -> str:
 
 
 def _row_values(cols: List[_Col], effective: dict, by_dest: dict, artifact: Optional[dict],
-                realize: Optional[Callable], freq_hz: Optional[float]) -> list:
+                realize: Optional[Callable], freq_hz: Optional[float],
+                rf_gate: Optional[dict] = None) -> list:
     resolver = tune_log._make_resolver(by_dest, effective)
     base = tune_log._num(effective.get("power"))
+    # RF output gate off ⇒ MUTED: nothing is emitting, so blank every power quantity and report the
+    # muted device state (SDR gain 0, attenuators at max) instead of the phantom held level.
+    rf_off = False
+    if rf_gate is not None:
+        gd = rf_gate.get("dest") or rf_gate.get("name")
+        rf_off = not _rf.is_on(effective.get(gd, rf_gate.get("default")))
     real = None
-    if realize is not None and base is not None:
+    if realize is not None:
         try:
-            real = realize(base, freq_hz)
+            real = (realize(None, freq_hz, rf_on=False) if rf_off
+                    else (realize(base, freq_hz) if base is not None else None))
         except Exception:                            # noqa: BLE001
             real = None
     out: list = []
@@ -156,10 +165,10 @@ def _row_values(cols: List[_Col], effective: dict, by_dest: dict, artifact: Opti
         if c.kind == "time":
             out.append("")                           # filled by the caller (the fire time)
         elif c.kind == "power_base":
-            out.append(_fnum(base))
+            out.append(None if rf_off else _fnum(base))
         elif c.kind == "law":
             v = None
-            if base is not None:
+            if not rf_off and base is not None:
                 try:
                     parsed = power_law.parse_law(c.ref)
                     keyed = {}
@@ -197,6 +206,7 @@ def build_task_table(task_name: str, steps: list, spec: Optional[dict], artifact
     by_dest = {p.get("dest"): p for p in params if p.get("dest")}
     laws = spec.get("calibration_power_laws") or []
     flag_to_dest = {str(f): p["dest"] for p in params if p.get("dest") for f in (p.get("flags") or [])}
+    rf_gate = _rf.gate(params)                        # the RF output gate (muted power ⇒ blank cells)
 
     fired = [s for s in steps if getattr(s, "task_name", None) == task_name
              and getattr(s, "fired_actual", None) and str(getattr(s, "fired_actual")) != "skipped"
@@ -212,7 +222,7 @@ def build_task_table(task_name: str, steps: list, spec: Optional[dict], artifact
             effective.update(_args_to_params(list(getattr(s, "args", []) or []), flag_to_dest))
         if getattr(s, "params", None):
             effective.update(dict(s.params))
-        values = _row_values(cols, effective, by_dest, artifact, realize, freq_hz)
+        values = _row_values(cols, effective, by_dest, artifact, realize, freq_hz, rf_gate)
         body = values[1:]                            # everything but Time
         if last is not None and body == last:
             continue                                 # nothing changed → no new row

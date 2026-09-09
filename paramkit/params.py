@@ -193,6 +193,12 @@ class Param:
     # the GUI folds --power at the actual span. The transmit script already computes the same
     # quantity itself (a derived field is never a CLI argument). None ⇒ stands in for nothing.
     provides: Optional[str] = None
+    # CHOICE only: marks this parameter as the RF OUTPUT GATE — an on/off control that mutes the
+    # unit when off (the script zeros gain + amplitude; the agent also drives every programmable
+    # attenuator to max). "Off" means the unit is not transmitting, so the run log / spreadsheet
+    # export blank the power quantities on an off row instead of showing a phantom held level.
+    # See paramkit.rf for how a gate is recognised (this marker, else the --rf on/off convention).
+    is_rf: bool = False
 
     @property
     def display_name(self) -> str:
@@ -223,6 +229,7 @@ class Param:
             "is_freq": self.is_freq,
             "hidden": self.hidden,
             "provides": self.provides,
+            "is_rf": self.is_rf,
         }
 
 
@@ -380,7 +387,8 @@ class Script:
     def choice(self, *flags: str, options: ChoiceInput, name: Optional[str] = None,
                help: str = "", unit: str = "", default: Any = None,
                required: bool = False, live: bool = False,
-               show_when: Optional[Dict[str, Any]] = None) -> "Script":
+               show_when: Optional[Dict[str, Any]] = None,
+               is_rf: bool = False) -> "Script":
         """A parameter restricted to a fixed set of options (a GUI dropdown).
 
         ``options`` is either a plain sequence of values — ``["sc8", "sc16"]`` — or a
@@ -390,7 +398,12 @@ class Script:
         receive the value, kept in its Python type (int/float/str). A plain sequence
         uses each entry as both value and label, exactly as before, so existing
         scripts are unaffected. ``unit`` is a display-only suffix (like the other
-        input types). See number() for the live= flag."""
+        input types). See number() for the live= flag.
+
+        Pass ``is_rf=True`` to mark this as the RF OUTPUT GATE (an on/off control):
+        when it reads off the unit is muted (the script zeros gain + amplitude and
+        the agent maxes every programmable attenuator), so the run log / spreadsheet
+        export blank the power quantities on an off row. See paramkit.rf."""
         n, flags = self._derive_name(flags, name)
         if isinstance(options, Mapping):
             # {label: value} — display label → the value the script receives.
@@ -406,7 +419,7 @@ class Script:
         return self._add(Param(
             name=n, flags=flags, kind=CHOICE, help=help, unit=unit, choices=opts,
             choice_labels=labels, choice_values=values, default=default,
-            required=required, live=live, show_when=show_when,
+            required=required, live=live, show_when=show_when, is_rf=is_rf,
         ))
 
     @staticmethod

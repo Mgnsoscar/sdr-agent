@@ -34,7 +34,9 @@ _ART = {"quantity": "spectral density", "operating_unit": "dBm/Hz",
         "active_components": [{"plane": "atten"}]}
 
 
-def _realize(power, freq=None):
+def _realize(power, freq=None, rf_on=True):
+    if not rf_on:                                     # muted: gain 0, attenuator at max
+        return {"sdr_gain_db": 0.0, "atten_db": 95.0}
     return {"sdr_gain_db": 80.25, "atten_db": 29.0}
 
 
@@ -43,10 +45,10 @@ def _step(action, fired, args=None, params=None, task="mock_prn"):
                            params=params or {}, fired_actual=fired)
 
 
-def _launch():
+def _launch(rf="off"):
     return _step("start", "2026-09-09T09:00:00+00:00",
                  args=["--prn", "1", "--freq", "1575.42", "--sidelobes", "2",
-                       "--power", "-99.654784", "--rf", "off"])
+                       "--power", "-99.654784", "--rf", rf])
 
 
 def test_columns_include_quantities_realized_and_fixed_params():
@@ -84,10 +86,18 @@ def test_row_per_change_and_no_op_tune_is_dropped():
     assert [r[ci["Time"]] for r in t["rows"]] == ["09:00:00.000", "09:00:02.000", "09:00:06.000"]
     assert [r[rf] for r in t["rows"]] == [0, 1, 1]                              # RF 0/1
     assert [r[sl] for r in t["rows"]] == [2, 2, 3]
-    # full-signal power tracks the sidelobe count (enbw), so it changes on the last row only
-    assert t["rows"][0][full] == t["rows"][1][full]
+    # Warm-up row has RF OFF ⇒ MUTED: every power quantity blanks, and the device state is the
+    # muted one (SDR gain 0, attenuator at max) — not the phantom held level.
+    sd, g, a = ci["Spectral density [dBm/Hz]"], ci["SDR gain [dB]"], ci["Attenuation [dB]"]
+    assert t["rows"][0][full] is None and t["rows"][0][sd] is None
+    assert t["rows"][0][g] == 0 and t["rows"][0][a] == 95
+    # Once RF is on the quantities appear; full-signal power tracks the sidelobe count (enbw),
+    # so it changes only on the last row.
+    assert t["rows"][1][full] is not None
     assert t["rows"][2][full] != t["rows"][1][full]
-    # passband tracks sidelobes: 2 → 6.138, 3 → 8.184
+    assert t["rows"][1][g] == 80.25 and t["rows"][1][a] == 29
+    # passband (a derived readout, not power) is unaffected by RF and tracks sidelobes: 2 → 6.138,
+    # 3 → 8.184
     pb = ci["Passband bandwidth [MHz]"]
     assert t["rows"][0][pb] == 6.138 and t["rows"][2][pb] == 8.184
     # fixed columns are constant
@@ -100,7 +110,7 @@ def test_subsecond_fires_get_distinct_timestamps():
     # both printed "10:39:..." truncated to the second). Millisecond precision keeps them
     # distinct AND ordered.
     steps = [
-        _launch(),
+        _launch("on"),                                # a ramp runs while RF is ON (power varies)
         _step("tune", "2026-09-09T09:00:43.974602+00:00", params={"power": -120.0}),
         _step("tune", "2026-09-09T09:00:44.796660+00:00", params={"power": -160.0}),
     ]
@@ -109,6 +119,28 @@ def test_subsecond_fires_get_distinct_timestamps():
     times = [r[ci["Time"]] for r in t["rows"]]
     assert times == ["09:00:00.000", "09:00:43.974", "09:00:44.796"]
     assert len(set(times)) == len(times)              # all distinct — no shared timestamp
+
+
+def test_rf_off_blanks_power_and_a_power_change_while_muted_adds_no_row():
+    # While RF is off the unit is muted, so a --power change produces no emitted change and no new
+    # row; when RF turns on the held power appears and the muted device state gives way to the real
+    # SDR gain / attenuation.
+    steps = [
+        _launch("off"),
+        _step("tune", "2026-09-09T09:00:01+00:00", params={"power": -120.0}),   # muted → no row
+        _step("tune", "2026-09-09T09:00:05+00:00", params={"rf": "on"}),        # un-mute → row
+    ]
+    t = run_table.build_task_table("mock_prn", steps, _SPEC, _ART, _realize)
+    ci = {c: i for i, c in enumerate(t["columns"])}
+    sd, full = ci["Spectral density [dBm/Hz]"], ci["Full signal power (filter passband) [dBm]"]
+    g, a, rf = ci["SDR gain [dB]"], ci["Attenuation [dB]"], ci["RF on"]
+    assert len(t["rows"]) == 2                         # the muted power change added no row
+    assert t["rows"][0][rf] == 0 and t["rows"][1][rf] == 1
+    assert t["rows"][0][sd] is None and t["rows"][0][full] is None
+    assert t["rows"][0][g] == 0 and t["rows"][0][a] == 95
+    # RF back on carries the last-set power (-120), now shown, with the real device state
+    assert t["rows"][1][sd] == -120.0
+    assert t["rows"][1][g] == 80.25 and t["rows"][1][a] == 29
 
 
 def test_uncalibrated_run_has_no_quantity_or_realized_columns():

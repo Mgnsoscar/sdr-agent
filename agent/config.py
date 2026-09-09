@@ -304,7 +304,16 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # points well under a second apart, and whole-second truncation printed two DISTINCT sequential
 # state changes under one timestamp (they looked simultaneous in the exported sheet). Display-only;
 # no capability change (the client just renders the Time string).
-AGENT_VERSION = "1.21.1"
+# 1.22.0: RF output gate = MUTE. A transmit script's RF on/off control is now a first-class gate
+# (paramkit .choice(is_rf=True), else the --rf on/off convention; argspec extracts `is_rf`). When
+# it reads OFF the unit is muted: on top of the script zeroing its gain + amplitude, the agent now
+# drives every programmable attenuator to MAX (ResolvedCalibration.mute → _gate_precommand on
+# start/tune/restart/run), and the run log + spreadsheet export blank the power quantities on an
+# off row (SDR gain 0, Attenuation max) instead of showing the phantom held level — so a power-vs-
+# time plot has no points during a muted warm-up. Agent-rendered/behaviour only; the client parses
+# nothing new, so no capability string (an older agent just shows the pre-mute values). The bump
+# lets OTA push the new argspec (`is_rf`) + muting onto deployed units.
+AGENT_VERSION = "1.22.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list

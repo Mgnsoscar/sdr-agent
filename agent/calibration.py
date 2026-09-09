@@ -495,6 +495,23 @@ class ResolvedCalibration:
         return {"power_dbm": res["power_dbm"] + dr, "sdr_gain_db": res["sdr_gain_db"],
                 "settings": settings}
 
+    def mute(self) -> dict:
+        """Device settings for a MUTED output (the RF gate is off): SDR gain 0 and every active
+        component driven to its MOST-REDUCING state (max attenuation / min gain). No emitted power
+        is defined — nothing is transmitting. ``settings`` has the same shape as
+        ``realize(...)['settings']`` (so the same one-shot command path positions the attenuators),
+        and this mirrors, on the attenuator side, what the transmit script does to its own gain +
+        amplitude while off."""
+        settings = []
+        for name, d in self._active_hops():
+            c = d.control
+            applied = c.applied_lo                    # most reduction: max attenuation / min gain
+            settings.append({"plane": name, "task": c.task, "param": c.param,
+                             "applied_db": applied,
+                             "value": round(c.param_for_applied(applied), 6),
+                             "consts": dict(c.consts)})
+        return {"power_dbm": None, "sdr_gain_db": 0.0, "settings": settings}
+
     def _rd(self) -> float:
         """Reported offset applied at the grid boundary: 0 for an own curve (the grid is
         already in the reported quantity), else the additive reported delta."""

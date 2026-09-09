@@ -28,6 +28,7 @@ from typing import Deque, Dict, List, Optional
 from . import config as _agentcfg   # module import; container methods use a local `cfg`
 from . import calibration as _calib
 from .argspec import extract_params
+from paramkit import rf as _rf
 from .log_manager import LogManager
 from .models import (
     CrashEvent, ExitRecord, ProcessState, ProcessStatus,
@@ -192,6 +193,20 @@ def _power_from_command(cmd) -> Optional[float]:
             except (TypeError, ValueError):
                 pass
     return val
+
+
+def _rf_on_from_command(cmd, gate: dict) -> bool:
+    """Whether a launch command leaves the RF output gate ON: the gate flag's value on the command
+    line if present, else the gate's schema default, else on (a launch that never set --rf)."""
+    flags = {str(f) for f in (gate.get("flags") or [])}
+    last = None
+    for i, a in enumerate(cmd or []):
+        if str(a) in flags and i + 1 < len(cmd):
+            last = cmd[i + 1]
+    if last is not None:
+        return _rf.is_on(last)
+    default = gate.get("default")
+    return _rf.is_on(default) if default is not None else True
 
 
 def _fmt_num(v: float) -> str:
@@ -604,6 +619,9 @@ class ProcessManager:
         self._active_flags: Dict[str, dict] = {}
         # Full extracted argspec, cached per script (see tune_log_context).
         self._script_specs: Dict[str, Optional[dict]] = {}
+        # Per-task RF-gate bookkeeping: the last-known {power, rf_on} so a live tune that toggles
+        # only one of them still positions the attenuators correctly (see _gate_precommand).
+        self._gate_state: Dict[str, dict] = {}
 
     def _make_proc(self, cfg: TaskConfig) -> ManagedProcess:
         return ManagedProcess(
@@ -681,8 +699,9 @@ class ProcessManager:
         cfg = mp.config
         cmd = _build_command(cfg.command, list(args), replace=True)
         # Auto-command both: a one-shot transmit run that sets an absolute --power also drives
-        # its linked active components (attenuator, …) first.
-        await self._precommand_active(name, _power_from_command(cmd))
+        # its linked active components (attenuator, …) first — muted (attenuators at max) when the
+        # command leaves the RF output gate off.
+        await self._gate_precommand(name, cmd=cmd)
         env = {**os.environ, **cfg.env}
         env.setdefault("PYTHONUNBUFFERED", "1")   # flush print()/stdout live, like logging
         try:
@@ -748,7 +767,7 @@ class ProcessManager:
         # as a one-shot, so nothing has to be running and the operator never sees it.
         req = request or StartRequest()
         cmd = _build_command(proc.config.command, req.args, req.replace_args)
-        await self._precommand_active(name, _power_from_command(cmd))
+        await self._gate_precommand(name, cmd=cmd)
         await proc.start(request)
         status = proc.status()
         if source == "manual":
@@ -766,35 +785,30 @@ class ProcessManager:
     async def set_params(self, name: str, values: dict, wait: float = 1.0) -> dict:
         """Retune a running task's live parameters. Raises KeyError (unknown task)
         or RuntimeError (not running / no live params)."""
-        # A live retune of an absolute --power on a calibrated transmit task also repositions
-        # its linked active components (attenuator, …) first.
-        p = values.get("power")
-        await self._precommand_active(name, p if isinstance(p, (int, float)) else None)
+        # A live retune of an absolute --power (or a toggle of the RF gate) on a calibrated
+        # transmit task also repositions its linked active components (attenuator, …) first —
+        # muted (attenuators at max) when the gate is now off, else set for the effective --power.
+        gate = self._rf_gate(name)
+        gd = (gate.get("dest") or gate.get("name")) if gate else None
+        if "power" in values or (gd and gd in values):
+            await self._gate_precommand(name, values=values)
         return await self._get(name).set_params(values, wait)
 
     async def get_params(self, name: str) -> dict:
         """Read a running task's current + applied live-parameter values."""
         return await self._get(name).get_params()
 
-    def active_settings(self, task_name: str, power: Optional[float],
-                        freq_hz: Optional[float] = None) -> List[dict]:
-        """The active-component commands to issue alongside an absolute ``power`` (dBm) on
-        ``task_name`` — driven automatically whenever the task is launched/tuned (Run, quick
-        play, sequences, ramps, the API). Each is ``{plane, task, param, applied_db, value}``
-        from the SDR-first realization, naming
-        a linked control task (e.g. a step attenuator), its parameter, and the value to set so
-        the SDR + the component together deliver ``power``. Empty when the task didn't opt into
-        calibration, the unit isn't calibrated for its signal, the chain has no active
-        components, or ``power`` is None. Never raises — a resolution problem yields []."""
-        if power is None:
-            return []
+    def _resolve_active(self, task_name: str, freq_hz: Optional[float] = None):
+        """``(resolved_calibration, freq_hz)`` for a task IF it opted into calibration AND its
+        chain has active components, else ``(None, freq_hz)`` (freq resolved from the task env when
+        not supplied). Never raises — a resolution problem yields None."""
         try:
             cfg = self._get(task_name).config
         except KeyError:
-            return []
+            return None, freq_hz
         signal_id = cfg.env.get(_agentcfg.CAL_SIGNAL_ID_ENV)
         if not signal_id:
-            return []
+            return None, freq_hz
         if freq_hz is None:
             raw = cfg.env.get(_agentcfg.CAL_FREQ_HZ_ENV)
             if raw:
@@ -808,10 +822,35 @@ class ProcessManager:
                 components_path=_agentcfg.CALIBRATION_COMPONENTS, freq_hz=freq_hz)
         except _calib.CalibrationError as exc:
             logger.warning("Active components for '%s': %s", task_name, exc)
-            return []
+            return None, freq_hz
         if resolved is None or not resolved.has_active:
+            return None, freq_hz
+        return resolved, freq_hz
+
+    def active_settings(self, task_name: str, power: Optional[float],
+                        freq_hz: Optional[float] = None) -> List[dict]:
+        """The active-component commands to issue alongside an absolute ``power`` (dBm) on
+        ``task_name`` — driven automatically whenever the task is launched/tuned (Run, quick
+        play, sequences, ramps, the API). Each is ``{plane, task, param, applied_db, value}``
+        from the SDR-first realization, naming
+        a linked control task (e.g. a step attenuator), its parameter, and the value to set so
+        the SDR + the component together deliver ``power``. Empty when the task didn't opt into
+        calibration, the unit isn't calibrated for its signal, the chain has no active
+        components, or ``power`` is None. Never raises — a resolution problem yields []."""
+        if power is None:
+            return []
+        resolved, freq_hz = self._resolve_active(task_name, freq_hz)
+        if resolved is None:
             return []
         return resolved.realize(float(power), freq_hz)["settings"]
+
+    def _mute_settings(self, task_name: str, freq_hz: Optional[float] = None) -> List[dict]:
+        """The active-component commands that MUTE ``task_name``'s chain — every programmable
+        attenuator driven to max (see ``ResolvedCalibration.mute``). Same shape as
+        ``active_settings`` so the same one-shot command path positions them. Empty when the task
+        isn't calibrated or has no active components. Never raises."""
+        resolved, _ = self._resolve_active(task_name, freq_hz)
+        return resolved.mute()["settings"] if resolved is not None else []
 
     def _active_flag(self, task_name: str, param: str) -> str:
         """The CLI flag for an active component's control ``param``, read from its task's
@@ -919,8 +958,12 @@ class ProcessManager:
             return None
         if resolved is None:
             return None
+        muted = resolved.mute()                      # resolved ONCE: gain 0 + attenuators at max
+        muted_atten = next((s.get("value") for s in muted.get("settings", []) or []), None)
 
-        def realize(power, freq=None):
+        def realize(power, freq=None, rf_on=True):
+            if not rf_on:                            # muted: RF gate off → no emission
+                return {"sdr_gain_db": muted.get("sdr_gain_db", 0.0), "atten_db": muted_atten}
             try:
                 res = resolved.realize(float(power), freq if freq is not None else freq_env)
             except Exception:                        # noqa: BLE001
@@ -963,15 +1006,11 @@ class ProcessManager:
             logger.warning("Active-set '%s' exited with code %s", name, code)
         return code
 
-    async def _precommand_active(self, name: str, power: Optional[float],
-                                 freq_hz: Optional[float] = None) -> None:
-        """Set each linked active component (e.g. a step attenuator) for an absolute ``power``
-        BEFORE the transmit task ``name`` emits — as a one-shot, so no long-running control
-        task is needed and the operator never has to think about it. Awaited so the component
-        is physically in position first. Best-effort: a failed/timed-out set is logged, not
-        fatal (the transmit script still clamps its own SDR gain to a safe range). A no-op for
-        a task without active components or without an absolute power (relative-gain mode)."""
-        for s in self.active_settings(name, power, freq_hz):
+    async def _apply_active_settings(self, settings: List[dict]) -> None:
+        """Fire each active-component set (a one-shot, awaited) so the components are physically in
+        position before the transmit emits. Best-effort: a failed/timed-out set is logged, not
+        fatal (the transmit script still clamps its own SDR gain to a safe range)."""
+        for s in settings or []:
             atask, param, value = s.get("task"), s.get("param"), s.get("value")
             if not atask or param is None or value is None:
                 continue
@@ -985,12 +1024,53 @@ class ProcessManager:
             except Exception as exc:                     # never let a set derail the transmit
                 logger.warning("Active component '%s' set failed: %s", atask, exc)
 
+    async def _precommand_active(self, name: str, power: Optional[float],
+                                 freq_hz: Optional[float] = None) -> None:
+        """Set each linked active component (e.g. a step attenuator) for an absolute ``power``
+        BEFORE the transmit task ``name`` emits — as a one-shot, so no long-running control
+        task is needed and the operator never has to think about it. Awaited so the component
+        is physically in position first. Best-effort: a failed/timed-out set is logged, not
+        fatal (the transmit script still clamps its own SDR gain to a safe range). A no-op for
+        a task without active components or without an absolute power (relative-gain mode)."""
+        await self._apply_active_settings(self.active_settings(name, power, freq_hz))
+
+    def _rf_gate(self, name: str) -> Optional[dict]:
+        """The task's RF output-gate param dict (or None) from its cached argspec."""
+        spec = self._script_spec(name)
+        return _rf.gate((spec or {}).get("params")) if spec else None
+
+    async def _gate_precommand(self, name: str, *, cmd: Optional[list] = None,
+                               values: Optional[dict] = None) -> None:
+        """Position a task's active components for a launch (``cmd``) or a live tune (``values``),
+        honouring the RF output gate: OFF ⇒ MUTE the chain (every attenuator to max); ON ⇒ set it
+        for the effective absolute ``--power``. The per-task ``{power, rf_on}`` is tracked so a
+        tune that toggles only one of them still positions the attenuators correctly. A task with
+        no RF gate behaves exactly as before (the gate is always 'on' ⇒ set for --power)."""
+        gate = self._rf_gate(name)
+        st = self._gate_state.setdefault(name, {"power": None, "rf_on": True})
+        if cmd is not None:                              # a launch: (re)seed from the command line
+            st["power"] = _power_from_command(cmd)
+            st["rf_on"] = _rf_on_from_command(cmd, gate) if gate is not None else True
+        else:                                            # a live tune: update only what changed
+            vals = values or {}
+            if "power" in vals:
+                p = vals.get("power")
+                st["power"] = float(p) if isinstance(p, (int, float)) else None
+            if gate is not None:
+                gd = gate.get("dest") or gate.get("name")
+                if gd in vals:
+                    st["rf_on"] = _rf.is_on(vals.get(gd))
+        if gate is not None and not st["rf_on"]:
+            await self._apply_active_settings(self._mute_settings(name))
+        else:
+            await self._apply_active_settings(self.active_settings(name, st["power"]))
+
     async def restart(self, name: str, request: Optional[StartRequest] = None,
                       source: str = "manual") -> ProcessStatus:
         proc = self._get(name)
         req = request or StartRequest()
         cmd = _build_command(proc.config.command, req.args, req.replace_args)
-        await self._precommand_active(name, _power_from_command(cmd))
+        await self._gate_precommand(name, cmd=cmd)
         if proc.state == ProcessState.RUNNING:
             await proc.stop()
         await proc.start(request)
