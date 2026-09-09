@@ -894,15 +894,37 @@ class ProcessManager:
         if not script:
             return None
         if script not in self._script_specs:
-            p = Path(script)
-            if not p.is_absolute() and cfg.working_dir:
-                p = Path(cfg.working_dir) / script
-            try:
-                self._script_specs[script] = extract_params(
-                    p.read_text(encoding="utf-8", errors="replace")) or None
-            except OSError:
-                self._script_specs[script] = None
+            source = self._read_script_source(script, cfg.working_dir)
+            self._script_specs[script] = (
+                extract_params(source) or None) if source is not None else None
         return self._script_specs[script]
+
+    @staticmethod
+    def _read_script_source(script: str, working_dir: Optional[str]) -> Optional[str]:
+        """The source text of a task's transmit script — resolved the SAME way the launch does
+        (`_build_command` → `_resolve_script_path`). A script filed into an organizational
+        subfolder keeps its basename, so the task command's path may not be the file's real
+        location; reading only that naive path would fail (returning None), degrading the run
+        log / spreadsheet export to the uncalibrated one-line fallback EVEN THOUGH the task
+        launches fine and the client authored against a valid spec (its `/scripts/{name}/params`
+        search finds the subfolder file). So: try the command path first (absolute, or relative
+        to working_dir), then fall back to locating the basename under its directory. None when
+        no readable source is found."""
+        p = Path(script)
+        if not p.is_absolute() and working_dir:
+            p = Path(working_dir) / script
+        try:
+            return p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+        # Not at the command path — find it by basename (subfolders), as the launch does.
+        for cand in _resolve_script_path([str(p)]):
+            if isinstance(cand, str) and cand.endswith(".py") and cand != str(p):
+                try:
+                    return Path(cand).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    break
+        return None
 
     def tune_log_context(self, task_name: str):
         """(argspec, resolved public calibration artifact) for a task — the inputs the sequence

@@ -14,7 +14,7 @@ UploadFile = pytest.importorskip("starlette.datastructures").UploadFile
 HTTPException = pytest.importorskip("fastapi").HTTPException
 
 from agent import main
-from agent.process_manager import _resolve_script_path
+from agent.process_manager import ProcessManager, _resolve_script_path
 
 
 def _scripts_dir(tmp_path, monkeypatch):
@@ -43,6 +43,53 @@ def test_resolve_script_path_leaves_a_flat_script(tmp_path):
     (root / "foo.py").write_text("print(1)\n")
     cmd = ["python3", str(root / "foo.py")]
     assert _resolve_script_path(cmd) == cmd
+
+
+# ── the run-log / export spec path resolves a subfolder script the SAME way ──────
+# The launch relocates a basename-referenced script into its real subfolder
+# (_resolve_script_path, above); the run-log / spreadsheet-export spec (_script_spec →
+# _read_script_source) must do the same, or a task whose script lives in a subfolder
+# launches fine yet logs/exports with NO parameter columns and power in the base
+# quantity only (the uncalibrated fallback), even though the client authored it against
+# a valid spec (its /scripts params search finds the subfolder file too).
+
+_SCRIPT_SRC = (
+    "from paramkit import Script\n"
+    "SCRIPT = (Script('gps')\n"
+    "    .number('--freq', name='Center frequency', unit='MHz', default=1575.42, is_freq=True)\n"
+    "    .number('--power', name='Power', unit='dBm', default=-50.0, live=True)\n"
+    "    .choice('--rf', options=['on', 'off'], name='RF', default='on', live=True))\n"
+)
+
+
+def test_read_script_source_finds_nested_script(tmp_path):
+    root = tmp_path / "scripts"
+    (root / "GPS PRN").mkdir(parents=True)
+    (root / "GPS PRN" / "gps.py").write_text(_SCRIPT_SRC)
+    # The task command names the flat path (basename identity) — the file is nested.
+    naive = str(root / "gps.py")
+    src = ProcessManager._read_script_source(naive, None)
+    assert src == _SCRIPT_SRC                                       # found in the subfolder
+    from agent.argspec import extract_params
+    params = extract_params(src)["params"]
+    assert len(params) == 3                                         # a real spec, not empty
+
+
+def test_read_script_source_flat_and_missing(tmp_path):
+    root = tmp_path / "scripts"
+    root.mkdir()
+    (root / "flat.py").write_text(_SCRIPT_SRC)
+    assert ProcessManager._read_script_source(str(root / "flat.py"), None) == _SCRIPT_SRC
+    # A genuinely absent script (nowhere under its dir) still yields None, not a raise.
+    assert ProcessManager._read_script_source(str(root / "nope.py"), None) is None
+
+
+def test_read_script_source_relative_to_working_dir(tmp_path):
+    root = tmp_path / "scripts"
+    root.mkdir()
+    (root / "rel.py").write_text(_SCRIPT_SRC)
+    # A relative command path resolves against the task's working_dir.
+    assert ProcessManager._read_script_source("rel.py", str(root)) == _SCRIPT_SRC
 
 
 # ── /scripts addresses by basename regardless of subfolder ──────────────────────

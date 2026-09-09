@@ -90,6 +90,34 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — run-log / export spec resolves a subfolder-filed script (regression fix): COMPLETE (branch `claude/sdr-logging-export-wvrni4`, agent-only)
+Owner report (after the RF-gate work): a PLAN/sequence run of a real signal logged every launch param
+on ONE raw fallback line (`▶ start CA -Power -50 -Center-frequency 1575.42 …`), a calibrated `--power`
+logged only its base value (no law quantities), and the spreadsheet export contained only the three
+time columns. Root cause is NOT the RF work — it's a long-standing path mismatch the RF/export features
+merely exposed: **`ProcessManager._script_spec` read the script at the task command's LITERAL `.py`
+path**, while the LAUNCH (`_build_command` → `_resolve_script_path`) and the client's authoring
+(`GET /scripts/{name}/params` → `_resolve_script`, a recursive basename search) both relocate a script
+filed into an organizational subfolder by its basename. So a task whose script lives in a subfolder
+(e.g. `<scripts>/PRN GPS/gps_ca…​.py`, referenced flat) LAUNCHES fine and the client shows the full power
+card, but `_script_spec` gets `OSError → None` → `tune_log_context`/`build_log_table` fold with **no
+spec** → `format_launch_step` gets empty values → the runner's one-line fallback, tune steps show base
+only, and `run_table._columns` emits just `Time` (the client then localizes it to Timezone/Date/Time —
+the "only three time columns"). The tell in the log was the headers `◈ CA • Rf` / `• Power`
+(dest.capitalize(), NOT the metavar `RF`), proving `spec is None`.
+Fix (agent-only): `_script_spec` now reads the source via a new static
+`ProcessManager._read_script_source(script, working_dir)` — try the command path (absolute / relative to
+working_dir), then fall back to locating the basename under its directory via the SAME
+`_resolve_script_path` the launch uses. So the run-log/export spec is read from the exact file that
+actually runs, and matches what the client authored against. Byte-identical for a script already at its
+command path (the common/flat case). No version/capability bump (agent-rendered output only; behaviour
+only IMPROVES for the previously-broken subfolder case). Tests: `tests/test_script_folders.py`
+(`_read_script_source` finds a nested script → non-empty spec; flat + missing + relative-to-working_dir).
+Suite 440 → 450 (also picks up the RF-gate tests). Verified live: the CA mock filed into `PRN GPS/`
+with a flat command path exports 11 full columns + a grouped launch block (was 3 time columns + the raw
+fallback line). Immediate operator note: it needs no re-deploy of scripts — restarting the fixed agent
+is enough; the script can stay in its subfolder.
+
 ## Current state — spreadsheet run-log export (agent side: per-change table endpoint): COMPLETE (branch `claude/hold-step-phase-0-wwwxf7-lty0i5`, cross-repo; client side in `sdr-client`)
 Owner ask: export a ran sequence/plan's log as a spreadsheet — one ROW PER STATE CHANGE (a tune that
 changes nothing adds no row), every parameter in its own column, and (for multi-unit plans) one SHEET
