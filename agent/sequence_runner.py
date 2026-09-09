@@ -720,7 +720,7 @@ class SequenceRunner:
             spec, artifact = self._manager.tune_log_context(task)
             realize = self._manager.power_realizer(task)
             tables.append(run_table.build_task_table(
-                task, list(run.steps), spec, artifact, realize))
+                task, list(run.steps), spec, artifact, realize, on_air_at=run.on_air_at))
         return {
             "run_id": run.id,
             "sequence_id": run.sequence_id,

@@ -143,6 +143,36 @@ def test_rf_off_blanks_power_and_a_power_change_while_muted_adds_no_row():
     assert t["rows"][1][g] == 80.25 and t["rows"][1][a] == 29
 
 
+def test_on_air_offset_column_is_signed_seconds_from_t0():
+    # Right after Time: the SIGNED offset from T0 (the on-air instant) — negative before on-air
+    # (a muted warm-up step), positive after — and a no-op tune still adds no row (the offset,
+    # which varies every fire, must not defeat the row-per-change dedupe).
+    on_air = "2026-09-09T09:00:05+00:00"
+    steps = [
+        _step("start", "2026-09-09T09:00:04+00:00",                # 1 s BEFORE on-air (muted)
+              args=["--prn", "1", "--freq", "1575.42", "--sidelobes", "2",
+                    "--power", "-99.654784", "--rf", "off"]),
+        _step("tune", "2026-09-09T09:00:05+00:00", params={"rf": "on"}),          # exactly T0 → 0
+        _step("tune", "2026-09-09T09:00:06+00:00", params={"sidelobes": 2}),      # no-op → no row
+        _step("tune", "2026-09-09T09:00:08.500000+00:00", params={"sidelobes": 3}),  # +3.5 s
+    ]
+    t = run_table.build_task_table("mock_prn", steps, _SPEC, _ART, _realize, on_air_at=on_air)
+    cols = t["columns"]
+    assert cols[1] == "On-air offset [s]"                          # directly after Time
+    ci = {c: i for i, c in enumerate(cols)}
+    off = ci["On-air offset [s]"]
+    assert len(t["rows"]) == 3                                     # the no-op tune added no row
+    assert [r[off] for r in t["rows"]] == [-1, 0, 3.5]            # signed seconds, ms precision
+
+
+def test_on_air_offset_is_blank_without_a_t0():
+    # No on_air_at supplied (or unparseable) → the column is present but its cells are blank.
+    t = run_table.build_task_table("mock_prn", [_launch()], _SPEC, _ART, _realize)
+    ci = {c: i for i, c in enumerate(t["columns"])}
+    assert t["columns"][1] == "On-air offset [s]"
+    assert t["rows"][0][ci["On-air offset [s]"]] is None
+
+
 def test_uncalibrated_run_has_no_quantity_or_realized_columns():
     t = run_table.build_task_table("mock_prn", [_launch()], _SPEC, artifact=None, realize=None)
     cols = t["columns"]

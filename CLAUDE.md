@@ -90,6 +90,22 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — run-log export: "On-air offset [s]" column (signed Δt from T0): COMPLETE (branch `claude/export-onair-offset-column`, agent-only)
+Owner ask: the spreadsheet export should carry a column right after Time saying how long BEFORE or AFTER
+T0 (the on-air instant) each step fired — from the on-air anchor only, not stop/hold. Done agent-side in
+**`agent/run_table.py`**: `_columns` now emits `_Col("On-air offset [s]", "t0_offset")` at index 1 (right
+after Time); `build_task_table` gained an `on_air_at` kwarg and fills that cell per row with
+`_offset_s(fired_actual, on_air_at)` — SIGNED seconds (negative before on-air, positive after), rounded
+to ms via `_fnum(…, 3)`, blank when either timestamp is unparseable. Like Time, it's filled AFTER the
+row-per-change dedupe (the placeholder `""` sits in the compared `body`, so the ever-varying offset can't
+spuriously un-dedupe a no-op tune). `agent/sequence_runner.build_log_table` passes `on_air_at=run.on_air_at`.
+**No client change** — the client's `_localize_table` special-cases only the leading Time column and passes
+`cols[1:]`/`row[1:]` through, so after its Timezone/Date/Time expansion the offset lands right after Time
+(verified: `Timezone,Date,Time,On-air offset [s],…`). `config.py` bumps `AGENT_VERSION 1.23.0 → 1.23.1`
+(export-shape/behaviour only, NO capability — an older client just shows the extra column; the bump lets
+OTA push it). `argspec`/`ramp` untouched (drift guard intact). Tests: `tests/test_run_table.py`
+(signed seconds before/at/after T0; a no-op tune still drops its row; blank without a T0). Suite 467 → 469.
+
 ## Current state — the deployed script LIBRARY survives an agent update (+ negative-cache recovery): COMPLETE (branch `claude/scripts-survive-agent-update`, agent-only)
 Owner report: after an agent OTA update the deployed library looked WIPED — a plan/sequence run
 immediately after updating logged the raw one-line fallback and exported only the three time columns;
