@@ -340,7 +340,12 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # fixes the negative argspec cache (a missing script's spec is never cached; reload drops the cache)
 # so re-deploying after a failed run recovers without a restart. Behaviour only, no capability; the
 # bump lets OTA push it onto deployed units.
-AGENT_VERSION = "1.23.0"
+# 1.23.1: the spreadsheet run-log export gains an "On-air offset [s]" column right after Time — the
+# SIGNED seconds of each state change relative to T0 (the on-air instant): negative before on-air (a
+# muted warm-up), positive after. Only from the on-air anchor. Agent-rendered/export-shape only; the
+# client renders whatever columns the payload carries (it just localizes the leading Time column), so
+# no capability and an older client shows the extra column too. The bump lets OTA push it.
+AGENT_VERSION = "1.23.1"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list

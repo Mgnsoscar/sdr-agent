@@ -13,6 +13,7 @@ per unit into a sheet of an .xlsx workbook.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
 from . import tune_log
@@ -41,6 +42,28 @@ def _hhmmss(iso: Optional[str]) -> str:
     t = t.split("+", 1)[0].split("Z", 1)[0]          # drop the timezone suffix
     hms, _, frac = t.partition(".")
     return f"{hms[:8]}.{(frac + '000')[:3]}"
+
+
+def _parse_iso(s: Optional[str]) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp (with a '+00:00' or 'Z' zone), or None."""
+    if not s or not isinstance(s, str):
+        return None
+    t = s.strip()
+    if t.endswith("Z"):
+        t = t[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(t)
+    except ValueError:
+        return None
+
+
+def _offset_s(fired_iso: Optional[str], on_air_iso: Optional[str]) -> Optional[float]:
+    """Signed seconds of a step's fire time relative to T0 (the on-air instant): NEGATIVE before
+    on-air (a muted warm-up step), POSITIVE after. None if either timestamp is unparseable."""
+    fired, on_air = _parse_iso(fired_iso), _parse_iso(on_air_iso)
+    if fired is None or on_air is None:
+        return None
+    return (fired - on_air).total_seconds()
 
 
 def _args_to_params(args: list, flag_to_dest: dict) -> dict:
@@ -87,7 +110,11 @@ class _Col:
 
 def _columns(spec: dict, artifact: Optional[dict], laws: list, by_dest: dict,
              has_realize: bool) -> List[_Col]:
-    cols: List[_Col] = [_Col("Time", "time")]
+    # "Time" is the absolute clock; the next column is the SIGNED offset from T0 (the on-air
+    # instant) — negative before on-air (muted warm-up), positive after — so the reader sees how
+    # long before/after on-air each state change fired without doing clock arithmetic. Only from
+    # the on-air anchor, never a stop/hold anchor. Filled per-row by the caller (like Time).
+    cols: List[_Col] = [_Col("Time", "time"), _Col("On-air offset [s]", "t0_offset")]
     power = by_dest.get("power")
     calibrated = bool(power and artifact)
     if calibrated:
@@ -164,6 +191,8 @@ def _row_values(cols: List[_Col], effective: dict, by_dest: dict, artifact: Opti
     for c in cols:
         if c.kind == "time":
             out.append("")                           # filled by the caller (the fire time)
+        elif c.kind == "t0_offset":
+            out.append("")                           # filled by the caller (fire time − on-air)
         elif c.kind == "power_base":
             out.append(None if rf_off else _fnum(base))
         elif c.kind == "law":
@@ -197,9 +226,11 @@ def _row_values(cols: List[_Col], effective: dict, by_dest: dict, artifact: Opti
 
 
 def build_task_table(task_name: str, steps: list, spec: Optional[dict], artifact: Optional[dict],
-                     realize: Optional[Callable] = None, *, freq_hz: Optional[float] = None) -> dict:
+                     realize: Optional[Callable] = None, *, freq_hz: Optional[float] = None,
+                     on_air_at: Optional[str] = None) -> dict:
     """Reconstruct one task's per-change table. ``steps`` is the run's fired StepFire list (any
     order); ``realize(power_dbm, freq_hz)`` returns ``{'sdr_gain_db', 'atten_db'}`` (or None).
+    ``on_air_at`` (T0, an ISO instant) backs the signed 'On-air offset [s]' column.
     Returns ``{'task', 'columns': [str], 'rows': [[...]]}`` — a row only where a value changed."""
     spec = spec or {}
     params = spec.get("params", []) or []
@@ -227,6 +258,9 @@ def build_task_table(task_name: str, steps: list, spec: Optional[dict], artifact
         if last is not None and body == last:
             continue                                 # nothing changed → no new row
         last = body
+        # Fill Time + the on-air offset AFTER the change check (both vary every fire, so filling
+        # them before would defeat the row-per-change dedupe — body still holds their placeholders).
         values[0] = _hhmmss(str(s.fired_actual))
+        values[1] = _fnum(_offset_s(str(s.fired_actual), on_air_at), 3)
         rows.append(values)
     return {"task": task_name, "columns": [c.header for c in cols], "rows": rows}
