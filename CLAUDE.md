@@ -90,6 +90,33 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — step-to-step anchoring Phase 1 (agent runtime): COMPLETE (branch `claude/step-to-step-anchoring`, agent side; client next)
+Owner ask: anchor a step not only to on-air/off-air/hold but to ANOTHER step's edge — e.g. a ramp
+after another ramp's end — so editing the first moves everything downstream (a dependency graph).
+Decisions: full DAG (any step → any step's start/end + offset); PHASED (Phase 1 = tunes/ramps/tasks,
+the Hold stays start-anchored; Phase 2 makes the Hold itself step-anchorable). Agent side (this):
+- **`models.py`** `SequenceStep` gains `id` (stable, client-assigned), `anchor="step"`, `anchor_step_id`,
+  `anchor_edge` ("start"|"end"); `offset_s` is the offset from that edge. Additive/back-compat.
+- **`sequence_runner._resolve_steps`** now resolves in TWO passes: pass 1 = root anchors
+  (start/stop/both/hold) exactly as before (byte-identical for any sequence with no step anchor); pass 2
+  = step-anchored steps resolved TOPOLOGICALLY — a step fires once its target's edges `(first_fire,
+  last_fire)` are known (target may be a root or an earlier step-anchored step, so chains resolve). A
+  step-anchored ramp runs forward from the edge (`_resolve_ramp` gained a `base_at`, mirroring the
+  hold case); a point step fires at `edge + offset`. No-progress remainder (unknown/cyclic target) is
+  logged + dropped (validation catches it first).
+- **`_validate_steps`** allows `anchor="step"`, requires a known `anchor_step_id` + valid `anchor_edge`,
+  rejects self-anchor, CYCLES (walk the source→target graph), and — Phase 1 — a step anchor in a
+  Hold-bearing sequence.
+- **`config.py`** capability **`sequence-step-anchor`** + `AGENT_VERSION 1.23.1 → 1.24.0` (safety gate:
+  an older agent can't resolve the new anchor). `place_ramp`/`ramp.py`/`argspec` untouched (drift guard
+  intact). Tests: `tests/test_sequence_step_anchor.py` (point end/start/chain; a ramp's end edge = its
+  last point; no-step-anchor byte-identical; validation: unknown target / self / bad edge / missing id /
+  cycle / step+Hold). Suite 469 → 479. **NEXT — Phase 1 client** (`sdr-client`): the step-editor anchor
+  picker ("another step → its start/end + offset"), canvas geometry that positions a step-anchored item
+  at its target's edge (so dragging the target moves dependents) + round-trip (`uid↔id`), cycle
+  prevention, the `sequence-step-anchor` save/arm gate, and the temporal power walk ordered by resolved
+  time.
+
 ## Current state — run-log export: "On-air offset [s]" column (signed Δt from T0): COMPLETE (branch `claude/export-onair-offset-column`, agent-only)
 Owner ask: the spreadsheet export should carry a column right after Time saying how long BEFORE or AFTER
 T0 (the on-air instant) each step fired — from the on-air anchor only, not stop/hold. Done agent-side in

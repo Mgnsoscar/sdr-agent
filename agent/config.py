@@ -345,7 +345,14 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # muted warm-up), positive after. Only from the on-air anchor. Agent-rendered/export-shape only; the
 # client renders whatever columns the payload carries (it just localizes the leading Time column), so
 # no capability and an older client shows the extra column too. The bump lets OTA push it.
-AGENT_VERSION = "1.23.1"
+# 1.24.0: STEP-TO-STEP anchoring (Phase 1) — a step may be anchored to ANOTHER step's edge
+# (SequenceStep.id + anchor="step" + anchor_step_id + anchor_edge "start"/"end" + offset_s) instead of
+# to on-air/off-air. _resolve_steps resolves fire times TOPOLOGICALLY (roots first, then step-anchored
+# steps once their target's edges are known); _validate_steps rejects unknown targets and cycles.
+# Phase 1 excludes the Hold (a step anchor + a Hold is refused). New capability sequence-step-anchor
+# (a safety gate — an older agent can't resolve the new anchor); byte-identical resolution for any
+# sequence that uses no step anchor. place_ramp/ramp.py/argspec untouched (drift guard intact).
+AGENT_VERSION = "1.24.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -452,6 +459,12 @@ AGENT_CAPABILITIES = [
                                          # derived readouts). The client gates its "Export log…"
                                          # button on this string and turns each unit's tables
                                          # into sheets of an .xlsx workbook.
+    "sequence-step-anchor",              # a step may be anchored to ANOTHER step's edge
+                                         # (anchor="step" + anchor_step_id + anchor_edge): the agent
+                                         # resolves fire times topologically at arm (roots first,
+                                         # then step-anchored steps), rejecting cycles/unknown
+                                         # targets. Phase 1: not alongside a Hold. The client gates
+                                         # authoring/arming a step-anchored sequence on this string.
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

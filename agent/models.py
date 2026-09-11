@@ -311,6 +311,18 @@ class SequenceStep(BaseModel):
                       proceed is Phase 1 — Phase 0 only validates the shape.
     """
     anchor: str = "start"              # "start" | "stop" | "both" (ramp) | "hold" (post-Hold window B)
+                                       #   | "step" (relative to ANOTHER step's edge — see below)
+    # A stable id for this step, so other steps can anchor to it. Assigned by the client
+    # (a fresh sequence gets ids on save); empty for legacy steps that nothing references.
+    id: str = ""
+    # anchor = "step": this step is timed relative to another step's edge, not to on-air/off-air.
+    #   anchor_step_id  — the id of the step this one hangs off
+    #   anchor_edge     — which edge of that step: "start" (its first fire) or "end" (its last)
+    #   offset_s        — seconds from that edge (may be negative)
+    # The agent resolves these topologically at arm time (roots first, then step-anchored steps
+    # once their target's edges are known); a cycle or a missing target is a validation error.
+    anchor_step_id: str = ""
+    anchor_edge: str = "end"           # "start" | "end" (of the anchored-to step)
     offset_s: float                    # relative to the chosen anchor (on-air side for "both")
     # For a "both"-anchored ramp: the off-air-side inset (≤ 0 = before off-air). The
     # ramp fills [on-air + offset_s, off-air + offset_end_s]. Ignored otherwise.
