@@ -105,13 +105,17 @@ the Hold stays start-anchored; Phase 2 makes the Hold itself step-anchorable). A
   hold case); a point step fires at `edge + offset`. No-progress remainder (unknown/cyclic target) is
   logged + dropped (validation catches it first).
 - **`_validate_steps`** allows `anchor="step"`, requires a known `anchor_step_id` + valid `anchor_edge`,
-  rejects self-anchor, CYCLES (walk the source→target graph), and — Phase 1 — a step anchor in a
-  Hold-bearing sequence.
+  rejects self-anchor, CYCLES (walk the source→target graph), a step anchor in a Hold-bearing sequence
+  (Phase 1), and — **ordering invariant (owner rule)** — a NEGATIVE `offset_s` on a step anchor (a
+  dependent never precedes its target; the offset runs FORWARD from the referenced edge, so `offset >= 0`
+  keeps a moved anchor from silently invalidating its dependents). `end > start` within a ramp/bar stays
+  enforced by `resolve_ramp` / the duration checks. The client clamps drags to keep this true; the agent
+  is the backstop for an API-/plan-authored sequence.
 - **`config.py`** capability **`sequence-step-anchor`** + `AGENT_VERSION 1.23.1 → 1.24.0` (safety gate:
   an older agent can't resolve the new anchor). `place_ramp`/`ramp.py`/`argspec` untouched (drift guard
   intact). Tests: `tests/test_sequence_step_anchor.py` (point end/start/chain; a ramp's end edge = its
   last point; no-step-anchor byte-identical; validation: unknown target / self / bad edge / missing id /
-  cycle / step+Hold). Suite 469 → 479. **NEXT — Phase 1 client** (`sdr-client`): the step-editor anchor
+  cycle / step+Hold / negative offset). Suite 469 → 480. **NEXT — Phase 1 client** (`sdr-client`): the step-editor anchor
   picker ("another step → its start/end + offset"), canvas geometry that positions a step-anchored item
   at its target's edge (so dragging the target moves dependents) + round-trip (`uid↔id`), cycle
   prevention, the `sequence-step-anchor` save/arm gate, and the temporal power walk ordered by resolved

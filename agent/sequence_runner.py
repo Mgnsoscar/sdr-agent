@@ -245,6 +245,18 @@ class SequenceRunner:
                     raise ValueError(f"anchor_edge must be 'start' or 'end', got '{s.anchor_edge}'")
                 if getattr(s, "id", "") and s.anchor_step_id == s.id:
                     raise ValueError(f"step '{s.task_name}' cannot anchor to itself")
+                # Ordering invariant (owner rule): a dependent never precedes its anchor.
+                # The offset is measured FORWARD from the referenced edge, so a negative
+                # offset would fire the step before the thing it hangs off — the very
+                # "backwards dependency" that moving the anchor could turn invalid. The
+                # client clamps drags to keep this true; the agent is the backstop for an
+                # API-/plan-authored sequence. (end > start within a ramp/bar is enforced
+                # separately by resolve_ramp / the duration checks.)
+                if s.offset_s < 0:
+                    raise ValueError(
+                        f"step '{s.task_name}' anchors to another step with a negative offset "
+                        f"({s.offset_s}s); a step-anchored step must fire at or after the edge it "
+                        f"hangs off (offset >= 0)")
             if action == "ramp":
                 if s.ramp is None:
                     raise ValueError(f"ramp step for '{s.task_name}' has no ramp definition")

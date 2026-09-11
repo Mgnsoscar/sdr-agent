@@ -42,12 +42,12 @@ def test_point_step_anchor_end_start_and_chain(tmp_path):
         _tune("a", 10, anchor="start", offset=5.0),                     # fires T0+5
         _tune("b", 20, anchor="step", ref="a", edge="end", offset=2.0),  # a.end(5)+2 = 7
         _tune("c", 30, anchor="step", ref="b", edge="end", offset=1.0),  # b(7)+1 = 8 (chain)
-        _tune("d", 40, anchor="step", ref="a", edge="start", offset=-1.0),  # a.start(5)-1 = 4
+        _tune("d", 40, anchor="step", ref="a", edge="start", offset=0.0),  # a.start(5)+0 = 5
         SequenceStep(anchor="stop", offset_s=0.0, action=StepAction.STOP, task_name="tx"),
     ]
     fires = r._resolve_steps(steps, T0, END, 0.0)
     by = {f.params.get("gain"): _off(f.fire_at) for f in fires if f.action == "tune"}
-    assert by == {10: 5.0, 20: 7.0, 30: 8.0, 40: 4.0}
+    assert by == {10: 5.0, 20: 7.0, 30: 8.0, 40: 5.0}
     # Fires are globally time-ordered.
     times = [_off(f.fire_at) for f in fires]
     assert times == sorted(times)
@@ -102,6 +102,7 @@ def test_valid_step_anchor_passes(tmp_path):
     (lambda: _tune("a", 1, anchor="step", ref="a", edge="end"), "cannot anchor to itself"),
     (lambda: _tune("a", 1, anchor="step", ref="s0", edge="middle"), "anchor_edge"),
     (lambda: _tune("a", 1, anchor="step", ref="", edge="end"), "needs anchor_step_id"),
+    (lambda: _tune("a", 1, anchor="step", ref="s0", edge="end", offset=-0.5), "negative offset"),
 ])
 def test_bad_step_anchor_rejected(tmp_path, bad, msg):
     r = _runner(tmp_path)
