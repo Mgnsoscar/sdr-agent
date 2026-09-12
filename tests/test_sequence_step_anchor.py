@@ -102,12 +102,27 @@ def test_valid_step_anchor_passes(tmp_path):
     (lambda: _tune("a", 1, anchor="step", ref="a", edge="end"), "cannot anchor to itself"),
     (lambda: _tune("a", 1, anchor="step", ref="s0", edge="middle"), "anchor_edge"),
     (lambda: _tune("a", 1, anchor="step", ref="", edge="end"), "needs anchor_step_id"),
-    (lambda: _tune("a", 1, anchor="step", ref="s0", edge="end", offset=-0.5), "negative offset"),
 ])
 def test_bad_step_anchor_rejected(tmp_path, bad, msg):
     r = _runner(tmp_path)
     with pytest.raises(ValueError, match=msg):
         r._validate_steps(_valid_base() + [bad()])
+
+
+def test_negative_step_offset_is_accepted_and_fires_before_the_edge(tmp_path):
+    # A step anchor's offset may be NEGATIVE (fire before the referenced edge), like a start/stop
+    # anchor's warm-up lead-in — no longer rejected (1.25.0, sequence-step-anchor-negative).
+    r = _runner(tmp_path)
+    steps = _valid_base() + [
+        _tune("a", 10, anchor="start", offset=5.0),                        # a fires T0+5
+        _tune("b", 20, anchor="step", ref="a", edge="start", offset=-3.0),   # a.start(5) − 3 = 2
+    ]
+    r._validate_steps(steps)                                               # no raise
+    fires = r._resolve_steps(steps, T0, END, 0.0)
+    by = {f.params.get("gain"): _off(f.fire_at) for f in fires if f.action == "tune"}
+    assert by[20] == 2.0                                                   # b fires BEFORE its anchor a
+    times = [_off(f.fire_at) for f in fires]
+    assert times == sorted(times)                                         # still globally time-ordered
 
 
 def test_cycle_rejected(tmp_path):

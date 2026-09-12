@@ -352,7 +352,13 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # Phase 1 excludes the Hold (a step anchor + a Hold is refused). New capability sequence-step-anchor
 # (a safety gate — an older agent can't resolve the new anchor); byte-identical resolution for any
 # sequence that uses no step anchor. place_ramp/ramp.py/argspec untouched (drift guard intact).
-AGENT_VERSION = "1.24.0"
+# 1.25.0: a step anchor's offset_s may be NEGATIVE — a step-anchored step can fire BEFORE the edge it
+# hangs off (like a start/stop anchor's warm-up lead-in), not only at/after it. _validate_steps no
+# longer rejects offset < 0 on a step anchor (the topological resolve already placed edge + offset for
+# any sign); the graph must still be acyclic. New capability sequence-step-anchor-negative (a safety
+# gate — a ≤1.24 agent rejects the negative offset with 400, so the client must only send it to a
+# 1.25.0+ agent). Byte-identical for any sequence whose step anchors all use offset >= 0.
+AGENT_VERSION = "1.25.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -465,6 +471,10 @@ AGENT_CAPABILITIES = [
                                          # then step-anchored steps), rejecting cycles/unknown
                                          # targets. Phase 1: not alongside a Hold. The client gates
                                          # authoring/arming a step-anchored sequence on this string.
+    "sequence-step-anchor-negative",     # a step anchor's offset_s may be NEGATIVE (fire before the
+                                         # referenced edge, like a start/stop anchor's lead-in), not
+                                         # only >= 0. The client gates authoring/arming a sequence with
+                                         # a negative step offset on this string (a ≤1.24 agent 400s).
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
