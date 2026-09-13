@@ -90,6 +90,29 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — step anchors accept a NEGATIVE offset (fire before the referenced edge): COMPLETE (branch `claude/step-to-step-anchoring`, cross-repo)
+Owner ask (drawn on a 4-step sketch): a step anchored to another step should be able to fire BEFORE its
+target's edge, not only at/after it — exactly like a start/stop anchor's warm-up lead-in (which the owner
+already uses to start a duration task a few seconds before on-air). The earlier Phase-1 rule forbade a
+negative `offset_s` on a step anchor (the "ordering invariant"); the owner reversed that. Agent side:
+- **`sequence_runner._validate_steps`** — the `offset_s < 0` rejection for a step anchor is REMOVED (the
+  topological `_resolve_steps`/`_point_fire` already placed `edge + offset` for any sign — arithmetic;
+  only validation blocked it). The graph must still be ACYCLIC (unchanged); `end > start` within a
+  ramp/bar is still enforced by `resolve_ramp`/the duration checks. A negative-offset dependent resolves
+  before its anchor and the whole run stays globally time-ordered.
+- **`config.py`** capability **`sequence-step-anchor-negative`** + `AGENT_VERSION 1.24.0 → 1.25.0` (safety
+  gate: a ≤1.24 agent 400s on a negative step offset, so the client only sends one to a ≥1.25.0 agent).
+  `argspec`/`ramp` untouched (drift guard intact). Tests: `tests/test_sequence_step_anchor.py`
+  (`test_negative_step_offset_is_accepted_and_fires_before_the_edge` — a step anchored to another's start
+  at −3 s fires 3 s before it, still time-ordered; the old negative-reject parametrize case dropped),
+  `test_meta_endpoint.py` asserts both step-anchor capabilities. Suite 480 (count unchanged — one reject
+  case became an accept case). **Verified LIVE cross-repo** against the owner's 4-step layout (authored
+  through the client's `items_to_steps`, resolved through the agent runtime): Step1@0:30, Step2 anchored
+  to Step1 −0:30 → fires 0:00, Step3&4 anchored to Step2 +0:30 → fire 0:30 — matches the sketch exactly.
+  Client side (`sdr-client`): the dialogs/canvas author a negative step offset, the canvas routes such a
+  dependent entered from the RIGHT with a left-pointing arrow (and flips a two-sided pin's caption to the
+  clear side), and the save/arm gate enforces `sequence-step-anchor-negative`.
+
 ## Current state — step-to-step anchoring Phase 1 (agent runtime): COMPLETE (branch `claude/step-to-step-anchoring`, agent side; client next)
 Owner ask: anchor a step not only to on-air/off-air/hold but to ANOTHER step's edge — e.g. a ramp
 after another ramp's end — so editing the first moves everything downstream (a dependency graph).
