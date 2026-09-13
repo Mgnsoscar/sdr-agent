@@ -69,6 +69,39 @@ def test_ramp_end_edge_is_its_last_point(tmp_path):
     assert after == round(ramp_pts[-1] + 1.0, 6)     # the tune hangs off the ramp's LAST point
 
 
+def _ramp_step(anchor, **flags):
+    ramp = RampSpec(start=0.0, stop=9.0, steps=3, duration_s=8.0, param="gain", **flags)
+    return SequenceStep(anchor=anchor, offset_s=0.0, action=StepAction.RAMP,
+                        task_name="tx", ramp=ramp)
+
+
+def test_ramp_exclude_first_still_fires_the_stop_level(tmp_path):
+    """Regression: a past report was 'exclude the ramp's FIRST level → the LAST doesn't fire'.
+    Excluding the first must drop only the start level; the stop value (9) is still emitted and
+    fires — for start- AND stop-anchored ramps (full ladder [0,3,6,9], hold 2 s)."""
+    r = _runner(tmp_path)
+    for anchor in ("start", "stop"):
+        fires = r._resolve_ramp(_ramp_step(anchor, include_first=False), T0, END, False)
+        vals = [f.params.get("gain") for f in fires]
+        assert vals == [3.0, 6.0, 9.0], anchor      # first (0) dropped, stop (9) KEPT + fires
+
+
+def test_ramp_exclude_last_drops_only_the_stop_level(tmp_path):
+    """Excluding the LAST level omits the stop value BY DESIGN (so consecutive ramps chain
+    without a doubled seam) — the remaining last point still fires; no interior step is lost."""
+    r = _runner(tmp_path)
+    fires = r._resolve_ramp(_ramp_step("start", include_last=False), T0, END, False)
+    assert [f.params.get("gain") for f in fires] == [0.0, 3.0, 6.0]   # stop (9) intentionally omitted
+
+
+def test_ramp_exclude_both_fires_the_interior_levels(tmp_path):
+    """Excluding both ends fires every interior level (nothing beyond the two endpoints lost)."""
+    r = _runner(tmp_path)
+    fires = r._resolve_ramp(_ramp_step("start", include_first=False, include_last=False),
+                            T0, END, False)
+    assert [f.params.get("gain") for f in fires] == [3.0, 6.0]
+
+
 def test_no_step_anchor_is_unchanged(tmp_path):
     """A sequence with no step anchor resolves exactly as before (roots only)."""
     r = _runner(tmp_path)
