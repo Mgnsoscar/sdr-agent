@@ -90,6 +90,26 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — `anchor="enter"`: a window-A step timed from the Hold's ENTER instant (the pause's start): COMPLETE (branch `claude/step-to-step-anchoring`, cross-repo)
+Owner ask (v3 #4): in the client's Hold WINDOW a ramp's END should anchor to the LEFT edge (where the
+pause begins), while a start / a tune anchors to the resume edge. Agent side:
+- **`_validate_steps`** accepts `anchor="enter"`: requires a HOLD marker and `offset_s <= 0` (nothing may
+  reach INTO the pause — the run is holding then). `models.py` documents the value.
+- **`_split_hold_windows`** routes it to WINDOW A (only `hold`/`stop` go to window B) — it's known at arm.
+  **`_lead_offset`** counts `hold_off + offset_s` (an enter step may precede on-air like any lead-in).
+- **`_resolve_steps(..., enter_at=)`** — `arm` passes `enter_at = on_air_at + hold_at_offset_s` in hold
+  mode; pass 1 places a point at `enter_at + offset_s` (fire anchor `"enter"`), and **`_resolve_ramp`** uses
+  the STOP layout (`place_ramp("stop", offset_s, …)` — backward, the last level's hold ENDS at the pause +
+  offset) rebased to `enter_at`. Without `enter_at` (not a hold-aware arm) an enter step produces no fire;
+  a non-hold-aware arm with a Hold is refused anyway, and the client's schedule/plan path compiles the
+  anchor out (`collapse_hold`) before sending.
+- **`config.py`** capability **`sequence-hold-enter`** + `AGENT_VERSION 1.25.3 → 1.26.0` (a safety gate: a
+  ≤1.25 agent 400s on the unknown anchor value, so the client only sends it to a ≥1.26.0 unit).
+  `argspec`/`ramp` untouched (drift guard intact). Tests: `tests/test_sequence_hold_enter.py` (validation,
+  window split, lead offset, point + ramp placement from the pause, a hold-aware arm schedules it in
+  window A) + `test_meta_endpoint.py` asserts the capability. Suite 485 → 491. Client side:
+  `sdr-client/CLAUDE.md` "owner-testing round 3".
+
 ## Current state — `SequenceStep.anchor_own_edge` pass-through (a ramp tied by its END): COMPLETE (branch `claude/step-to-step-anchoring`, cross-repo)
 Client authoring metadata for step anchors: `anchor_own_edge` ("start" default | "end") says which of
 the STEP'S OWN edges the client ties to the target (only a ramp has two — an end-tied ramp's END sits

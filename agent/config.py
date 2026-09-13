@@ -371,7 +371,10 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # 1.25.3: SequenceStep carries `anchor_own_edge` (client authoring metadata — a ramp tied to its
 # target by its END; offset_s stays the start offset, so the runtime is unchanged). Pass-through
 # only, no capability; the bump lets OTA push the field so it survives a store/reload round-trip.
-AGENT_VERSION = "1.25.3"
+# 1.26.0: anchor="enter" — a step measured from the Hold's ENTER instant (the pause's start; a
+# ramp tied by its END so it finishes as the pause begins). Window A, resolved at a hold-aware
+# arm. Capability sequence-hold-enter (a safety gate: older agents reject the anchor value).
+AGENT_VERSION = "1.26.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -488,6 +491,12 @@ AGENT_CAPABILITIES = [
                                          # referenced edge, like a start/stop anchor's lead-in), not
                                          # only >= 0. The client gates authoring/arming a sequence with
                                          # a negative step offset on this string (a ≤1.24 agent 400s).
+    "sequence-hold-enter",               # anchor="enter": a window-A step timed from the Hold's ENTER
+                                         # edge (where the pause begins; offset_s <= 0, a ramp is tied
+                                         # by its END like a stop anchor). Resolved at arm from
+                                         # T0 + hold_at_offset_s. The client gates a hold-aware arm
+                                         # carrying an enter-anchored step on this string (a ≤1.25
+                                         # agent 400s on the unknown anchor).
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

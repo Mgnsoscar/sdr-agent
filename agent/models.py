@@ -311,6 +311,9 @@ class SequenceStep(BaseModel):
                       proceed is Phase 1 — Phase 0 only validates the shape.
     """
     anchor: str = "start"              # "start" | "stop" | "both" (ramp) | "hold" (post-Hold window B)
+                                       #   | "enter" (from the Hold's ENTER instant — the pause's
+                                       #     start; window A, known at arm; offset_s ≤ 0; a ramp is
+                                       #     tied by its END like a stop anchor. ≥ 1.26.0)
                                        #   | "step" (relative to ANOTHER step's edge — see below)
     # A stable id for this step, so other steps can anchor to it. Assigned by the client
     # (a fresh sequence gets ids on save); empty for legacy steps that nothing references.

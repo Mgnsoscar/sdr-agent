@@ -226,11 +226,23 @@ class SequenceRunner:
             # All non-HOLD steps reference a real task on this unit.
             if not self._manager.has_task(s.task_name):
                 raise ValueError(f"unknown task in step: '{s.task_name}'")
-            if s.anchor not in ("start", "stop", "both", "hold", "step"):
+            if s.anchor not in ("start", "stop", "both", "hold", "enter", "step"):
                 raise ValueError(
-                    f"step anchor must be 'start', 'stop', 'both', 'hold' or 'step', got '{s.anchor}'")
+                    f"step anchor must be 'start', 'stop', 'both', 'hold', 'enter' or 'step', "
+                    f"got '{s.anchor}'")
             if s.anchor == "hold" and not has_hold:
                 raise ValueError("an anchor='hold' step requires a HOLD marker in the sequence")
+            if s.anchor == "enter":
+                # Measured from the Hold's ENTER instant (the pause's start): window A, known at
+                # arm. A ramp is tied by its END (offset_s = the end's offset, like a stop anchor);
+                # nothing may reach INTO the pause — the run is holding then (AGENT_VERSION 1.26.0,
+                # capability sequence-hold-enter).
+                if not has_hold:
+                    raise ValueError("an anchor='enter' step requires a HOLD marker in the sequence")
+                if s.offset_s > 1e-9:
+                    raise ValueError(
+                        f"an anchor='enter' step ('{s.task_name}') must fire at or before the pause "
+                        f"(offset_s <= 0)")
             if s.anchor == "both" and action != "ramp":
                 raise ValueError("only a ramp step can be anchored to both edges")
             if s.anchor == "step":
@@ -398,7 +410,11 @@ class SequenceRunner:
         the on-air window is [on_air_at, on_air_end] and on_air_end is supplied at
         arm time; this only reports how far before on-air the first step fires.
         """
-        return min((s.offset_s for s in steps if s.anchor == "start"), default=0.0)
+        hold_off = next((s.offset_s for s in steps if _step_action(s) == "hold"), None)
+        leads = [s.offset_s for s in steps if s.anchor == "start"]
+        if hold_off is not None:      # a pause-anchored step sits at hold + offset on the same clock
+            leads += [hold_off + s.offset_s for s in steps if s.anchor == "enter"]
+        return min(leads, default=0.0)
 
     @staticmethod
     def _active_span(run: SequenceRun) -> Tuple[datetime, Optional[datetime]]:
@@ -415,8 +431,10 @@ class SequenceRunner:
     ) -> Tuple[List[SequenceStep], List[SequenceStep], Optional[float]]:
         """Split a Hold-bearing sequence into (window_A, window_B, hold_offset).
 
-        Window A = start/both-anchored work (the HOLD marker is dropped — it fires
-        nothing). Window B = the hold-/stop-anchored steps, deferred until proceed.
+        Window A = start/both-anchored work plus the pause-anchored (anchor="enter") steps —
+        they end at or before the pause, timed from T0 + hold_offset, known at arm (the HOLD
+        marker is dropped — it fires nothing). Window B = the hold-/stop-anchored steps,
+        deferred until proceed.
         hold_offset is the HOLD marker's offset from T0 (None if there is no Hold —
         the caller only uses this in hold mode). Structure is already validated by
         _validate_steps, so exactly one HOLD is assumed here.
@@ -461,7 +479,7 @@ class SequenceRunner:
         self, steps: List[SequenceStep], on_air_at: datetime,
         on_air_end: Optional[datetime], resume_offset_s: float,
         open_ended: bool = False, overrides: Optional[Dict[int, StepOverride]] = None,
-        hold_at: Optional[datetime] = None,
+        hold_at: Optional[datetime] = None, enter_at: Optional[datetime] = None,
     ) -> List[StepFire]:
         """
         Compute absolute fire times for every step around the anchors.
@@ -470,8 +488,10 @@ class SequenceRunner:
         on-air until aborted. on_air_end may be None in that case.
 
         hold_at (the resume instant, T_resume) is the base for anchor="hold" steps —
-        window B, resolved only at proceed (docs/sequence-hold-step.md §5.3). A HOLD
-        MARKER step (action="hold") is a pure boundary and produces no fire.
+        window B, resolved only at proceed (docs/sequence-hold-step.md §5.3). enter_at
+        (the pause's START, T0 + hold_offset — known at arm) is the base for anchor="enter"
+        steps, window A. A HOLD MARKER step (action="hold") is a pure boundary and produces
+        no fire.
 
         overrides maps a step's index (its position in `steps`) to a StepOverride
         whose args/replace_args replace the step's — so a plan can run a sequence
@@ -520,13 +540,18 @@ class SequenceRunner:
                 deferred.append((i, s))
                 continue
             if action == "ramp":
-                sf = self._resolve_ramp(s, on_air_at, on_air_end, open_ended, hold_at)
+                sf = self._resolve_ramp(s, on_air_at, on_air_end, open_ended, hold_at,
+                                        enter_at=enter_at)
                 fires.extend(sf); _record_edges(s, sf)
                 continue
             if s.anchor == "hold":
                 if hold_at is None:
                     continue   # window B is unresolved until proceed supplies T_resume
                 base = hold_at
+            elif s.anchor == "enter":
+                if enter_at is None:
+                    continue   # only a hold-aware arm knows the pause instant
+                base = enter_at
             elif s.anchor == "stop":
                 if open_ended:
                     continue   # no stop in an open-ended run; abort handles shutdown
@@ -550,7 +575,7 @@ class SequenceRunner:
                 action = s.action.value if hasattr(s.action, "value") else str(s.action)
                 if action == "ramp":
                     sf = self._resolve_ramp(s, on_air_at, on_air_end, open_ended, hold_at,
-                                            base_at=base_dt)
+                                            base_at=base_dt, enter_at=enter_at)
                 else:
                     sf = [_point_fire(s, i, base_dt)]
                 fires.extend(sf); _record_edges(s, sf)
@@ -570,17 +595,22 @@ class SequenceRunner:
     def _resolve_ramp(self, s: SequenceStep, on_air_at: datetime,
                       on_air_end: Optional[datetime], open_ended: bool,
                       hold_at: Optional[datetime] = None,
-                      base_at: Optional[datetime] = None) -> List[StepFire]:
+                      base_at: Optional[datetime] = None,
+                      enter_at: Optional[datetime] = None) -> List[StepFire]:
         """Expand a RAMP step into a series of `tune` fires. A both-anchored ramp
         fills the on-air window (skipped when the run is open-ended, since there's
         no window). A hold-anchored ramp (window B) runs FORWARD from the resume
         instant (hold_at) — the same geometry as a start-anchored ramp, so we reuse
-        place_ramp's forward layout and rebase to hold_at. A bad/under-specified ramp
-        is logged and dropped rather than sinking the whole run."""
+        place_ramp's forward layout and rebase to hold_at. A pause-anchored ramp
+        (anchor="enter") is tied by its END to the pause's start (enter_at): the stop
+        layout (backward from offset_s ≤ 0) rebased to enter_at. A bad/under-specified
+        ramp is logged and dropped rather than sinking the whole run."""
         if s.ramp is None:
             return []
         if s.anchor == "hold" and hold_at is None:
             return []      # window B is unresolved until proceed supplies T_resume
+        if s.anchor == "enter" and enter_at is None:
+            return []      # only a hold-aware arm knows the pause instant
         if s.anchor == "step" and base_at is None:
             return []      # the anchored-to step isn't resolved yet (topological caller retries)
         r = s.ramp
@@ -595,7 +625,8 @@ class SequenceRunner:
         # A hold- or step-anchored ramp runs FORWARD from its base instant (the resume instant,
         # or the anchored-to step's edge); place it with the start layout (forward from offset_s)
         # and rebase every point to that base below.
-        place_anchor = "start" if s.anchor in ("hold", "step") else s.anchor
+        place_anchor = ("start" if s.anchor in ("hold", "step")
+                        else "stop" if s.anchor == "enter" else s.anchor)
         try:
             resolved = ramp.resolve_ramp(r.start, r.stop, steps=r.steps, step=r.step, hold_s=r.hold_s,
                                          duration_s=r.duration_s, window_s=window_s,
@@ -613,6 +644,9 @@ class SequenceRunner:
             elif s.anchor == "step":
                 base = base_at            # forward from the anchored-to step's edge
                 fire_anchor = "step"
+            elif s.anchor == "enter":
+                base = enter_at           # backward from the pause's start (window A)
+                fire_anchor = "enter"
             elif fire_anchor == "stop":
                 if open_ended or on_air_end is None:
                     continue
@@ -713,8 +747,11 @@ class SequenceRunner:
                 f"(on-air start needs {abs(lead_in):.0f}s lead-in; choose a later on_air_at)"
             )
 
+        # The pause's START (T0 + hold offset) is known at arm: the base for anchor="enter" work.
+        enter_at = (on_air_at + timedelta(seconds=hold_at_offset_s)
+                    if hold_mode and hold_at_offset_s is not None else None)
         steps = self._resolve_steps(resolve_defs, on_air_at, on_air_end, req.resume_offset_s,
-                                    open_ended, overrides)
+                                    open_ended, overrides, enter_at=enter_at)
 
         run = SequenceRun(
             id=_run_id(),
