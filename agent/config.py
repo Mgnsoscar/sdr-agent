@@ -358,7 +358,12 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # any sign); the graph must still be acyclic. New capability sequence-step-anchor-negative (a safety
 # gate — a ≤1.24 agent rejects the negative offset with 400, so the client must only send it to a
 # 1.25.0+ agent). Byte-identical for any sequence whose step anchors all use offset >= 0.
-AGENT_VERSION = "1.25.0"
+# 1.25.1: a step anchored to a RAMP's "end" edge now fires AFTER the ramp's final level has been held
+# its full dwell (the ramp's end = last tune fire + one hold), not the instant the last level is
+# reached — so the final level always gets its hold time before a dependent fires. Behaviour-only,
+# no capability (part of the step-anchor feature, already gated at >= 1.24.0); the bump lets OTA push
+# it. Only affects a step anchored to a ramp's end edge; every other resolution is byte-identical.
+AGENT_VERSION = "1.25.1"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list

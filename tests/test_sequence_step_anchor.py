@@ -53,8 +53,12 @@ def test_point_step_anchor_end_start_and_chain(tmp_path):
     assert times == sorted(times)
 
 
-def test_ramp_end_edge_is_its_last_point(tmp_path):
+def test_ramp_end_edge_is_after_the_final_levels_hold(tmp_path):
+    """A step anchored to a ramp's END fires AFTER the ramp's final level has been held its full
+    dwell — the ramp's end = last tune fire + one hold, so the top level always gets its hold time
+    before a dependent fires (not the instant the top is reached)."""
     r = _runner(tmp_path)
+    # steps=3, duration_s=6 → 4 levels held 1.5 s each; ramp at offset 2 fires at 2, 3.5, 5, 6.5.
     ramp = RampSpec(start=0.0, stop=9.0, steps=3, duration_s=6.0, param="gain")
     steps = [
         SequenceStep(id="s0", anchor="start", offset_s=0.0, action=StepAction.START, task_name="tx"),
@@ -65,8 +69,9 @@ def test_ramp_end_edge_is_its_last_point(tmp_path):
     ]
     fires = r._resolve_steps(steps, T0, END, 0.0)
     ramp_pts = sorted(_off(f.fire_at) for f in fires if f.anchor == "start" and f.action == "tune")
+    hold = round(ramp_pts[-1] - ramp_pts[-2], 6)     # uniform dwell (1.5 s)
     after = next(_off(f.fire_at) for f in fires if f.params.get("gain") == 99)
-    assert after == round(ramp_pts[-1] + 1.0, 6)     # the tune hangs off the ramp's LAST point
+    assert after == round(ramp_pts[-1] + hold + 1.0, 6)   # last fire (6.5) + hold (1.5) + offset (1) = 9.0
 
 
 def _ramp_step(anchor, **flags):

@@ -90,6 +90,24 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — a ramp's step-anchor END edge = after the final level's hold: COMPLETE (branch `claude/step-to-step-anchoring`, cross-repo)
+Owner ask: when a step is anchored to a RAMP's `end`, the ramp's LAST level must be held its full dwell
+before the ramp is "finished" — the dependent shouldn't fire the instant the top level is reached. Root
+cause: **`_resolve_steps._record_edges`** recorded a step's end edge as `max(fire_at)`, which for a ramp
+is its LAST tune FIRE — so a dependent on the ramp's end fired at the top level's fire with ZERO hold.
+Fix (agent-only): for a `ramp` target with ≥2 fires, the end edge is now `last fire + one hold` (the
+uniform fire spacing `ts[-1] − ts[-2]`), i.e. the ramp's full-duration end where the final level's hold
+completes; a step anchored to the end fires after that hold. Every other step type (point/tune/run) is
+byte-identical (end = its single fire), and a ramp's START edge is unchanged (first fire). `config.py`
+bumps `AGENT_VERSION 1.25.0 → 1.25.1` (behaviour-only, NO new capability — part of the step-anchor
+feature already gated at ≥ 1.24.0; the bump lets OTA push it). `place_ramp`/`ramp.py`/`argspec`
+untouched (drift guard intact). Tests: `tests/test_sequence_step_anchor.py::
+test_ramp_end_edge_is_after_the_final_levels_hold` (last fire + hold + offset). **Client** (`sdr-client`):
+this REVERSES the earlier code-review "finding #1" (which had aligned the client's end edge DOWN to the
+agent's last-fire) — the client keeps `_ramp_duration` (= `last fire + hold` = full duration) at its
+three end-edge sites, so client + agent now agree at the ramp's full-duration end. Verified live: a step
+anchored to a `0→9`, steps=3, duration 6 s ramp's end (hold 1.5 s, last fire 4.5 s) fires at 6.0 s.
+
 ## Current state — step anchors accept a NEGATIVE offset (fire before the referenced edge): COMPLETE (branch `claude/step-to-step-anchoring`, cross-repo)
 Owner ask (drawn on a 4-step sketch): a step anchored to another step should be able to fire BEFORE its
 target's edge, not only at/after it — exactly like a start/stop anchor's warm-up lead-in (which the owner

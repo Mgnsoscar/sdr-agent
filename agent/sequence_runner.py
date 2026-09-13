@@ -485,8 +485,16 @@ class SequenceRunner:
 
         def _record_edges(s, step_fires):
             if getattr(s, "id", "") and step_fires:
-                ts = [_parse(f.fire_at) for f in step_fires]
-                edges[s.id] = (min(ts), max(ts))
+                ts = sorted(_parse(f.fire_at) for f in step_fires)
+                first, last = ts[0], ts[-1]
+                action = s.action.value if hasattr(s.action, "value") else str(s.action)
+                if action == "ramp" and len(ts) >= 2:
+                    # A ramp's END is when its FINAL level's hold completes, not its last
+                    # tune fire: the last level is held one dwell (= the uniform fire spacing)
+                    # before the ramp is finished. So a step anchored to the ramp's end fires
+                    # AFTER that hold, not the instant the top is reached.
+                    last = last + (ts[-1] - ts[-2])
+                edges[s.id] = (first, last)
 
         def _point_fire(s, i, base_dt):
             fire_at = base_dt + timedelta(seconds=s.offset_s)
