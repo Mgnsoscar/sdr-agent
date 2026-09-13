@@ -90,6 +90,24 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — a window-filling ("both") ramp holds its LAST level before off-air: COMPLETE (branch `claude/step-to-step-anchoring`, cross-repo)
+Owner ask: a dual-anchor ("both") ramp that fills the on-air window reached its top level exactly AT
+off-air (0 hold) — the top was only touched at the edge, never transmitted. Now it HOLDS its last level
+one dwell before off-air, like a single-anchor / "stop" ramp. Fix in the **drift-guarded**
+`ramp.resolve_ramp` window branch (mirrored byte-identically in `sdr-client/api/ramp.py`): the window is
+divided by LEVELS, not intervals — `hold = D / N` (N = number of levels), so the last value fires at
+`D − hold` and is held over `[D − hold, D]` (off-air). `place_ramp` is UNCHANGED (it already places the
+last value at `offset_s + (N−1)·hold`); `duration_s` still equals the full window `D` (the ramp still
+fills it), so `min_on_air_duration` and the client canvas geometry (`ramp_span` draws the bar across the
+window) are unaffected — only the internal fire spacing changed. Every level now gets its dwell (the
+first level is held at the start too, exactly like a single-anchor ramp). The `hold_s` sub-case honours
+the requested dwell (`N = round(D/hold_s)` levels). `config.py` bumps `AGENT_VERSION 1.25.1 → 1.25.2`
+(behaviour-only, no capability). Tests: `tests/test_ramp.py` (`test_dual_anchor_uses_window_for_duration`
+now 30 levels/29 intervals; `test_place_both_holds_the_last_level_before_the_window_end` — last fires at
+window−hold), `tests/test_sequence_ramp.py` (`test_both_anchor_ramp_fills_window` top at 50 held to 60;
+`..._respects_insets` top at 45 held to 55). Verified live: a `0→9` steps=3 ramp across a 30 s window
+reaches 9 at 22.5 s and holds it 7.5 s to off-air.
+
 ## Current state — a ramp's step-anchor END edge = after the final level's hold: COMPLETE (branch `claude/step-to-step-anchoring`, cross-repo)
 Owner ask: when a step is anchored to a RAMP's `end`, the ramp's LAST level must be held its full dwell
 before the ramp is "finished" — the dependent shouldn't fire the instant the top level is reached. Root

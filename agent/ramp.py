@@ -119,7 +119,11 @@ def resolve_ramp(start: float, stop: float, *, steps: Optional[int] = None,
     adelta = abs(delta)
     sign = 1.0 if delta > 0 else -1.0
 
-    # ── Dual-anchor: fill the on-air window exactly, both ends included (legacy). ──
+    # ── Dual-anchor: fill the on-air window, HOLDING every level (incl. the last). ──
+    # Each of the N levels is held one dwell, so the window is divided by LEVELS, not
+    # intervals: hold = D / N. The last value fires at (N-1)·hold and is held over
+    # [(N-1)·hold, D] — so the final level gets its full hold before off-air (like a
+    # single-anchor / 'stop' ramp), instead of only being touched at the off-air edge.
     if window_s is not None:
         D = window_s
         if steps is not None:
@@ -134,16 +138,18 @@ def resolve_ramp(start: float, stop: float, *, steps: Optional[int] = None,
             values = [float(start) + sign * step * i for i in range(n_int)]
             values.append(float(stop))
         elif hold_s is not None:
-            n_int = max(1, round(D / float(hold_s)))
+            # Honour the requested dwell: fit N levels of ~hold_s across the window.
+            n_levels = max(2, round(D / float(hold_s)))
+            n_int = n_levels - 1
             _guard(n_int)
             values = [float(start) + delta * (i / n_int) for i in range(n_int + 1)]
         else:
             raise ValueError("a window-filling ramp needs a step count or hold time")
-        hold = D / n_int
+        hold = D / len(values)                       # every level held one dwell → fills D
         if hold <= 0:
             raise ValueError("ramp hold time resolves to zero — increase the window")
         return ResolvedRamp(values=values, hold_s=hold,
-                            duration_s=n_int * hold, n_intervals=n_int)
+                            duration_s=D, n_intervals=n_int)
 
     # ── Single-anchor: held-levels model with first/last trimming. ──
     full, n_int = _full_ladder(start, stop, delta, adelta, sign,

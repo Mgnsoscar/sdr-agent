@@ -363,7 +363,12 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # reached — so the final level always gets its hold time before a dependent fires. Behaviour-only,
 # no capability (part of the step-anchor feature, already gated at >= 1.24.0); the bump lets OTA push
 # it. Only affects a step anchored to a ramp's end edge; every other resolution is byte-identical.
-AGENT_VERSION = "1.25.1"
+# 1.25.2: a window-filling ("both", dual-anchor) ramp now HOLDS its last level for one dwell before
+# off-air (the window is divided by levels, not intervals: hold = D/N; the top fires at D−hold and is
+# held to off-air) instead of only touching the stop value at the off-air edge — so the final level
+# always gets its full hold, like a single-anchor / "stop" ramp. Drift-guarded ramp.resolve_ramp
+# window branch (mirrored in sdr-client). Behaviour-only, no capability; the bump lets OTA push it.
+AGENT_VERSION = "1.25.2"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list

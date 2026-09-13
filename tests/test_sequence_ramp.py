@@ -89,12 +89,14 @@ def test_both_anchor_ramp_fills_window(tmp_path):
             run = await runner.arm(
                 seq.id,
                 ArmSequenceRequest(on_air_at=(now + timedelta(seconds=30)).isoformat()),
-                (now + timedelta(seconds=90)).isoformat(),   # 60s window → 6 intervals
+                (now + timedelta(seconds=90)).isoformat(),   # 60s window → 6 levels held 10s each
             )
             tunes = sorted((s for s in run.steps if s.action == "tune"),
                            key=lambda s: s.offset_s)
             assert tunes[0].offset_s == 0 and tunes[0].params["gain"] == 0
-            assert tunes[-1].offset_s == pytest.approx(60) and tunes[-1].params["gain"] == 30
+            # The top level now fires at 50 (= window − hold) and is HELD to off-air (60), so it
+            # gets its full dwell instead of only being touched at the off-air edge.
+            assert tunes[-1].offset_s == pytest.approx(50) and tunes[-1].params["gain"] == 30
         finally:
             await runner.shutdown(); await mgr.shutdown()
     asyncio.run(scenario())
@@ -117,7 +119,9 @@ def test_both_anchor_ramp_respects_insets(tmp_path):
             )
             tunes = sorted((s for s in run.steps if s.action == "tune"), key=lambda s: s.offset_s)
             assert tunes[0].offset_s == pytest.approx(5)     # starts at on-air + 5
-            assert tunes[-1].offset_s == pytest.approx(55)   # ends at off-air - 5 (60-5)
+            # 50s span, hold 10 → 5 levels; the top fires at 45 (= span end − hold) and is HELD to
+            # the off-air inset (55), so the last level gets its full dwell.
+            assert tunes[-1].offset_s == pytest.approx(45)
         finally:
             await runner.shutdown(); await mgr.shutdown()
     asyncio.run(scenario())
