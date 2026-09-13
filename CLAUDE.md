@@ -90,6 +90,19 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — `SequenceStep.anchor_own_edge` pass-through (a ramp tied by its END): COMPLETE (branch `claude/step-to-step-anchoring`, cross-repo)
+Client authoring metadata for step anchors: `anchor_own_edge` ("start" default | "end") says which of
+the STEP'S OWN edges the client ties to the target (only a ramp has two — an end-tied ramp's END sits
+at the target edge and the ramp runs backward from it). The runtime NEVER reads it: `offset_s` is
+always the step's START offset from the target edge (for an end tie the client sends end offset −
+duration), so `_resolve_steps`/`_resolve_ramp` are byte-identical. Added to `models.py` so the field
+survives a store/reload round-trip (an older agent drops it; the client then reloads the ramp
+start-tied at identical timing). `config.py` bumps `AGENT_VERSION 1.25.2 → 1.25.3` (pass-through
+only, no capability). `argspec`/`ramp` untouched (drift guard intact). Tests:
+`tests/test_sequence_step_anchor.py` (round-trip + default; an end-tied ramp fires exactly like a
+start-tied one with the same `offset_s`). Suite 483 → 485. Client side: `sdr-client/CLAUDE.md`
+"owner-testing round 2".
+
 ## Current state — a window-filling ("both") ramp holds its LAST level before off-air: COMPLETE (branch `claude/step-to-step-anchoring`, cross-repo)
 Owner ask: a dual-anchor ("both") ramp that fills the on-air window reached its top level exactly AT
 off-air (0 hold) — the top was only touched at the edge, never transmitted. Now it HOLDS its last level

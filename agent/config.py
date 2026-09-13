@@ -368,7 +368,10 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # held to off-air) instead of only touching the stop value at the off-air edge — so the final level
 # always gets its full hold, like a single-anchor / "stop" ramp. Drift-guarded ramp.resolve_ramp
 # window branch (mirrored in sdr-client). Behaviour-only, no capability; the bump lets OTA push it.
-AGENT_VERSION = "1.25.2"
+# 1.25.3: SequenceStep carries `anchor_own_edge` (client authoring metadata — a ramp tied to its
+# target by its END; offset_s stays the start offset, so the runtime is unchanged). Pass-through
+# only, no capability; the bump lets OTA push the field so it survives a store/reload round-trip.
+AGENT_VERSION = "1.25.3"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list

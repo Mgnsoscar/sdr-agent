@@ -183,3 +183,39 @@ def test_step_anchor_with_hold_rejected_in_phase1(tmp_path):
     ]
     with pytest.raises(ValueError, match="Hold"):
         r._validate_steps(steps)
+
+
+# ── anchor_own_edge (client authoring metadata, ≥ 1.25.3) is carried through, never interpreted ──
+
+def test_anchor_own_edge_round_trips_and_defaults_to_start():
+    ramp = RampSpec(start=0.0, stop=9.0, steps=3, duration_s=6.0, param="gain")
+    s = SequenceStep(id="rmp", anchor="step", anchor_step_id="a", anchor_edge="end",
+                     anchor_own_edge="end", offset_s=-4.0, action=StepAction.RAMP,
+                     task_name="tx", ramp=ramp)
+    dumped = s.model_dump()
+    assert dumped["anchor_own_edge"] == "end"
+    assert SequenceStep(**dumped).anchor_own_edge == "end"          # survives a store/reload
+    legacy = {k: v for k, v in dumped.items() if k != "anchor_own_edge"}
+    assert SequenceStep(**legacy).anchor_own_edge == "start"        # absent on an older client
+
+
+def test_end_tied_ramp_resolves_exactly_like_a_start_tied_one(tmp_path):
+    """The runtime never reads anchor_own_edge: the client sends the START's offset_s either way,
+    so an end-tied ramp fires at the same instants as a start-tied ramp with that offset_s."""
+    r = _runner(tmp_path)
+    ramp = RampSpec(start=0.0, stop=9.0, steps=3, duration_s=6.0, param="gain")
+
+    def steps(own):
+        return [
+            SequenceStep(id="s0", anchor="start", offset_s=0.0, action=StepAction.START, task_name="tx"),
+            _tune("a", 10, anchor="start", offset=20.0),
+            SequenceStep(id="rmp", anchor="step", anchor_step_id="a", anchor_edge="end",
+                         anchor_own_edge=own, offset_s=-8.0, action=StepAction.RAMP,
+                         task_name="tx", ramp=ramp),                 # start at 20−8 = 12, end at 18
+            SequenceStep(anchor="stop", offset_s=0.0, action=StepAction.STOP, task_name="tx"),
+        ]
+    times = {}
+    for own in ("start", "end"):
+        fires = r._resolve_steps(steps(own), T0, END, 0.0)
+        times[own] = sorted(_off(f.fire_at) for f in fires if f.anchor == "step")
+    assert times["start"] == times["end"] == [12.0, 13.5, 15.0, 16.5]

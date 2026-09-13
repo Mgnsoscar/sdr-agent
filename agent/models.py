@@ -323,6 +323,11 @@ class SequenceStep(BaseModel):
     # once their target's edges are known); a cycle or a missing target is a validation error.
     anchor_step_id: str = ""
     anchor_edge: str = "end"           # "start" | "end" (of the anchored-to step)
+    # Client authoring metadata, carried through untouched: which of THIS step's own edges the
+    # client ties to the target ("start" | "end" — only a ramp has two). The runtime never reads
+    # it: offset_s is ALWAYS the step's START offset from the target edge (for an end-tied ramp
+    # the client sends end_offset − duration), so resolution is unchanged either way.
+    anchor_own_edge: str = "start"
     offset_s: float                    # relative to the chosen anchor (on-air side for "both")
     # For a "both"-anchored ramp: the off-air-side inset (≤ 0 = before off-air). The
     # ramp fills [on-air + offset_s, off-air + offset_end_s]. Ignored otherwise.
