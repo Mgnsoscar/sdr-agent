@@ -434,6 +434,12 @@ class SequenceRun(BaseModel):
     # absolute fire times only at proceed (relative to the resume instant). Empty for a
     # normal run. Persisted so a proceed survives the run being reloaded.
     window_b_steps: list[SequenceStep] = []
+    # Window-A fires DEFERRED past the pause (agent ≥ 1.27.0, capability sequence-hold-ramp-pause):
+    # a ramp that crosses the Hold is FROZEN at the hold instant (the level it had reached holds
+    # through the pause) and its remaining points fire after proceed, each `offset_s` seconds
+    # after the resume instant (anchor "hold"). Re-based and appended to `steps` at proceed;
+    # persisted so a proceed survives the run being reloaded.
+    paused_fires: list[StepFire] = []
 
 
 class StepOverride(BaseModel):

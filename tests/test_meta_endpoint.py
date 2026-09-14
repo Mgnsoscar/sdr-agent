@@ -33,6 +33,7 @@ def test_capabilities_advertised_and_stable():
     assert "sequence-step-anchor" in cfg.AGENT_CAPABILITIES                # step-to-step anchoring
     assert "sequence-step-anchor-negative" in cfg.AGENT_CAPABILITIES       # negative step-anchor offset
     assert "sequence-hold-enter" in cfg.AGENT_CAPABILITIES                 # anchor="enter" (Hold's pause edge)
+    assert "sequence-hold-ramp-pause" in cfg.AGENT_CAPABILITIES            # a ramp crossing the Hold pauses
 
 
 def test_agent_info_carries_capabilities():

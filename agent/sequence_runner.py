@@ -453,6 +453,27 @@ class SequenceRunner:
         return window_a, window_b, hold_offset
 
     @staticmethod
+    def _split_fires_at_hold(fires: List[StepFire], hold_time: datetime,
+                             ) -> Tuple[List[StepFire], List[StepFire]]:
+        """Split resolved window-A fires at the pause: (at/before the hold instant, AFTER it).
+
+        A ramp that crosses the Hold is FROZEN there — the level it had reached holds through
+        the pause — and its later points are DEFERRED: re-tagged anchor="hold" with offset_s =
+        seconds after the pause, so proceed re-bases them to T_resume and the ramp resumes
+        where it left off, shifted by the pause's length (agent 1.27.0, capability
+        sequence-hold-ramp-pause). Validation keeps every other window-A step at or before the
+        hold, so only ramp points ever land in the second list."""
+        before: List[StepFire] = []
+        after: List[StepFire] = []
+        for f in fires:
+            dt = (_parse(f.fire_at) - hold_time).total_seconds()
+            if dt <= 1e-6:
+                before.append(f)
+            else:
+                after.append(f.model_copy(update={"anchor": "hold", "offset_s": round(dt, 6)}))
+        return before, after
+
+    @staticmethod
     def _validate_overrides(
         steps: List[SequenceStep], overrides: List[StepOverride],
     ) -> Dict[int, StepOverride]:
@@ -752,6 +773,11 @@ class SequenceRunner:
                     if hold_mode and hold_at_offset_s is not None else None)
         steps = self._resolve_steps(resolve_defs, on_air_at, on_air_end, req.resume_offset_s,
                                     open_ended, overrides, enter_at=enter_at)
+        paused: List[StepFire] = []
+        if enter_at is not None:
+            # A ramp crossing the Hold is PAUSED there: its points up to the pause fire in
+            # window A, the rest wait for proceed (re-based to the resume instant).
+            steps, paused = self._split_fires_at_hold(steps, enter_at)
 
         run = SequenceRun(
             id=_run_id(),
@@ -771,6 +797,7 @@ class SequenceRunner:
             max_hold_s=req.max_hold_s,
             hold_at_offset_s=hold_at_offset_s,
             window_b_steps=list(window_b_defs),
+            paused_fires=paused,
         )
 
         async with self._lock:
@@ -935,9 +962,17 @@ class SequenceRunner:
             # (edit-while-holding, §6.4) — the FULL sequence with an immutable window A and a
             # revised window B; the agent validates it and re-extracts window B (window A has
             # already fired and is ignored here). Absent, the window B stored at arm is used.
+            paused = list(run.paused_fires)
             if req.steps:
                 self._validate_steps(req.steps)
-                _, wb_defs, _ = self._split_hold_windows(req.steps)
+                wa_defs, wb_defs, _ = self._split_hold_windows(req.steps)
+                if run.hold_at_offset_s is not None:
+                    # The edit may retarget a ramp that crosses the Hold: re-derive its deferred
+                    # remainder from the EDITED window A (the part before the pause has fired).
+                    hold_time = on_air_at + timedelta(seconds=run.hold_at_offset_s)
+                    wa_fires = self._resolve_steps(wa_defs, on_air_at, None, run.resume_offset_s,
+                                                   True, None, enter_at=hold_time)
+                    _, paused = self._split_fires_at_hold(wa_fires, hold_time)
             else:
                 wb_defs = list(run.window_b_steps)
             hold_defs = [s for s in wb_defs if s.anchor == "hold"]
@@ -947,6 +982,13 @@ class SequenceRunner:
             # the off-air (stop-anchored) steps land after the post-hold work completes.
             hold_fires = self._resolve_steps(hold_defs, on_air_at, None, run.resume_offset_s,
                                              open_ended=True, hold_at=t_resume)
+            # A ramp paused at the Hold resumes where it left off, shifted by the pause's
+            # length: each deferred point fires offset_s after T_resume (see _split_fires_at_hold).
+            resumed = [f.model_copy(update={
+                           "fire_at": (t_resume + timedelta(seconds=f.offset_s)).isoformat(),
+                           "fired_actual": None})
+                       for f in paused]
+            hold_fires = resumed + hold_fires
             content_s = max(
                 ((_parse(f.fire_at) - t_resume).total_seconds() for f in hold_fires),
                 default=0.0)
@@ -959,6 +1001,7 @@ class SequenceRunner:
             new_fires.sort(key=lambda f: _parse(f.fire_at))
 
             run.steps = list(run.steps) + new_fires
+            run.paused_fires = []                  # now scheduled (in run.steps)
             run.on_air_end = on_air_end.isoformat()
             run.open_ended = False
             run.resumed_actual = _utcnow_iso()
@@ -986,7 +1029,9 @@ class SequenceRunner:
         enters HOLDING immediately, stamping held_actual = now (so the max-hold deadman runs
         from here). The operator then edits/schedules window B and proceeds, exactly as for a
         run that reached its hold on its own — the test jumps to the interesting state without
-        waiting out a ramp whose outcome is already known.
+        waiting out a ramp whose outcome is already known. The jump-the-clock rule for a ramp
+        that crosses the Hold: what would have fired BEFORE the pause is skipped (as here), what
+        comes AFTER it was deferred at arm (paused_fires) and still resumes after proceed.
         """
         async with self._lock:
             run = self._runs.get(run_id)

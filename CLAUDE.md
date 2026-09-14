@@ -90,6 +90,34 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — a ramp ACROSS the Hold is PAUSED there and resumes after proceed: COMPLETE (branch `claude/step-to-step-anchoring`, cross-repo)
+Owner question: a ramp can be placed so its middle lies inside the Hold window; reject it, or let it
+hold? Decision (owner-approved): ALLOW it with "the pause freezes the ramp" semantics — a Hold means
+time stops, so the ramp holds the level it had reached and continues after Proceed, shifted by the
+pause's length. Before this the agent kept the whole ramp in window A and `_service_holds` waited
+for `window_a_done`, so the pause was silently DELAYED until the ramp finished (the hold offset was
+missed); validation only checked a start-anchored step's START against the Hold. Agent side:
+- **`_split_fires_at_hold(fires, hold_time)`** (new static) splits the resolved window-A fires at the
+  pause instant: at/before it → `run.steps`; after it → re-tagged `anchor="hold"`, `offset_s` = seconds
+  past the pause. `arm` (hold mode) applies it right after `_resolve_steps` and stores the remainder as
+  the new **`SequenceRun.paused_fires`** (`models.py`, persisted). Validation keeps every other window-A
+  step at/before the hold, so only ramp points ever land there; a ramp STARTING after the hold is still
+  rejected. `_service_holds` is untouched — window A now genuinely ends at the pause.
+- **`proceed`** re-bases each paused fire to `T_resume + offset_s` (so the ramp resumes where it left
+  off, shifted by the pause) and counts them toward the post-hold content that fixes `on_air_end`;
+  `paused_fires` is cleared once scheduled. **Edit-while-holding** (`req.steps`) re-derives the remainder
+  from the EDITED window A (re-resolve against T0 + `hold_at_offset_s`, split again), so retargeting
+  the crossing ramp's top while holding takes effect. **`hold_now`** is unchanged (jump-the-clock rule:
+  what would have fired before the pause is skipped, the deferred remainder still resumes).
+- **`config.py`** capability **`sequence-hold-ramp-pause`** + `AGENT_VERSION 1.26.0 → 1.27.0` (a safety
+  gate: the client refuses to save / hold-aware-arm a crossing ramp on a ≤1.26 agent, which would delay
+  the pause). The schedule/plan path compiles the Hold out (the ramp runs straight through) — no gate.
+  `argspec`/`ramp` untouched (drift guard intact). Tests: `tests/test_sequence_hold_ramp_pause.py`
+  (validation, the split incl. a point AT the pause staying in window A, edit-while-holding
+  re-derivation, and a LIVE run that freezes the mock task at 30, holds it, and reaches 40 after
+  proceed) + `test_meta_endpoint.py`. Suite 491 → 496. Client side + design note:
+  `sdr-client/docs/sequence-hold-step.md` §5.7, `sdr-client/CLAUDE.md`.
+
 ## Current state — `anchor="enter"`: a window-A step timed from the Hold's ENTER instant (the pause's start): COMPLETE (branch `claude/step-to-step-anchoring`, cross-repo)
 Owner ask (v3 #4): in the client's Hold WINDOW a ramp's END should anchor to the LEFT edge (where the
 pause begins), while a start / a tune anchors to the resume edge. Agent side:

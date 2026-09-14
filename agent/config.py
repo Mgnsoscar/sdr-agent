@@ -374,7 +374,12 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # 1.26.0: anchor="enter" — a step measured from the Hold's ENTER instant (the pause's start; a
 # ramp tied by its END so it finishes as the pause begins). Window A, resolved at a hold-aware
 # arm. Capability sequence-hold-enter (a safety gate: older agents reject the anchor value).
-AGENT_VERSION = "1.26.0"
+# 1.27.0: a ramp crossing the Hold is PAUSED there — its points up to the pause fire in window A,
+# the level reached holds through the pause, and the remaining points resume after proceed shifted
+# by the pause's length (SequenceRun.paused_fires, re-based to T_resume; edit-while-holding
+# re-derives them from the edited window A). Capability sequence-hold-ramp-pause (a safety gate:
+# a ≤1.26 agent kept such a ramp in window A and DELAYED the pause until it finished).
+AGENT_VERSION = "1.27.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -497,6 +502,12 @@ AGENT_CAPABILITIES = [
                                          # T0 + hold_at_offset_s. The client gates a hold-aware arm
                                          # carrying an enter-anchored step on this string (a ≤1.25
                                          # agent 400s on the unknown anchor).
+    "sequence-hold-ramp-pause",          # a ramp crossing the Hold is PAUSED there: the level it
+                                         # had reached holds through the pause and its remaining
+                                         # points resume after proceed, shifted by the pause's
+                                         # length (SequenceRun.paused_fires). A ≤1.26 agent instead
+                                         # delays the pause until the ramp finishes, so the client
+                                         # gates a hold-aware arm of such a sequence on this string.
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
