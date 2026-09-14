@@ -397,6 +397,9 @@ class StepFire(BaseModel):
     args: list[str] = []               # CLI args for this step's start/run (see SequenceStep.args)
     replace_args: bool = False         # args are the complete set (replace defaults), see SequenceStep
     params: dict = {}                  # TUNE step: live-param values to apply (see SequenceStep.params)
+    # A ramp point DEFERRED past the Hold (paused_fires): how long its level is held before the next
+    # point — the ramp's dwell — so proceed keeps the last level's hold before off-air. None otherwise.
+    dwell_s: Optional[float] = None
 
 
 class SequenceRun(BaseModel):

@@ -379,7 +379,12 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # by the pause's length (SequenceRun.paused_fires, re-based to T_resume; edit-while-holding
 # re-derives them from the edited window A). Capability sequence-hold-ramp-pause (a safety gate:
 # a ≤1.26 agent kept such a ramp in window A and DELAYED the pause until it finished).
-AGENT_VERSION = "1.27.0"
+# 1.27.1: proceed's off-air lands AFTER the post-hold content — a resumed / hold-anchored ramp's last
+# level keeps its dwell (on_air_end was the last fire itself → zero hold + a STOP at the same instant)
+# and the stop-anchored (off-air) steps' backward extent is added (a stop-anchored down-ramp used to
+# resolve BEFORE T_resume and burst-fire); PATCH on-air-end refuses a Hold-aware run (it rebuilt the
+# fires without the Hold's bases and dropped every hold/enter fire). Behaviour only, no capability.
+AGENT_VERSION = "1.27.1"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list

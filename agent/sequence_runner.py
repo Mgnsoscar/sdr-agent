@@ -465,12 +465,24 @@ class SequenceRunner:
         hold, so only ramp points ever land in the second list."""
         before: List[StepFire] = []
         after: List[StepFire] = []
-        for f in fires:
-            dt = (_parse(f.fire_at) - hold_time).total_seconds()
+        ordered = sorted(fires, key=lambda f: _parse(f.fire_at))
+        # A deferred point keeps its DWELL (the ramp's uniform spacing — measured to the previous
+        # point of the same ramp: same task, same tuned keys) so proceed can hold the last level
+        # its full dwell before off-air instead of ending the run on the fire itself.
+        prev_at: dict = {}
+        for f in ordered:
+            key = (f.task_name, f.action, tuple(sorted((f.params or {}).keys())))
+            t = _parse(f.fire_at)
+            dt = (t - hold_time).total_seconds()
             if dt <= 1e-6:
                 before.append(f)
             else:
-                after.append(f.model_copy(update={"anchor": "hold", "offset_s": round(dt, 6)}))
+                last = prev_at.get(key)
+                dwell = round((t - last).total_seconds(), 6) if last is not None else None
+                after.append(f.model_copy(update={"anchor": "hold", "offset_s": round(dt, 6),
+                                                  "dwell_s": dwell if dwell and dwell > 0 else None}))
+            if f.action == "tune":
+                prev_at[key] = t
         return before, after
 
     @staticmethod
@@ -895,6 +907,15 @@ class SequenceRunner:
                     "cannot extend an open-ended run — it has no on-air stop; "
                     "stop it by aborting instead"
                 )
+            if run.hold_aware:
+                # A Hold run's fires hang off the Hold's own bases (the pause / the resume instant);
+                # rebuilding them from on-air alone would drop every hold-/enter-anchored fire —
+                # the resumed ramp remainder and all of window B included. Its off-air is set at
+                # Proceed (T_resume + the post-hold content) and is not movable afterwards.
+                raise ValueError(
+                    "cannot move the on-air end of a Hold run — its off-air is set at Proceed; "
+                    "abort the run instead"
+                )
 
             new_end = _parse(new_end_iso)
             now = _utcnow_dt()
@@ -989,10 +1010,18 @@ class SequenceRunner:
                            "fired_actual": None})
                        for f in paused]
             hold_fires = resumed + hold_fires
-            content_s = max(
-                ((_parse(f.fire_at) - t_resume).total_seconds() for f in hold_fires),
-                default=0.0)
-            content_s = max(0.0, content_s)
+            # Off-air lands AFTER the whole post-hold content: the hold-anchored work runs FORWARD
+            # from T_resume — a ramp's extent includes its LAST level's dwell (the level is held,
+            # not merely touched, before off-air; a resumed remainder carries its dwell on the fire)
+            # — and the stop-anchored (off-air) work's BACKWARD extent is added after it, so a
+            # stop-anchored down-ramp never resolves before T_resume. This is the picture the client
+            # draws: off-air floats just past both groups.
+            fwd_s = ramp.min_on_air_duration(
+                [s.model_copy(update={"anchor": "start"}) for s in hold_defs])
+            for f in resumed:
+                fwd_s = max(fwd_s, float(f.offset_s) + float(f.dwell_s or 0.0))
+            bwd_s = ramp.min_on_air_duration(stop_defs)
+            content_s = max(0.0, fwd_s) + max(0.0, bwd_s)
             on_air_end = t_resume + timedelta(seconds=content_s)
             stop_fires = self._resolve_steps(stop_defs, on_air_at, on_air_end, run.resume_offset_s,
                                              open_ended=False, hold_at=t_resume)

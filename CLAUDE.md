@@ -90,6 +90,30 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — proceed's off-air lands after the WHOLE post-hold content (`/code-review` fixes, 1.27.1): COMPLETE (branch `claude/step-to-step-anchoring`, agent-only)
+A `/code-review` of the ramp-pause work found three `proceed`-path defects (two pre-existing since
+Phase 1). Fixed in `sequence_runner.py`, behaviour only — `AGENT_VERSION 1.27.0 → 1.27.1`, no capability:
+- **Zero dwell for the last post-hold level.** `content_s` was the LAST hold-anchored FIRE, so
+  `on_air_end` landed exactly on it and the STOP fired the same tick — the top of a resumed crossing ramp
+  (or the bottom of a hold-anchored down-ramp) was touched, never held (the very defect fixed for `both`
+  ramps in 1.25.2 / step-anchor ends in 1.25.1). Now the forward extent = `ramp.min_on_air_duration`
+  over the hold defs re-anchored `start` (a ramp's FULL span, last dwell included) and, for the resumed
+  remainder, `offset_s + dwell_s` — `StepFire.dwell_s` is a new optional field stamped by
+  `_split_fires_at_hold` from the ramp's uniform spacing (to the previous point of the same task + tuned
+  keys).
+- **Stop-anchored window-B content resolved BEFORE `T_resume`.** `content_s` ignored stop-anchored defs,
+  so a stop-anchored down-ramp longer than the hold-anchored content (or with none) placed its points in
+  the past and `_tick` burst-fired them plus the STOP. Now `on_air_end = T_resume + forward + backward`
+  where backward = `ramp.min_on_air_duration(stop_defs)` — the off-air work lands AFTER the post-hold
+  work, which is exactly the picture the client draws (off-air floats past both groups, sum not max).
+- **`patch_on_air_end` dropped every hold/enter fire of a proceeded run** (it rebuilt `run.steps` via
+  `_resolve_steps` without `hold_at`/`enter_at`; HTTP-only, no client button). It now refuses a
+  `hold_aware` run (`ValueError` → 400: "cannot move the on-air end of a Hold run").
+Tests: `tests/test_sequence_hold_ramp_pause.py` (the resumed remainder's dwell is carried; off-air after
+a stop-anchored down-ramp with/without hold content + a hold-anchored ramp's last dwell; PATCH refused
+with the fires intact), `tests/test_sequence_hold_runtime.py::test_proceed_resolves_a_window_b_ramp`
+(off-air at last fire + hold; the bottom level is still transmitting before it). Suite 496 → 498.
+
 ## Current state — a ramp ACROSS the Hold is PAUSED there and resumes after proceed: COMPLETE (branch `claude/step-to-step-anchoring`, cross-repo)
 Owner question: a ramp can be placed so its middle lies inside the Hold window; reject it, or let it
 hold? Decision (owner-approved): ALLOW it with "the pause freezes the ramp" semantics — a Hold means

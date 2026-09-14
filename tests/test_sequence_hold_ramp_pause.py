@@ -90,6 +90,7 @@ def test_edit_while_holding_re_derives_the_paused_remainder(tmp_path):
         run = await r.arm(seq.id, ArmSequenceRequest(on_air_at=t0.isoformat(), open_ended=True,
                                                      hold_aware=True, max_hold_s=0), None)
         assert [f.params["gain"] for f in run.paused_fires] == [9.0]
+        assert run.paused_fires[0].dwell_s == 1.5                       # the ramp's hold, carried
         assert all(_off(f.fire_at, t0) <= 30.0 for f in run.steps)     # window A ends at the pause
         # park it (the tick loop isn't running — nothing fires)
         run.state = SequenceState.HOLDING
@@ -101,7 +102,94 @@ def test_edit_while_holding_re_derives_the_paused_remainder(tmp_path):
         resumed = [f for f in out.steps if f.anchor == "hold" and f.action == "tune"]
         by_off = sorted((_off(f.fire_at, t_resume), f.params["gain"]) for f in resumed)
         assert by_off == [(0.5, 21), (1.5, 90.0)]           # the edited top, 1.5 s after resume
-        assert _off(out.on_air_end, t_resume) == 1.5        # the resumed remainder counts as content
+        # Off-air lands after the resumed remainder AND its last level's dwell (1.5 s fire + 1.5 s
+        # hold) — the top is HELD before off-air, never merely touched.
+        assert _off(out.on_air_end, t_resume) == 3.0
+        await r.cancel_or_abort(run.id)
+
+    asyncio.run(scenario())
+
+
+def test_proceed_lands_off_air_after_the_whole_post_hold_content(tmp_path):
+    """on_air_end = T_resume + the hold-anchored content (a ramp's full extent, last dwell
+    included) + the stop-anchored (off-air) content's backward extent — so a stop-anchored
+    down-ramp never resolves before T_resume and burst-fires, and a hold-anchored ramp's last
+    level keeps its dwell."""
+    down = RampSpec(start=9.0, stop=0.0, steps=3, duration_s=6.0, param="gain")   # 4 levels × 1.5 s
+
+    def steps(with_hold_tune: bool):
+        out = [
+            SequenceStep(anchor="start", offset_s=0.0, action=StepAction.START, task_name="tx"),
+            SequenceStep(anchor="start", offset_s=30.0, action=StepAction.HOLD, task_name=""),
+            SequenceStep(anchor="stop", offset_s=0.0, action=StepAction.RAMP, task_name="tx",
+                         ramp=down),
+            SequenceStep(anchor="stop", offset_s=0.0, action=StepAction.STOP, task_name="tx"),
+        ]
+        if with_hold_tune:
+            out.insert(2, SequenceStep(anchor="hold", offset_s=2.0, action=StepAction.TUNE,
+                                       task_name="tx", params={"gain": 21}))
+        return out
+
+    async def scenario():
+        r = _runner(tmp_path)
+        t0 = datetime.now(timezone.utc) + timedelta(seconds=3600)
+        t_resume = t0 + timedelta(seconds=600)
+        for with_hold_tune, fwd in ((False, 0.0), (True, 2.0)):
+            seq = await r.create_sequence(CreateSequenceRequest(name="d", steps=steps(with_hold_tune)))
+            run = await r.arm(seq.id, ArmSequenceRequest(on_air_at=t0.isoformat(), open_ended=True,
+                                                         hold_aware=True, max_hold_s=0), None)
+            run.state = SequenceState.HOLDING
+            run.held_actual = datetime.now(timezone.utc).isoformat()
+            out = await r.proceed(run.id, ProceedRequest(proceed_at=t_resume.isoformat()))
+            # off-air = resume + forward content + the down-ramp's 6 s span
+            assert _off(out.on_air_end, t_resume) == fwd + 6.0
+            pts = sorted(_off(f.fire_at, t_resume) for f in out.steps
+                         if f.anchor == "stop" and f.action == "tune")
+            assert pts == [fwd + 0.0, fwd + 1.5, fwd + 3.0, fwd + 4.5]   # all at/after resume
+            # every window-B fire sits at/after resume (window A's START is unfired only because
+            # the tick loop isn't running in this scenario)
+            assert all(_off(f.fire_at, t_resume) >= 0.0 for f in out.steps
+                       if f.anchor in ("hold", "stop"))
+            await r.cancel_or_abort(run.id)
+        # A hold-anchored ramp keeps its last level's dwell: 4 levels × 1.5 s from resume+1 →
+        # last fire at 5.5, off-air at 7.0 (not 5.5).
+        up = RampSpec(start=0.0, stop=9.0, steps=3, duration_s=6.0, param="gain")
+        seq = await r.create_sequence(CreateSequenceRequest(name="u", steps=[
+            SequenceStep(anchor="start", offset_s=0.0, action=StepAction.START, task_name="tx"),
+            SequenceStep(anchor="start", offset_s=30.0, action=StepAction.HOLD, task_name=""),
+            SequenceStep(anchor="hold", offset_s=1.0, action=StepAction.RAMP, task_name="tx", ramp=up),
+            SequenceStep(anchor="stop", offset_s=0.0, action=StepAction.STOP, task_name="tx"),
+        ]))
+        run = await r.arm(seq.id, ArmSequenceRequest(on_air_at=t0.isoformat(), open_ended=True,
+                                                     hold_aware=True, max_hold_s=0), None)
+        run.state = SequenceState.HOLDING
+        run.held_actual = datetime.now(timezone.utc).isoformat()
+        out = await r.proceed(run.id, ProceedRequest(proceed_at=t_resume.isoformat()))
+        last = max(_off(f.fire_at, t_resume) for f in out.steps if f.action == "tune")
+        assert last == 5.5 and _off(out.on_air_end, t_resume) == 7.0
+        await r.cancel_or_abort(run.id)
+
+    asyncio.run(scenario())
+
+
+def test_patch_on_air_end_refuses_a_hold_run(tmp_path):
+    """After Proceed a Hold run is RUNNING with a known end, but its fires hang off the Hold's
+    bases — rebuilding them from on-air would drop every hold-/enter-anchored fire. Refused."""
+    async def scenario():
+        r = _runner(tmp_path)
+        seq = await r.create_sequence(CreateSequenceRequest(name="x", steps=_crossing_steps()))
+        t0 = datetime.now(timezone.utc) + timedelta(seconds=3600)
+        run = await r.arm(seq.id, ArmSequenceRequest(on_air_at=t0.isoformat(), open_ended=True,
+                                                     hold_aware=True, max_hold_s=0), None)
+        run.state = SequenceState.HOLDING
+        run.held_actual = datetime.now(timezone.utc).isoformat()
+        t_resume = t0 + timedelta(seconds=600)
+        out = await r.proceed(run.id, ProceedRequest(proceed_at=t_resume.isoformat()))
+        n_hold = sum(1 for f in out.steps if f.anchor == "hold")
+        assert out.state == SequenceState.RUNNING and n_hold > 0
+        with pytest.raises(ValueError, match="Hold run"):
+            await r.patch_on_air_end(run.id, (t_resume + timedelta(seconds=100)).isoformat())
+        assert sum(1 for f in r.get_run(run.id).steps if f.anchor == "hold") == n_hold  # intact
         await r.cancel_or_abort(run.id)
 
     asyncio.run(scenario())
