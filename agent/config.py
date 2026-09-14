@@ -345,7 +345,46 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # muted warm-up), positive after. Only from the on-air anchor. Agent-rendered/export-shape only; the
 # client renders whatever columns the payload carries (it just localizes the leading Time column), so
 # no capability and an older client shows the extra column too. The bump lets OTA push it.
-AGENT_VERSION = "1.23.1"
+# 1.24.0: STEP-TO-STEP anchoring (Phase 1) — a step may be anchored to ANOTHER step's edge
+# (SequenceStep.id + anchor="step" + anchor_step_id + anchor_edge "start"/"end" + offset_s) instead of
+# to on-air/off-air. _resolve_steps resolves fire times TOPOLOGICALLY (roots first, then step-anchored
+# steps once their target's edges are known); _validate_steps rejects unknown targets and cycles.
+# Phase 1 excludes the Hold (a step anchor + a Hold is refused). New capability sequence-step-anchor
+# (a safety gate — an older agent can't resolve the new anchor); byte-identical resolution for any
+# sequence that uses no step anchor. place_ramp/ramp.py/argspec untouched (drift guard intact).
+# 1.25.0: a step anchor's offset_s may be NEGATIVE — a step-anchored step can fire BEFORE the edge it
+# hangs off (like a start/stop anchor's warm-up lead-in), not only at/after it. _validate_steps no
+# longer rejects offset < 0 on a step anchor (the topological resolve already placed edge + offset for
+# any sign); the graph must still be acyclic. New capability sequence-step-anchor-negative (a safety
+# gate — a ≤1.24 agent rejects the negative offset with 400, so the client must only send it to a
+# 1.25.0+ agent). Byte-identical for any sequence whose step anchors all use offset >= 0.
+# 1.25.1: a step anchored to a RAMP's "end" edge now fires AFTER the ramp's final level has been held
+# its full dwell (the ramp's end = last tune fire + one hold), not the instant the last level is
+# reached — so the final level always gets its hold time before a dependent fires. Behaviour-only,
+# no capability (part of the step-anchor feature, already gated at >= 1.24.0); the bump lets OTA push
+# it. Only affects a step anchored to a ramp's end edge; every other resolution is byte-identical.
+# 1.25.2: a window-filling ("both", dual-anchor) ramp now HOLDS its last level for one dwell before
+# off-air (the window is divided by levels, not intervals: hold = D/N; the top fires at D−hold and is
+# held to off-air) instead of only touching the stop value at the off-air edge — so the final level
+# always gets its full hold, like a single-anchor / "stop" ramp. Drift-guarded ramp.resolve_ramp
+# window branch (mirrored in sdr-client). Behaviour-only, no capability; the bump lets OTA push it.
+# 1.25.3: SequenceStep carries `anchor_own_edge` (client authoring metadata — a ramp tied to its
+# target by its END; offset_s stays the start offset, so the runtime is unchanged). Pass-through
+# only, no capability; the bump lets OTA push the field so it survives a store/reload round-trip.
+# 1.26.0: anchor="enter" — a step measured from the Hold's ENTER instant (the pause's start; a
+# ramp tied by its END so it finishes as the pause begins). Window A, resolved at a hold-aware
+# arm. Capability sequence-hold-enter (a safety gate: older agents reject the anchor value).
+# 1.27.0: a ramp crossing the Hold is PAUSED there — its points up to the pause fire in window A,
+# the level reached holds through the pause, and the remaining points resume after proceed shifted
+# by the pause's length (SequenceRun.paused_fires, re-based to T_resume; edit-while-holding
+# re-derives them from the edited window A). Capability sequence-hold-ramp-pause (a safety gate:
+# a ≤1.26 agent kept such a ramp in window A and DELAYED the pause until it finished).
+# 1.27.1: proceed's off-air lands AFTER the post-hold content — a resumed / hold-anchored ramp's last
+# level keeps its dwell (on_air_end was the last fire itself → zero hold + a STOP at the same instant)
+# and the stop-anchored (off-air) steps' backward extent is added (a stop-anchored down-ramp used to
+# resolve BEFORE T_resume and burst-fire); PATCH on-air-end refuses a Hold-aware run (it rebuilt the
+# fires without the Hold's bases and dropped every hold/enter fire). Behaviour only, no capability.
+AGENT_VERSION = "1.27.1"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -452,6 +491,28 @@ AGENT_CAPABILITIES = [
                                          # derived readouts). The client gates its "Export log…"
                                          # button on this string and turns each unit's tables
                                          # into sheets of an .xlsx workbook.
+    "sequence-step-anchor",              # a step may be anchored to ANOTHER step's edge
+                                         # (anchor="step" + anchor_step_id + anchor_edge): the agent
+                                         # resolves fire times topologically at arm (roots first,
+                                         # then step-anchored steps), rejecting cycles/unknown
+                                         # targets. Phase 1: not alongside a Hold. The client gates
+                                         # authoring/arming a step-anchored sequence on this string.
+    "sequence-step-anchor-negative",     # a step anchor's offset_s may be NEGATIVE (fire before the
+                                         # referenced edge, like a start/stop anchor's lead-in), not
+                                         # only >= 0. The client gates authoring/arming a sequence with
+                                         # a negative step offset on this string (a ≤1.24 agent 400s).
+    "sequence-hold-enter",               # anchor="enter": a window-A step timed from the Hold's ENTER
+                                         # edge (where the pause begins; offset_s <= 0, a ramp is tied
+                                         # by its END like a stop anchor). Resolved at arm from
+                                         # T0 + hold_at_offset_s. The client gates a hold-aware arm
+                                         # carrying an enter-anchored step on this string (a ≤1.25
+                                         # agent 400s on the unknown anchor).
+    "sequence-hold-ramp-pause",          # a ramp crossing the Hold is PAUSED there: the level it
+                                         # had reached holds through the pause and its remaining
+                                         # points resume after proceed, shifted by the pause's
+                                         # length (SequenceRun.paused_fires). A ≤1.26 agent instead
+                                         # delays the pause until the ramp finishes, so the client
+                                         # gates a hold-aware arm of such a sequence on this string.
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

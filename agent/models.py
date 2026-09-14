@@ -311,6 +311,26 @@ class SequenceStep(BaseModel):
                       proceed is Phase 1 — Phase 0 only validates the shape.
     """
     anchor: str = "start"              # "start" | "stop" | "both" (ramp) | "hold" (post-Hold window B)
+                                       #   | "enter" (from the Hold's ENTER instant — the pause's
+                                       #     start; window A, known at arm; offset_s ≤ 0; a ramp is
+                                       #     tied by its END like a stop anchor. ≥ 1.26.0)
+                                       #   | "step" (relative to ANOTHER step's edge — see below)
+    # A stable id for this step, so other steps can anchor to it. Assigned by the client
+    # (a fresh sequence gets ids on save); empty for legacy steps that nothing references.
+    id: str = ""
+    # anchor = "step": this step is timed relative to another step's edge, not to on-air/off-air.
+    #   anchor_step_id  — the id of the step this one hangs off
+    #   anchor_edge     — which edge of that step: "start" (its first fire) or "end" (its last)
+    #   offset_s        — seconds from that edge (may be negative)
+    # The agent resolves these topologically at arm time (roots first, then step-anchored steps
+    # once their target's edges are known); a cycle or a missing target is a validation error.
+    anchor_step_id: str = ""
+    anchor_edge: str = "end"           # "start" | "end" (of the anchored-to step)
+    # Client authoring metadata, carried through untouched: which of THIS step's own edges the
+    # client ties to the target ("start" | "end" — only a ramp has two). The runtime never reads
+    # it: offset_s is ALWAYS the step's START offset from the target edge (for an end-tied ramp
+    # the client sends end_offset − duration), so resolution is unchanged either way.
+    anchor_own_edge: str = "start"
     offset_s: float                    # relative to the chosen anchor (on-air side for "both")
     # For a "both"-anchored ramp: the off-air-side inset (≤ 0 = before off-air). The
     # ramp fills [on-air + offset_s, off-air + offset_end_s]. Ignored otherwise.
@@ -377,6 +397,9 @@ class StepFire(BaseModel):
     args: list[str] = []               # CLI args for this step's start/run (see SequenceStep.args)
     replace_args: bool = False         # args are the complete set (replace defaults), see SequenceStep
     params: dict = {}                  # TUNE step: live-param values to apply (see SequenceStep.params)
+    # A ramp point DEFERRED past the Hold (paused_fires): how long its level is held before the next
+    # point — the ramp's dwell — so proceed keeps the last level's hold before off-air. None otherwise.
+    dwell_s: Optional[float] = None
 
 
 class SequenceRun(BaseModel):
@@ -414,6 +437,12 @@ class SequenceRun(BaseModel):
     # absolute fire times only at proceed (relative to the resume instant). Empty for a
     # normal run. Persisted so a proceed survives the run being reloaded.
     window_b_steps: list[SequenceStep] = []
+    # Window-A fires DEFERRED past the pause (agent ≥ 1.27.0, capability sequence-hold-ramp-pause):
+    # a ramp that crosses the Hold is FROZEN at the hold instant (the level it had reached holds
+    # through the pause) and its remaining points fire after proceed, each `offset_s` seconds
+    # after the resume instant (anchor "hold"). Re-based and appended to `steps` at proceed;
+    # persisted so a proceed survives the run being reloaded.
+    paused_fires: list[StepFire] = []
 
 
 class StepOverride(BaseModel):

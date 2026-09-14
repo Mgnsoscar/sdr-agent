@@ -60,10 +60,13 @@ def test_ramp_down():
 
 
 def test_dual_anchor_uses_window_for_duration():
-    # window 60s, hold 2s → 30 intervals, step derived
+    # window 60s, hold 2s → 30 LEVELS each held 2s (29 intervals); the ramp still fills the
+    # 60s window, but the last level is now held its dwell instead of touching stop at the edge.
     r = ramp.resolve_ramp(0, 30, hold_s=2, window_s=60)
     assert r.duration_s == pytest.approx(60)
-    assert r.n_intervals == 30
+    assert r.n_intervals == 29
+    assert r.hold_s == pytest.approx(2)
+    assert len(r.values) == 30
     assert r.values[0] == 0 and r.values[-1] == 30
 
 
@@ -136,11 +139,15 @@ def test_place_stop_anchored_reserves_final_hold():
     assert r.duration_s == 15
 
 
-def test_place_both_fills_from_zero():
-    r = ramp.resolve_ramp(0, 20, hold_s=5, window_s=10)   # window 10 → 2 intervals
+def test_place_both_holds_the_last_level_before_the_window_end():
+    # window 10, hold 5 → 2 levels ([0, 20]) each held 5s. The last level fires at 5 (= window
+    # − hold) and is held over [5, 10], so the top level gets its full dwell before off-air
+    # instead of only being touched at the window edge.
+    r = ramp.resolve_ramp(0, 20, hold_s=5, window_s=10)
+    assert r.values == [0, 20] and r.hold_s == pytest.approx(5) and r.duration_s == pytest.approx(10)
     pts = ramp.place_ramp("both", 0.0, r)
     assert all(a == "start" for a, _, _ in pts)
-    assert pts[0][1] == 0 and pts[-1][1] == pytest.approx(10)
+    assert pts[0][1] == 0 and pts[-1][1] == pytest.approx(5)   # last level held from 5 to off-air(10)
 
 
 # ── Minimum on-air duration ───────────────────────────────────────────────────

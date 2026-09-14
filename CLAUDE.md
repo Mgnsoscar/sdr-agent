@@ -90,6 +90,181 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — proceed's off-air lands after the WHOLE post-hold content (`/code-review` fixes, 1.27.1): COMPLETE (branch `claude/step-to-step-anchoring`, agent-only)
+A `/code-review` of the ramp-pause work found three `proceed`-path defects (two pre-existing since
+Phase 1). Fixed in `sequence_runner.py`, behaviour only — `AGENT_VERSION 1.27.0 → 1.27.1`, no capability:
+- **Zero dwell for the last post-hold level.** `content_s` was the LAST hold-anchored FIRE, so
+  `on_air_end` landed exactly on it and the STOP fired the same tick — the top of a resumed crossing ramp
+  (or the bottom of a hold-anchored down-ramp) was touched, never held (the very defect fixed for `both`
+  ramps in 1.25.2 / step-anchor ends in 1.25.1). Now the forward extent = `ramp.min_on_air_duration`
+  over the hold defs re-anchored `start` (a ramp's FULL span, last dwell included) and, for the resumed
+  remainder, `offset_s + dwell_s` — `StepFire.dwell_s` is a new optional field stamped by
+  `_split_fires_at_hold` from the ramp's uniform spacing (to the previous point of the same task + tuned
+  keys).
+- **Stop-anchored window-B content resolved BEFORE `T_resume`.** `content_s` ignored stop-anchored defs,
+  so a stop-anchored down-ramp longer than the hold-anchored content (or with none) placed its points in
+  the past and `_tick` burst-fired them plus the STOP. Now `on_air_end = T_resume + forward + backward`
+  where backward = `ramp.min_on_air_duration(stop_defs)` — the off-air work lands AFTER the post-hold
+  work, which is exactly the picture the client draws (off-air floats past both groups, sum not max).
+- **`patch_on_air_end` dropped every hold/enter fire of a proceeded run** (it rebuilt `run.steps` via
+  `_resolve_steps` without `hold_at`/`enter_at`; HTTP-only, no client button). It now refuses a
+  `hold_aware` run (`ValueError` → 400: "cannot move the on-air end of a Hold run").
+Tests: `tests/test_sequence_hold_ramp_pause.py` (the resumed remainder's dwell is carried; off-air after
+a stop-anchored down-ramp with/without hold content + a hold-anchored ramp's last dwell; PATCH refused
+with the fires intact), `tests/test_sequence_hold_runtime.py::test_proceed_resolves_a_window_b_ramp`
+(off-air at last fire + hold; the bottom level is still transmitting before it). Suite 496 → 498.
+
+## Current state — a ramp ACROSS the Hold is PAUSED there and resumes after proceed: COMPLETE (branch `claude/step-to-step-anchoring`, cross-repo)
+Owner question: a ramp can be placed so its middle lies inside the Hold window; reject it, or let it
+hold? Decision (owner-approved): ALLOW it with "the pause freezes the ramp" semantics — a Hold means
+time stops, so the ramp holds the level it had reached and continues after Proceed, shifted by the
+pause's length. Before this the agent kept the whole ramp in window A and `_service_holds` waited
+for `window_a_done`, so the pause was silently DELAYED until the ramp finished (the hold offset was
+missed); validation only checked a start-anchored step's START against the Hold. Agent side:
+- **`_split_fires_at_hold(fires, hold_time)`** (new static) splits the resolved window-A fires at the
+  pause instant: at/before it → `run.steps`; after it → re-tagged `anchor="hold"`, `offset_s` = seconds
+  past the pause. `arm` (hold mode) applies it right after `_resolve_steps` and stores the remainder as
+  the new **`SequenceRun.paused_fires`** (`models.py`, persisted). Validation keeps every other window-A
+  step at/before the hold, so only ramp points ever land there; a ramp STARTING after the hold is still
+  rejected. `_service_holds` is untouched — window A now genuinely ends at the pause.
+- **`proceed`** re-bases each paused fire to `T_resume + offset_s` (so the ramp resumes where it left
+  off, shifted by the pause) and counts them toward the post-hold content that fixes `on_air_end`;
+  `paused_fires` is cleared once scheduled. **Edit-while-holding** (`req.steps`) re-derives the remainder
+  from the EDITED window A (re-resolve against T0 + `hold_at_offset_s`, split again), so retargeting
+  the crossing ramp's top while holding takes effect. **`hold_now`** is unchanged (jump-the-clock rule:
+  what would have fired before the pause is skipped, the deferred remainder still resumes).
+- **`config.py`** capability **`sequence-hold-ramp-pause`** + `AGENT_VERSION 1.26.0 → 1.27.0` (a safety
+  gate: the client refuses to save / hold-aware-arm a crossing ramp on a ≤1.26 agent, which would delay
+  the pause). The schedule/plan path compiles the Hold out (the ramp runs straight through) — no gate.
+  `argspec`/`ramp` untouched (drift guard intact). Tests: `tests/test_sequence_hold_ramp_pause.py`
+  (validation, the split incl. a point AT the pause staying in window A, edit-while-holding
+  re-derivation, and a LIVE run that freezes the mock task at 30, holds it, and reaches 40 after
+  proceed) + `test_meta_endpoint.py`. Suite 491 → 496. Client side + design note:
+  `sdr-client/docs/sequence-hold-step.md` §5.7, `sdr-client/CLAUDE.md`.
+
+## Current state — `anchor="enter"`: a window-A step timed from the Hold's ENTER instant (the pause's start): COMPLETE (branch `claude/step-to-step-anchoring`, cross-repo)
+Owner ask (v3 #4): in the client's Hold WINDOW a ramp's END should anchor to the LEFT edge (where the
+pause begins), while a start / a tune anchors to the resume edge. Agent side:
+- **`_validate_steps`** accepts `anchor="enter"`: requires a HOLD marker and `offset_s <= 0` (nothing may
+  reach INTO the pause — the run is holding then). `models.py` documents the value.
+- **`_split_hold_windows`** routes it to WINDOW A (only `hold`/`stop` go to window B) — it's known at arm.
+  **`_lead_offset`** counts `hold_off + offset_s` (an enter step may precede on-air like any lead-in).
+- **`_resolve_steps(..., enter_at=)`** — `arm` passes `enter_at = on_air_at + hold_at_offset_s` in hold
+  mode; pass 1 places a point at `enter_at + offset_s` (fire anchor `"enter"`), and **`_resolve_ramp`** uses
+  the STOP layout (`place_ramp("stop", offset_s, …)` — backward, the last level's hold ENDS at the pause +
+  offset) rebased to `enter_at`. Without `enter_at` (not a hold-aware arm) an enter step produces no fire;
+  a non-hold-aware arm with a Hold is refused anyway, and the client's schedule/plan path compiles the
+  anchor out (`collapse_hold`) before sending.
+- **`config.py`** capability **`sequence-hold-enter`** + `AGENT_VERSION 1.25.3 → 1.26.0` (a safety gate: a
+  ≤1.25 agent 400s on the unknown anchor value, so the client only sends it to a ≥1.26.0 unit).
+  `argspec`/`ramp` untouched (drift guard intact). Tests: `tests/test_sequence_hold_enter.py` (validation,
+  window split, lead offset, point + ramp placement from the pause, a hold-aware arm schedules it in
+  window A) + `test_meta_endpoint.py` asserts the capability. Suite 485 → 491. Client side:
+  `sdr-client/CLAUDE.md` "owner-testing round 3".
+
+## Current state — `SequenceStep.anchor_own_edge` pass-through (a ramp tied by its END): COMPLETE (branch `claude/step-to-step-anchoring`, cross-repo)
+Client authoring metadata for step anchors: `anchor_own_edge` ("start" default | "end") says which of
+the STEP'S OWN edges the client ties to the target (only a ramp has two — an end-tied ramp's END sits
+at the target edge and the ramp runs backward from it). The runtime NEVER reads it: `offset_s` is
+always the step's START offset from the target edge (for an end tie the client sends end offset −
+duration), so `_resolve_steps`/`_resolve_ramp` are byte-identical. Added to `models.py` so the field
+survives a store/reload round-trip (an older agent drops it; the client then reloads the ramp
+start-tied at identical timing). `config.py` bumps `AGENT_VERSION 1.25.2 → 1.25.3` (pass-through
+only, no capability). `argspec`/`ramp` untouched (drift guard intact). Tests:
+`tests/test_sequence_step_anchor.py` (round-trip + default; an end-tied ramp fires exactly like a
+start-tied one with the same `offset_s`). Suite 483 → 485. Client side: `sdr-client/CLAUDE.md`
+"owner-testing round 2".
+
+## Current state — a window-filling ("both") ramp holds its LAST level before off-air: COMPLETE (branch `claude/step-to-step-anchoring`, cross-repo)
+Owner ask: a dual-anchor ("both") ramp that fills the on-air window reached its top level exactly AT
+off-air (0 hold) — the top was only touched at the edge, never transmitted. Now it HOLDS its last level
+one dwell before off-air, like a single-anchor / "stop" ramp. Fix in the **drift-guarded**
+`ramp.resolve_ramp` window branch (mirrored byte-identically in `sdr-client/api/ramp.py`): the window is
+divided by LEVELS, not intervals — `hold = D / N` (N = number of levels), so the last value fires at
+`D − hold` and is held over `[D − hold, D]` (off-air). `place_ramp` is UNCHANGED (it already places the
+last value at `offset_s + (N−1)·hold`); `duration_s` still equals the full window `D` (the ramp still
+fills it), so `min_on_air_duration` and the client canvas geometry (`ramp_span` draws the bar across the
+window) are unaffected — only the internal fire spacing changed. Every level now gets its dwell (the
+first level is held at the start too, exactly like a single-anchor ramp). The `hold_s` sub-case honours
+the requested dwell (`N = round(D/hold_s)` levels). `config.py` bumps `AGENT_VERSION 1.25.1 → 1.25.2`
+(behaviour-only, no capability). Tests: `tests/test_ramp.py` (`test_dual_anchor_uses_window_for_duration`
+now 30 levels/29 intervals; `test_place_both_holds_the_last_level_before_the_window_end` — last fires at
+window−hold), `tests/test_sequence_ramp.py` (`test_both_anchor_ramp_fills_window` top at 50 held to 60;
+`..._respects_insets` top at 45 held to 55). Verified live: a `0→9` steps=3 ramp across a 30 s window
+reaches 9 at 22.5 s and holds it 7.5 s to off-air.
+
+## Current state — a ramp's step-anchor END edge = after the final level's hold: COMPLETE (branch `claude/step-to-step-anchoring`, cross-repo)
+Owner ask: when a step is anchored to a RAMP's `end`, the ramp's LAST level must be held its full dwell
+before the ramp is "finished" — the dependent shouldn't fire the instant the top level is reached. Root
+cause: **`_resolve_steps._record_edges`** recorded a step's end edge as `max(fire_at)`, which for a ramp
+is its LAST tune FIRE — so a dependent on the ramp's end fired at the top level's fire with ZERO hold.
+Fix (agent-only): for a `ramp` target with ≥2 fires, the end edge is now `last fire + one hold` (the
+uniform fire spacing `ts[-1] − ts[-2]`), i.e. the ramp's full-duration end where the final level's hold
+completes; a step anchored to the end fires after that hold. Every other step type (point/tune/run) is
+byte-identical (end = its single fire), and a ramp's START edge is unchanged (first fire). `config.py`
+bumps `AGENT_VERSION 1.25.0 → 1.25.1` (behaviour-only, NO new capability — part of the step-anchor
+feature already gated at ≥ 1.24.0; the bump lets OTA push it). `place_ramp`/`ramp.py`/`argspec`
+untouched (drift guard intact). Tests: `tests/test_sequence_step_anchor.py::
+test_ramp_end_edge_is_after_the_final_levels_hold` (last fire + hold + offset). **Client** (`sdr-client`):
+this REVERSES the earlier code-review "finding #1" (which had aligned the client's end edge DOWN to the
+agent's last-fire) — the client keeps `_ramp_duration` (= `last fire + hold` = full duration) at its
+three end-edge sites, so client + agent now agree at the ramp's full-duration end. Verified live: a step
+anchored to a `0→9`, steps=3, duration 6 s ramp's end (hold 1.5 s, last fire 4.5 s) fires at 6.0 s.
+
+## Current state — step anchors accept a NEGATIVE offset (fire before the referenced edge): COMPLETE (branch `claude/step-to-step-anchoring`, cross-repo)
+Owner ask (drawn on a 4-step sketch): a step anchored to another step should be able to fire BEFORE its
+target's edge, not only at/after it — exactly like a start/stop anchor's warm-up lead-in (which the owner
+already uses to start a duration task a few seconds before on-air). The earlier Phase-1 rule forbade a
+negative `offset_s` on a step anchor (the "ordering invariant"); the owner reversed that. Agent side:
+- **`sequence_runner._validate_steps`** — the `offset_s < 0` rejection for a step anchor is REMOVED (the
+  topological `_resolve_steps`/`_point_fire` already placed `edge + offset` for any sign — arithmetic;
+  only validation blocked it). The graph must still be ACYCLIC (unchanged); `end > start` within a
+  ramp/bar is still enforced by `resolve_ramp`/the duration checks. A negative-offset dependent resolves
+  before its anchor and the whole run stays globally time-ordered.
+- **`config.py`** capability **`sequence-step-anchor-negative`** + `AGENT_VERSION 1.24.0 → 1.25.0` (safety
+  gate: a ≤1.24 agent 400s on a negative step offset, so the client only sends one to a ≥1.25.0 agent).
+  `argspec`/`ramp` untouched (drift guard intact). Tests: `tests/test_sequence_step_anchor.py`
+  (`test_negative_step_offset_is_accepted_and_fires_before_the_edge` — a step anchored to another's start
+  at −3 s fires 3 s before it, still time-ordered; the old negative-reject parametrize case dropped),
+  `test_meta_endpoint.py` asserts both step-anchor capabilities. Suite 480 (count unchanged — one reject
+  case became an accept case). **Verified LIVE cross-repo** against the owner's 4-step layout (authored
+  through the client's `items_to_steps`, resolved through the agent runtime): Step1@0:30, Step2 anchored
+  to Step1 −0:30 → fires 0:00, Step3&4 anchored to Step2 +0:30 → fire 0:30 — matches the sketch exactly.
+  Client side (`sdr-client`): the dialogs/canvas author a negative step offset, the canvas routes such a
+  dependent entered from the RIGHT with a left-pointing arrow (and flips a two-sided pin's caption to the
+  clear side), and the save/arm gate enforces `sequence-step-anchor-negative`.
+
+## Current state — step-to-step anchoring Phase 1 (agent runtime): COMPLETE (branch `claude/step-to-step-anchoring`, agent side; client next)
+Owner ask: anchor a step not only to on-air/off-air/hold but to ANOTHER step's edge — e.g. a ramp
+after another ramp's end — so editing the first moves everything downstream (a dependency graph).
+Decisions: full DAG (any step → any step's start/end + offset); PHASED (Phase 1 = tunes/ramps/tasks,
+the Hold stays start-anchored; Phase 2 makes the Hold itself step-anchorable). Agent side (this):
+- **`models.py`** `SequenceStep` gains `id` (stable, client-assigned), `anchor="step"`, `anchor_step_id`,
+  `anchor_edge` ("start"|"end"); `offset_s` is the offset from that edge. Additive/back-compat.
+- **`sequence_runner._resolve_steps`** now resolves in TWO passes: pass 1 = root anchors
+  (start/stop/both/hold) exactly as before (byte-identical for any sequence with no step anchor); pass 2
+  = step-anchored steps resolved TOPOLOGICALLY — a step fires once its target's edges `(first_fire,
+  last_fire)` are known (target may be a root or an earlier step-anchored step, so chains resolve). A
+  step-anchored ramp runs forward from the edge (`_resolve_ramp` gained a `base_at`, mirroring the
+  hold case); a point step fires at `edge + offset`. No-progress remainder (unknown/cyclic target) is
+  logged + dropped (validation catches it first).
+- **`_validate_steps`** allows `anchor="step"`, requires a known `anchor_step_id` + valid `anchor_edge`,
+  rejects self-anchor, CYCLES (walk the source→target graph), a step anchor in a Hold-bearing sequence
+  (Phase 1), and — **ordering invariant (owner rule)** — a NEGATIVE `offset_s` on a step anchor (a
+  dependent never precedes its target; the offset runs FORWARD from the referenced edge, so `offset >= 0`
+  keeps a moved anchor from silently invalidating its dependents). `end > start` within a ramp/bar stays
+  enforced by `resolve_ramp` / the duration checks. The client clamps drags to keep this true; the agent
+  is the backstop for an API-/plan-authored sequence.
+- **`config.py`** capability **`sequence-step-anchor`** + `AGENT_VERSION 1.23.1 → 1.24.0` (safety gate:
+  an older agent can't resolve the new anchor). `place_ramp`/`ramp.py`/`argspec` untouched (drift guard
+  intact). Tests: `tests/test_sequence_step_anchor.py` (point end/start/chain; a ramp's end edge = its
+  last point; no-step-anchor byte-identical; validation: unknown target / self / bad edge / missing id /
+  cycle / step+Hold / negative offset). Suite 469 → 480. **NEXT — Phase 1 client** (`sdr-client`): the step-editor anchor
+  picker ("another step → its start/end + offset"), canvas geometry that positions a step-anchored item
+  at its target's edge (so dragging the target moves dependents) + round-trip (`uid↔id`), cycle
+  prevention, the `sequence-step-anchor` save/arm gate, and the temporal power walk ordered by resolved
+  time.
+
 ## Current state — run-log export: "On-air offset [s]" column (signed Δt from T0): COMPLETE (branch `claude/export-onair-offset-column`, agent-only)
 Owner ask: the spreadsheet export should carry a column right after Time saying how long BEFORE or AFTER
 T0 (the on-air instant) each step fired — from the on-air anchor only, not stop/hold. Done agent-side in

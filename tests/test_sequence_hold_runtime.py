@@ -217,10 +217,17 @@ def test_proceed_resolves_a_window_b_ramp(tmp_path, monkeypatch):
             # The ramp expanded to hold-anchored tune fires from the resume instant.
             ramp_fires = [s for s in resumed.steps if s.anchor == "hold" and s.action == "tune"]
             assert len(ramp_fires) == 3
+            # Off-air lands after the ramp's LAST level's dwell (last fire 1.0 + hold 0.5), so the
+            # bottom level is transmitted for its full hold — not cut off the instant it lands.
+            end_off = (datetime.fromisoformat(resumed.on_air_end) - t_resume).total_seconds()
+            assert abs(end_off - 1.5) < 1e-6
 
             await asyncio.sleep(0.3)
             assert (await mgr.get_params("tx"))["current"]["gain"] == 40   # ramp top at resume
-            await asyncio.sleep(1.4)
+            await asyncio.sleep(1.0)                                        # resume + 1.3 s
+            assert (await mgr.get_params("tx"))["current"]["gain"] == 20   # bottom level, still held
+            assert mgr.is_running("tx")                                     # (off-air is at 1.5 s)
+            await asyncio.sleep(1.0)                                        # resume + 2.3 s
             done = runner.get_run(rid)
             assert done.state == SequenceState.COMPLETED
             assert not mgr.is_running("tx")

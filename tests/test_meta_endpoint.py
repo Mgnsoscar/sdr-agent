@@ -30,6 +30,10 @@ def test_capabilities_advertised_and_stable():
     assert "sequence-hold-now" in cfg.AGENT_CAPABILITIES                   # Fast-Forward-to-Hold (Phase 3b)
     assert "sequence-hold-edit" in cfg.AGENT_CAPABILITIES                  # edit-while-holding (Phase 3c)
     assert "sequence-log-table" in cfg.AGENT_CAPABILITIES                  # spreadsheet run-log export
+    assert "sequence-step-anchor" in cfg.AGENT_CAPABILITIES                # step-to-step anchoring
+    assert "sequence-step-anchor-negative" in cfg.AGENT_CAPABILITIES       # negative step-anchor offset
+    assert "sequence-hold-enter" in cfg.AGENT_CAPABILITIES                 # anchor="enter" (Hold's pause edge)
+    assert "sequence-hold-ramp-pause" in cfg.AGENT_CAPABILITIES            # a ramp crossing the Hold pauses
 
 
 def test_agent_info_carries_capabilities():
