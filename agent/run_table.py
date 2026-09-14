@@ -248,12 +248,18 @@ def build_task_table(task_name: str, steps: list, spec: Optional[dict], artifact
     rows: List[list] = []
     effective: dict = {}
     last: Optional[list] = None
+    freq_dest = spec.get("calibration_freq_param")
     for s in fired:
         if s.action in ("start", "run"):
             effective.update(_args_to_params(list(getattr(s, "args", []) or []), flag_to_dest))
         if getattr(s, "params", None):
             effective.update(dict(s.params))
-        values = _row_values(cols, effective, by_dest, artifact, realize, freq_hz, rf_gate)
+        # Realize each row at the carrier in effect on THAT row (the script's CAL_FREQ_PARAM,
+        # scaled to Hz) — the frequency the script folded its gain at — so the SDR gain /
+        # attenuation columns reproduce what the unit actually commanded.
+        row_freq = tune_log.freq_hz_of(spec, effective) if freq_dest else None
+        values = _row_values(cols, effective, by_dest, artifact, realize,
+                             row_freq if row_freq is not None else freq_hz, rf_gate)
         body = values[1:]                            # everything but Time
         if last is not None and body == last:
             continue                                 # nothing changed → no new row

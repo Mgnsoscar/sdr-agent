@@ -1038,9 +1038,12 @@ def resolve(unit_doc: dict,
     ``signal_id``     the script's stable CAL_SIGNAL_ID.
     ``components``    the shared component catalog ``{id: {delta_db_by_freq, …}}`` a
                       derived plane may reference (docs/calibration-v2.md), or None.
-    ``freq_hz``       representative frequency to evaluate frequency-dependent hops at
-                      for the scalar read-outs / the v1-compat artifact curve; falls
-                      back to the signal's ``center_freq_hz``.
+    ``freq_hz``       the frequency to evaluate frequency-dependent hops at for the scalar
+                      read-outs / the v1-compat artifact curve (a task's live carrier);
+                      falls back to the signal's ``center_freq_hz``. The measurement
+                      de-embed and the source-bias zero are ALWAYS anchored at
+                      ``center_freq_hz`` — the frequency the curve was measured at — never
+                      at this fold frequency (see the de-embed step below).
 
     Raises :class:`SignalNotCalibrated` if the signal is absent, or
     :class:`CalibrationError` for any hard defect. Otherwise returns a
@@ -1078,6 +1081,14 @@ def resolve(unit_doc: dict,
     # Representative frequency: explicit arg wins, else the signal's center_freq_hz.
     rep = freq_hz if freq_hz is not None else sig.get("center_freq_hz")
     rep_freq = float(rep) if rep is not None else None
+    # The frequency the signal's curve was MEASURED at. The bench corrections — the measurement
+    # de-embed and the source-bias zero — anchor HERE, whatever frequency the caller folds the
+    # read-outs at. Anchoring them at a live carrier instead would cancel the flatness
+    # correction exactly where the tone is (the artifact would model the SDR at the carrier as
+    # if the curve had been measured there) and evaluate the bench cable at the wrong frequency.
+    # Unknown ⇒ the representative frequency (derived below when the chain needs one).
+    _cf = sig.get("center_freq_hz")
+    meas_freq = float(_cf) if _cf is not None else None
 
     # 3. build planes, attaching this signal's curves into the measured ones and
     #    resolving derived planes' hops (inline delta_db or a catalog component).
@@ -1088,14 +1099,17 @@ def resolve(unit_doc: dict,
 
     # Measurement DE-EMBED: remove any measurement-path loss (the cable/pad between a measured
     # plane and the analyzer) from that plane's curve, recovering the TRUE power at the plane.
-    # Folded into offset_db as a constant, evaluated at the signal's measured-at frequency
-    # (center_freq_hz); a constant-loss cable needs none, and an unknown frequency on a
-    # frequency-dependent table falls back to its lowest-frequency value. Done here — BEFORE the
-    # ceiling/limit inversion below — so every safety limit gauges true power, and it is a
-    # bench artifact that never reaches the artifact or the transmit path.
+    # Folded into offset_db as a constant, evaluated at the signal's MEASURED-AT frequency
+    # (center_freq_hz — NOT the caller's fold frequency, which may be a live carrier); a
+    # constant-loss cable needs none, and an unknown frequency on a frequency-dependent table
+    # falls back to its lowest-frequency value. Done here — BEFORE the ceiling/limit inversion
+    # below — so every safety limit gauges true power, and it is a bench artifact that never
+    # reaches the artifact or the transmit path.
     for _p in planes.values():
         if isinstance(_p, _Measured) and _p.deembed:
-            f = rep_freq if (rep_freq is not None or len(_p.deembed) == 1) else _p.deembed[0][0]
+            f = meas_freq if meas_freq is not None else rep_freq
+            if f is None and len(_p.deembed) > 1:
+                f = _p.deembed[0][0]
             _p.deembed_applied = _eval_table(_p.deembed, f)      # kept for an own reading (below)
             _p.offset_db -= _p.deembed_applied
             _p.deembed = None
@@ -1192,7 +1206,9 @@ def resolve(unit_doc: dict,
             gains, powers = _own_reading_curve(spec, ctx)
             dt = _deembed_table(spec.get("measurement_deembed"), components or {}, ctx)
             if dt:
-                f = rep_freq if (rep_freq is not None or len(dt) == 1) else dt[0][0]
+                f = meas_freq if meas_freq is not None else rep_freq
+                if f is None and len(dt) > 1:
+                    f = dt[0][0]
                 shift = _da - _eval_table(dt, f)
                 powers = [p + shift for p in powers]
             return gains, powers
@@ -1326,14 +1342,16 @@ def resolve(unit_doc: dict,
                 f"'center_freq_hz' and no frequency breakpoints to derive a representative "
                 f"operating frequency from")
 
-    # Normalize the source bias to the rep frequency (the frequency the curve was measured
-    # at) and attach it to the source plane. Zeroing it at the rep frequency keeps the v1
-    # rep-frequency read-outs unchanged; it only shifts the source AWAY from there. If the
-    # signal declares no rep frequency, derive one from the bias sweep so a bias-only SDR
-    # chain (no hops/limits) is still frequency-aware.
+    # Normalize the source bias to the MEASURED-AT frequency (center_freq_hz — where the curve
+    # was taken; the derived rep frequency when the signal declares none) and attach it to the
+    # source plane. Zeroing it there is what makes the curve + bias model the SDR at every OTHER
+    # frequency; zeroing at a caller's live fold frequency would erase the correction exactly at
+    # the carrier. If the signal declares no frequency, one is derived from the bias sweep so a
+    # bias-only SDR chain (no hops/limits) is still frequency-aware.
     source_bias = None
     if bias_pts is not None:
-        zero = _eval_table(bias_pts, rep_freq)            # bias(rep) — the normalization point
+        zero_at = meas_freq if meas_freq is not None else rep_freq
+        zero = _eval_table(bias_pts, zero_at)             # bias(measured-at) — the normalization point
         source_bias = [(f, d - zero) for f, d in bias_pts]
         if src_name is not None:
             planes[src_name].bias = source_bias           # fold it wherever source is the anchor

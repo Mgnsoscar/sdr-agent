@@ -27,6 +27,7 @@ from typing import Deque, Dict, List, Optional
 
 from . import config as _agentcfg   # module import; container methods use a local `cfg`
 from . import calibration as _calib
+from . import tune_log as _tune_log
 from .argspec import extract_params
 from paramkit import rf as _rf
 from .log_manager import LogManager
@@ -226,6 +227,27 @@ def _rf_on_from_command(cmd, gate: dict) -> bool:
         return _rf.is_on(last)
     default = gate.get("default")
     return _rf.is_on(default) if default is not None else True
+
+
+def _freq_from_command(cmd, spec: Optional[dict]) -> Optional[float]:
+    """The transmit frequency (Hz) a launch command sets: the script's CAL_FREQ_PARAM value on the
+    command line (else its schema default), scaled by the unit the param is declared in — i.e.
+    the frequency the script will fold its own calibration at. None when the script declares no
+    frequency param. The agent realizes everything it commands for the task (the attenuator) at
+    THIS frequency, so the SDR gain the script sets and the attenuation the agent sets belong to
+    the same realization."""
+    if not spec:
+        return None
+    dest = spec.get("calibration_freq_param")
+    if not dest:
+        return None
+    param = next((p for p in (spec.get("params") or []) if p.get("dest") == dest), None)
+    flags = {str(f) for f in ((param or {}).get("flags") or [])}
+    last = None
+    for i, a in enumerate(cmd or []):
+        if str(a) in flags and i + 1 < len(cmd):
+            last = cmd[i + 1]
+    return _tune_log.freq_hz_of(spec, {dest: last} if last is not None else {})
 
 
 def _fmt_num(v: float) -> str:
@@ -789,11 +811,32 @@ class ProcessManager:
         req = request or StartRequest()
         cmd = _build_command(proc.config.command, req.args, req.replace_args)
         await self._gate_precommand(name, cmd=cmd)
-        await proc.start(request)
+        await proc.start(self._with_launch_freq(name, req, cmd))
         status = proc.status()
         if source == "manual":
             await self._fire_task_event("task_started", status)
         return status
+
+    def _with_launch_freq(self, name: str, req: StartRequest, cmd) -> StartRequest:
+        """Carry the launch's transmit frequency (the command's CAL_FREQ_PARAM, in Hz) into the
+        task env as SDR_CAL_FREQ_HZ, so the injected artifact's v1 curve and --power bounds fold
+        at the carrier the script actually transmits at — the same frequency the frequency-aware
+        fold and the attenuator use. An explicit value (task config or request) wins."""
+        key = _agentcfg.CAL_FREQ_HZ_ENV
+        if key in self._get(name).config.env or key in (req.env_overrides or {}):
+            return req
+        f = self._freq_of_launch(name, cmd)
+        if f is None:
+            return req
+        return req.model_copy(update={"env_overrides": {**(req.env_overrides or {}), key: f"{f:.6f}"}})
+
+    def _freq_of_launch(self, name: str, cmd) -> Optional[float]:
+        """The transmit frequency (Hz) a launch command sets for `name` (see _freq_from_command)."""
+        return _freq_from_command(cmd, self._script_spec(name))
+
+    def _freq_dest(self, name: str) -> Optional[str]:
+        """The dest of `name`'s CAL_FREQ_PARAM (the live param whose tune moves the carrier)."""
+        return (self._script_spec(name) or {}).get("calibration_freq_param") or None
 
     async def stop(self, name: str, source: str = "manual") -> ProcessStatus:
         proc = self._get(name)
@@ -811,7 +854,11 @@ class ProcessManager:
         # muted (attenuators at max) when the gate is now off, else set for the effective --power.
         gate = self._rf_gate(name)
         gd = (gate.get("dest") or gate.get("name")) if gate else None
-        if "power" in values or (gd and gd in values):
+        fd = self._freq_dest(name)
+        # A retune of the CARRIER repositions them too: on a frequency-dependent chain the
+        # SDR/attenuator split the script re-folds at the new carrier differs from the one the
+        # agent commanded at the old — the two must be realized at the same frequency.
+        if "power" in values or (gd and gd in values) or (fd and fd in values):
             await self._gate_precommand(name, values=values)
         return await self._get(name).set_params(values, wait)
 
@@ -1100,10 +1147,14 @@ class ProcessManager:
         tune that toggles only one of them still positions the attenuators correctly. A task with
         no RF gate behaves exactly as before (the gate is always 'on' ⇒ set for --power)."""
         gate = self._rf_gate(name)
-        st = self._gate_state.setdefault(name, {"power": None, "rf_on": True})
+        st = self._gate_state.setdefault(name, {"power": None, "rf_on": True, "freq_hz": None})
         if cmd is not None:                              # a launch: (re)seed from the command line
             st["power"] = _power_from_command(cmd)
             st["rf_on"] = _rf_on_from_command(cmd, gate) if gate is not None else True
+            # The carrier the script folds at (its CAL_FREQ_PARAM, scaled to Hz): the components
+            # are realized at the SAME frequency as the SDR gain the script sets, else on a
+            # frequency-dependent chain the two belong to different SDR/attenuator splits.
+            st["freq_hz"] = self._freq_of_launch(name, cmd)
         else:                                            # a live tune: update only what changed
             vals = values or {}
             if "power" in vals:
@@ -1113,10 +1164,16 @@ class ProcessManager:
                 gd = gate.get("dest") or gate.get("name")
                 if gd in vals:
                     st["rf_on"] = _rf.is_on(vals.get(gd))
+            fd = self._freq_dest(name)
+            if fd and fd in vals:
+                f = _tune_log.freq_hz_of(self._script_spec(name), {fd: vals.get(fd)})
+                if f is not None:
+                    st["freq_hz"] = f
         if gate is not None and not st["rf_on"]:
-            await self._apply_active_settings(self._mute_settings(name))
+            await self._apply_active_settings(self._mute_settings(name, st.get("freq_hz")))
         else:
-            await self._apply_active_settings(self.active_settings(name, st["power"]))
+            await self._apply_active_settings(
+                self.active_settings(name, st["power"], st.get("freq_hz")))
 
     async def restart(self, name: str, request: Optional[StartRequest] = None,
                       source: str = "manual") -> ProcessStatus:
@@ -1126,7 +1183,7 @@ class ProcessManager:
         await self._gate_precommand(name, cmd=cmd)
         if proc.state == ProcessState.RUNNING:
             await proc.stop()
-        await proc.start(request)
+        await proc.start(self._with_launch_freq(name, req, cmd))
         status = proc.status()
         if source == "manual":
             await self._fire_task_event("task_restarted", status)
