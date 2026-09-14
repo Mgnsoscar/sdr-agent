@@ -581,8 +581,9 @@ sends `--power` as it always has.
   component must be realized at the SAME frequency the script folds its own SDR gain at. The
   chokepoint derives that frequency from the launch command's `CAL_FREQ_PARAM` value (else the
   param's schema default), scaled to Hz by the unit the script declares it in
-  (`tune_log.freq_hz_of`; `-Center-frequency` in MHz for the GPS scripts, `--freq` in Hz for the
-  CW tone), realizes there, and re-realizes on a live tune of that param (a carrier retune, like
+  (`tune_log.freq_hz_of`; every shipped script declares its carrier in MHz — the GPS
+  `-Center-frequency`, the CW `--freq` — and a Hz-declared param would fold right too),
+  realizes there, and re-realizes on a live tune of that param (a carrier retune, like
   a `power` / RF-gate tune, fires the one-shot). It also sets the launch env's `SDR_CAL_FREQ_HZ`
   from it (an explicit value in the task config / request wins), so the injected artifact's
   v1-compat curve + bounds fold at the carrier too, and the run-log export realizes each row at

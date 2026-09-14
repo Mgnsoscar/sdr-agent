@@ -78,8 +78,8 @@ CAL_RUN_DIR          = Path(os.environ.get("SDR_CAL_RUN_DIR", STATE_DIR / "run" 
 CAL_SIGNAL_ID_ENV    = "SDR_CAL_SIGNAL_ID"
 CALIBRATION_FILE_ENV = "SDR_CALIBRATION_FILE"
 # The task's transmit carrier in Hz. The agent DERIVES it at launch from the command's
-# CAL_FREQ_PARAM (scaled by the unit the script declares it in — MHz for the GPS scripts, Hz
-# for the CW tone) and sets it on the task env, so the injected artifact's v1-compat curve
+# CAL_FREQ_PARAM (scaled by the unit the script declares it in — MHz on every shipped script;
+# a Hz-declared one folds right too) and sets it on the task env, so the injected artifact's v1-compat curve
 # and --power bounds fold at the carrier; the attenuator the agent positions and the run-log
 # export realize at that same carrier (re-derived on a live retune of the param). A value
 # already present in the task config / request env overrides the derivation. A frequency-

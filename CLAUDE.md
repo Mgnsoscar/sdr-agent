@@ -103,7 +103,8 @@ chain (sample cal: 83.0/21.5 at 1500 MHz vs 80.5/19.5 at 1575 MHz → 2 dB off) 
 to different realizations. Fixed, behaviour only (`AGENT_VERSION 1.27.1 → 1.27.2`, no capability):
 - **`tune_log.freq_hz_of(spec, values)`** (new, shared) — a task's carrier in Hz: the script's
   `CAL_FREQ_PARAM` value (a launch's args / a tune) else its schema default, scaled by the param's
-  DECLARED unit (`-Center-frequency` MHz for GPS, `--freq` Hz for CW). None without a freq param.
+  DECLARED unit (MHz on every shipped script — GPS `-Center-frequency`, CW `--freq`; a Hz-declared
+  param folds right too). None without a freq param.
 - **`process_manager`** — `_freq_from_command(cmd, spec)` reads it off the launch command (last flag
   wins). `_gate_precommand` keeps `freq_hz` in the per-task gate state (seeded from the command,
   updated by a tune of the freq dest) and passes it to `active_settings` / `_mute_settings`;

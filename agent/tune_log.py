@@ -41,8 +41,9 @@ _HZ_PER_UNIT = {"hz": 1.0, "khz": 1e3, "mhz": 1e6, "ghz": 1e9}
 def freq_hz_of(spec: Optional[dict], values: Optional[Dict[str, Any]]) -> Optional[float]:
     """A task's transmit frequency in Hz: the script's ``CAL_FREQ_PARAM`` value in ``values``
     (``{dest: value}`` — a launch command's args or a live tune), else that param's schema
-    default, scaled by the unit the param is DECLARED in (a GPS script takes ``-Center-frequency``
-    in MHz, the CW tone ``--freq`` in Hz). This is the frequency the script itself folds its
+    default, scaled by the unit the param is DECLARED in (every shipped script declares its
+    carrier in MHz — the GPS ``-Center-frequency``, the CW ``--freq``; a Hz-declared param
+    scales by 1). This is the frequency the script itself folds its
     calibration at, so everything the agent realizes for the same task (the attenuator, the
     export's realized gain) must fold here too. None when the script declares no frequency
     param or the value is unusable."""
