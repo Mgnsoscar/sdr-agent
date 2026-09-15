@@ -395,7 +395,7 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # retune of it; the resolver anchors the measurement de-embed + source-bias zero at
 # center_freq_hz regardless of the fold frequency; calkit can fold with the components PINNED
 # (a drifting tone). Behaviour only, no capability.
-AGENT_VERSION = "1.27.2"
+AGENT_VERSION = "1.27.3"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list

@@ -7,6 +7,12 @@
 
 Both would otherwise collide on the unit's single TX channel and surface as a
 confusing UHD "device busy" crash at fire time instead of a clean rejection.
+
+Since 1.27.3 a whole day of non-overlapping scheduled plans can be armed at once, and a
+later one can still be armed while an earlier one is ON AIR: A0 exempts a task that is
+running BECAUSE of an active run (its channel span is known, so A decides), and A counts
+the stop tail after off-air (the STOP that fires 1 s later) as channel occupation, so two
+back-to-back windows collide cleanly at arm instead of at fire time.
 """
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -105,4 +111,132 @@ def test_arm_allowed_when_windows_are_disjoint(tmp_path):
             on_air_duration_s=60.0),
             (now + timedelta(seconds=180)).isoformat())
         assert len(r.list_runs()) == 2
+    asyncio.run(scenario())
+
+
+# ── 1.27.3: arming a whole day of scheduled plans ─────────────────────────────
+
+def _gated_seq(name, task="tx", lead_s=1.0, tail_s=1.0):
+    """The shape every client-authored scheduled sequence has: the task launches
+    `lead_s` before on-air (muted pre-roll) and stops `tail_s` after off-air."""
+    return CreateSequenceRequest(
+        name=name,
+        steps=[
+            SequenceStep(anchor="start", offset_s=-lead_s,
+                         action=StepAction.START, task_name=task),
+            SequenceStep(anchor="stop", offset_s=tail_s,
+                         action=StepAction.STOP, task_name=task),
+        ])
+
+
+async def _arm_window(r, seq, now, start_s, end_s):
+    return await r.arm(seq.id, ArmSequenceRequest(
+        on_air_at=(now + timedelta(seconds=start_s)).isoformat(),
+        on_air_duration_s=float(end_s - start_s)),
+        (now + timedelta(seconds=end_s)).isoformat())
+
+
+def _put_on_air(r, mgr, run):
+    """Simulate the run's launch having fired: the task is running BECAUSE of it."""
+    run = r._runs[run.id]
+    run.state = run.state.__class__.RUNNING
+    launch = next(s for s in run.steps if s.action == "start")
+    launch.fired_actual = datetime.now(timezone.utc).isoformat()
+    mgr.running.add(launch.task_name)
+
+
+def test_channel_end_is_the_later_of_on_air_end_and_the_last_fire(tmp_path):
+    from agent.models import StepFire
+    end = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
+    tail = StepFire(anchor="stop", offset_s=1.0, action="stop", task_name="tx",
+                    fire_at=(end + timedelta(seconds=1)).isoformat())
+    lead = StepFire(anchor="start", offset_s=-1.0, action="start", task_name="tx",
+                    fire_at=(end - timedelta(seconds=61)).isoformat())
+    assert SequenceRunner._channel_end(end, [lead, tail]) == end + timedelta(seconds=1)
+    assert SequenceRunner._channel_end(end, [lead]) == end          # no tail → on_air_end
+    assert SequenceRunner._channel_end(None, [lead, tail]) is None  # open-ended → +∞
+
+
+def test_later_window_arms_while_an_earlier_run_is_on_air(tmp_path):
+    """The owner's case: four plans in the schedule, the first already transmitting —
+    arming the next (disjoint) one must not be refused as 'task already running'."""
+    async def scenario():
+        mgr, r = _runner(tmp_path, ["tx"])
+        s1 = await r.create_sequence(_gated_seq("s1"))
+        s2 = await r.create_sequence(_gated_seq("s2"))
+        now = datetime.now(timezone.utc)
+        run1 = await _arm_window(r, s1, now, 30, 90)
+        _put_on_air(r, mgr, run1)
+        assert mgr.is_running("tx")
+        run2 = await _arm_window(r, s2, now, 120, 180)      # disjoint → allowed
+        states = {x.id: x.state for x in r.list_runs()}
+        assert states[run2.id].value == "armed" and len(states) == 2
+    asyncio.run(scenario())
+
+
+def test_overlapping_window_is_still_refused_while_on_air(tmp_path):
+    async def scenario():
+        mgr, r = _runner(tmp_path, ["tx"])
+        s1 = await r.create_sequence(_gated_seq("s1"))
+        s2 = await r.create_sequence(_gated_seq("s2"))
+        now = datetime.now(timezone.utc)
+        run1 = await _arm_window(r, s1, now, 30, 90)
+        _put_on_air(r, mgr, run1)
+        with pytest.raises(ValueError, match="overlaps run"):
+            await _arm_window(r, s2, now, 60, 120)
+        assert len(r.list_runs()) == 1
+    asyncio.run(scenario())
+
+
+def test_a_task_running_outside_any_run_is_still_refused(tmp_path):
+    """The exemption is only for a task the ACTIVE run itself launched: a run that is
+    merely armed (nothing fired) does not vouch for a hand-started task, and neither
+    does a run that already STOPPED the task (a later hand restart is someone else's)."""
+    async def scenario():
+        mgr, r = _runner(tmp_path, ["tx"])
+        s1 = await r.create_sequence(_gated_seq("s1"))
+        s2 = await r.create_sequence(_gated_seq("s2"))
+        now = datetime.now(timezone.utc)
+        run1 = await _arm_window(r, s1, now, 30, 90)
+        mgr.running.add("tx")                               # started by hand, run1 only ARMED
+        with pytest.raises(ValueError, match="already running"):
+            await _arm_window(r, s2, now, 120, 180)
+        # …and once run1 has launched AND stopped the task, a running 'tx' is not its own.
+        _put_on_air(r, mgr, run1)
+        stop = next(s for s in r._runs[run1.id].steps if s.action == "stop")
+        stop.fired_actual = datetime.now(timezone.utc).isoformat()
+        with pytest.raises(ValueError, match="already running"):
+            await _arm_window(r, s2, now, 120, 180)
+        assert len(r.list_runs()) == 1
+    asyncio.run(scenario())
+
+
+def test_back_to_back_gated_windows_collide_at_arm_and_need_a_gap(tmp_path):
+    """s1 stops its task 1 s AFTER off-air; s2 launches 1 s BEFORE on-air. Windows that
+    touch (or leave less than lead-in + tail between them) would have s1's STOP land on
+    s2's freshly launched task — refused at arm, with the reason; a wider gap arms."""
+    async def scenario():
+        mgr, r = _runner(tmp_path, ["tx"])
+        s1 = await r.create_sequence(_gated_seq("s1"))
+        s2 = await r.create_sequence(_gated_seq("s2"))
+        s3 = await r.create_sequence(_gated_seq("s3"))
+        now = datetime.now(timezone.utc)
+        await _arm_window(r, s1, now, 30, 90)
+        with pytest.raises(ValueError, match="overlaps run.*stop tail"):
+            await _arm_window(r, s2, now, 90, 150)          # touching
+        with pytest.raises(ValueError, match="overlaps run"):
+            await _arm_window(r, s2, now, 91, 151)          # 1 s gap: STOP@91 vs START@90
+        await _arm_window(r, s3, now, 92, 152)              # lead-in + tail = 2 s gap → ok
+        assert len(r.list_runs()) == 2
+    asyncio.run(scenario())
+
+
+def test_a_whole_day_of_disjoint_plans_arms_in_one_go(tmp_path):
+    async def scenario():
+        mgr, r = _runner(tmp_path, ["tx"])
+        seqs = [await r.create_sequence(_gated_seq(f"plan{i}")) for i in range(4)]
+        now = datetime.now(timezone.utc)
+        for i, seq in enumerate(seqs):                      # 4 disjoint hour-long windows
+            await _arm_window(r, seq, now, 60 + i * 3900, 60 + i * 3900 + 3600)
+        assert sorted(x.sequence_name for x in r.list_runs()) == [f"plan{i}" for i in range(4)]
     asyncio.run(scenario())

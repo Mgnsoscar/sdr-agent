@@ -90,6 +90,33 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — arm a whole day of scheduled plans at once (1.27.3): COMPLETE (branch `claude/arm-multiple-scheduled-plans`, stacked on 1.27.2; client "Arm all" in `sdr-client`)
+Owner ask: four non-overlapping plans in the schedule; arm ALL of them and have them start/stop on
+their own. Scheduled runs already fire at absolute times, so the blockers were the two arm guards in
+`sequence_runner.arm` (both refused a LATER, disjoint window):
+- **A0 ("task(s) already running")** fired whenever the plan's task was on air — even when it was on
+  air BECAUSE of an earlier scheduled run whose window ends before the new one. New
+  **`_tasks_owned_by_active_runs()`**: task names an ARMED/RUNNING/HOLDING run has LAUNCHED (a fired
+  `start`/`run`, not `"skipped"`) and not yet STOPPED (no fired `stop` after it). A0 now exempts those
+  (guard A decides — the run's channel span is known); a task started by hand / by another owner, a
+  merely-armed run's task, or a task the run already stopped and someone restarted, is still refused.
+- **A (window overlap)** counted the launch lead-in (`earliest_fire`, e.g. the START 1 s before on-air)
+  but NOT the stop tail (the STOP 1 s after off-air), so two back-to-back client-authored windows
+  (`START −1 s` / `STOP +1 s`) were refused when touching, yet ACCEPTED with a 1 s gap — where run 1's
+  STOP would land on run 2's freshly launched task. New static **`_channel_end(on_air_end, fires)`** =
+  `max(on_air_end, last fire_at)` (None when open-ended); `_active_span` (now a classmethod) uses it
+  for every active run and `arm` uses it for the new run's `new_end`, so a gap of lead-in + tail is
+  required and the refusal names it (message still carries `overlaps run <id>`, plus "this run would
+  occupy the channel HH:MM:SS–HH:MM:SS UTC, counting its launch lead-in … and its stop tail …; leave
+  a gap").
+`config.py` bumps `AGENT_VERSION 1.27.2 → 1.27.3` (behaviour only, NO capability — an older agent just
+refuses the later arm the old way; the client's "Arm all" works against any agent, one entry at a time).
+`argspec`/`ramp` untouched (drift guard intact). Tests: `tests/test_arm_guards.py` (`_channel_end`; a
+later disjoint window arms while an earlier run is ON AIR; an overlapping one is still refused; a task
+running outside any run / after its run stopped it is still refused; touching + 1 s-gap windows collide
+with the tail reason, a 2 s gap arms; four disjoint hour windows arm in one go). Suite 513 → 519.
+Client side: `sdr-client/ui/timeline_tab.py` "Arm all (N)" on the schedule tab (see its CLAUDE.md).
+
 ## Current state — the attenuator is realized at the task's CARRIER, not `center_freq_hz` (1.27.2): COMPLETE (branch `claude/active-freq-consistency`, agent + scripts)
 Owner report: "suddenly the calibrations I have done are off by about the cable loss of the cable I
 used while measuring" — after adding frequency-dependent cable tables to the chain (many copies of

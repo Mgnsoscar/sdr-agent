@@ -417,13 +417,48 @@ class SequenceRunner:
         return min(leads, default=0.0)
 
     @staticmethod
-    def _active_span(run: SequenceRun) -> Tuple[datetime, Optional[datetime]]:
+    def _channel_end(on_air_end: Optional[datetime], fires: List[StepFire]) -> Optional[datetime]:
+        """When a run RELEASES the TX channel: its on-air end or its last scheduled fire,
+        whichever is later. A stop-anchored tail (the STOP that lands 1 s after off-air,
+        an RF-off tune) still drives the task after on_air_end, so a run that started at
+        exactly that instant would collide with it. None (+∞) for an open-ended run."""
+        if on_air_end is None:
+            return None
+        tails = [_parse(s.fire_at) for s in fires if getattr(s, "fire_at", None)]
+        return max([on_air_end] + tails)
+
+    @classmethod
+    def _active_span(cls, run: SequenceRun) -> Tuple[datetime, Optional[datetime]]:
         """The wall-clock span a run occupies the TX channel: from its earliest fire
-        (warm-up lead-in) to on_air_end. An open-ended run has no end (+∞)."""
+        (warm-up lead-in) to its channel end (on_air_end or a later stop tail — see
+        `_channel_end`). An open-ended run has no end (+∞)."""
         fire_times = [_parse(s.fire_at) for s in run.steps if getattr(s, "fire_at", None)]
         start = min(fire_times) if fire_times else _parse(run.on_air_at)
-        end = _parse(run.on_air_end) if run.on_air_end else None
+        end = cls._channel_end(_parse(run.on_air_end) if run.on_air_end else None, run.steps)
         return start, end
+
+    def _tasks_owned_by_active_runs(self) -> set:
+        """Task names an ARMED/RUNNING/HOLDING run has launched (a fired START/RUN) and not
+        yet stopped (no fired STOP after it). Such a task is on air BECAUSE of a scheduled
+        run — a later window on the same task is a matter of the overlap check, not the
+        "already running" refusal (which exists for a task started by hand or by some
+        other owner, whose end nobody knows)."""
+        owned: set = set()
+        for run in self._runs.values():
+            if run.state not in _ACTIVE_STATES:
+                continue
+            launched: set = set()
+            stopped: set = set()
+            for s in run.steps:
+                if not s.fired_actual or s.fired_actual == "skipped":
+                    continue
+                if s.action in ("start", "run"):
+                    launched.add(s.task_name)
+                    stopped.discard(s.task_name)      # a later launch re-owns it
+                elif s.action == "stop":
+                    stopped.add(s.task_name)
+            owned |= launched - stopped
+        return owned
 
     @staticmethod
     def _split_hold_windows(
@@ -813,31 +848,43 @@ class SequenceRunner:
         )
 
         async with self._lock:
-            # A0. Don't arm on top of a task that's already running (started by hand,
-            # by a scheduled event, or by another sequence). This unit has one TX
-            # channel; arming would only collide with it at fire time.
+            # A0. Don't arm on top of a task that's already running under an owner whose
+            # end nobody knows (started by hand, by a scheduled event, by another agent
+            # client). This unit has one TX channel; arming would only collide with it at
+            # fire time. A task on air BECAUSE of an active sequence run is exempt: that
+            # run's channel span is known, so guard A below decides — which is what lets
+            # a whole day of non-overlapping scheduled plans be armed while the first one
+            # is already transmitting.
+            owned = self._tasks_owned_by_active_runs()
             already = sorted({s.task_name for s in eff_steps
-                              if self._manager.is_running(s.task_name)})
+                              if s.task_name not in owned
+                              and self._manager.is_running(s.task_name)})
             if already:
                 raise ValueError(
                     "cannot arm: task(s) already running on this unit: "
                     + ", ".join(f"'{t}'" for t in already))
 
-            # A. Don't arm a run whose active span overlaps another armed/running/holding
+            # A. Don't arm a run whose channel span overlaps another armed/running/holding
             # run on this unit — overlapping windows would both drive the single TX channel
             # and produce confusing "device busy" crashes instead of a clean rejection.
+            # The span runs from the earliest fire (the launch lead-in before on-air) to
+            # the LAST fire or on_air_end, whichever is later (the STOP tail after off-air),
+            # so two back-to-back windows need a gap of lead-in + tail between them.
             # A HOLDING run is open-ended (spans to +∞), so a new arm can't overlap it.
             new_start = earliest_fire
-            new_end = on_air_end   # None ⇒ open-ended ⇒ +∞
+            new_end = None if open_ended else self._channel_end(on_air_end, steps)
             for other in self._runs.values():
                 if other.state not in _ACTIVE_STATES:
                     continue
                 o_start, o_end = self._active_span(other)
                 if _spans_overlap(new_start, new_end, o_start, o_end):
                     win = _fmt_window(o_start, o_end)
+                    mine = _fmt_window(new_start, new_end)
                     raise ValueError(
                         f"cannot arm: on-air window overlaps run {other.id} "
-                        f"('{other.sequence_name}', {win}) already on this unit")
+                        f"('{other.sequence_name}', {win}) already on this unit — this run "
+                        f"would occupy the channel {mine}, counting its launch lead-in "
+                        f"before on-air and its stop tail after off-air; leave a gap")
 
             self._runs[run.id] = run
             self._persist_runs()
