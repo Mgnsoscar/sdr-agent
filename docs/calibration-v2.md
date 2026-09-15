@@ -225,8 +225,9 @@ so there is no version gate anywhere. As implemented:
 ```
 
 The agent's representative frequency (for folding `curve` / bounds) is the task's
-`SDR_CAL_FREQ_HZ` env when set (the client sources it from the script's
-`CAL_FREQ_PARAM`), else the signal's `center_freq_hz`, else — when the signal declares
+`SDR_CAL_FREQ_HZ` env when set (since agent 1.27.2 the agent DERIVES it at launch from the
+command's `CAL_FREQ_PARAM` value, scaled to Hz by the param's declared unit; an explicit task
+env value still wins), else the signal's `center_freq_hz`, else — when the signal declares
 none on a frequency-dependent chain — a representative one the resolver derives (the
 tightest-ceiling breakpoint under a frequency-dependent safety limit, else the breakpoint
 midpoint). Either way the artifact carries the chosen `center_freq_hz`, so a v1 script
@@ -461,9 +462,13 @@ Each stage is shippable and leaves the system working (v1 docs valid throughout)
     exceeds the achievable range there. The live-tune dialog re-folds and warns the same way
     as you tune a running task. Covered by `tests/test_sequence_effective_values.py` and the
     fold tests above.
-  - *Remaining:* the client setting `SDR_CAL_FREQ_HZ` on a task from the script's
-    `CAL_FREQ_PARAM` (task-creation wiring) — with the script now reading its own `--freq`,
-    this only pins the agent's representative fold for the v1-compat scalar read-outs.
+  - *Done (agent 1.27.2, agent-side — no client wiring needed):* the agent sets
+    `SDR_CAL_FREQ_HZ` on the launch env from the command's `CAL_FREQ_PARAM` (§12.3), so the
+    v1-compat fold, the auto-commanded attenuator and the export all use the carrier.
+    Independently, the resolver anchors the measurement de-embed and the source-bias zero at
+    the signal's `center_freq_hz` whatever `freq_hz` it folds the read-outs at (before, an
+    explicit fold frequency re-zeroed the flatness at the carrier — erasing the correction
+    exactly where the tone was — and evaluated the bench cable there).
 
 
 ## 12. Active components — a task-controlled gain/attenuation stage
@@ -571,6 +576,23 @@ sends `--power` as it always has.
   the attenuator's `--port` (and any other fixed param) rides along. Because
   sequence steps and ramps go through these same methods (`start` / `run_oneshot` /
   `set_params`), they are covered with no sequence-specific code.
+- **Realized at the task's CARRIER (agent ≥ 1.27.2).** On a frequency-dependent chain the
+  SDR/attenuator split the realization picks (closest exact hit) jumps with frequency, so the
+  component must be realized at the SAME frequency the script folds its own SDR gain at. The
+  chokepoint derives that frequency from the launch command's `CAL_FREQ_PARAM` value (else the
+  param's schema default), scaled to Hz by the unit the script declares it in
+  (`tune_log.freq_hz_of`; every shipped script declares its carrier in MHz — the GPS
+  `-Center-frequency`, the CW `--freq` — and a Hz-declared param would fold right too),
+  realizes there, and re-realizes on a live tune of that param (a carrier retune, like
+  a `power` / RF-gate tune, fires the one-shot). It also sets the launch env's `SDR_CAL_FREQ_HZ`
+  from it (an explicit value in the task config / request wins), so the injected artifact's
+  v1-compat curve + bounds fold at the carrier too, and the run-log export realizes each row at
+  the carrier in effect on that row. Before 1.27.2 the component was realized at the signal's
+  `center_freq_hz` (nothing ever set the env), so a task on a carrier away from it delivered
+  power off by whole attenuator steps — "off by about a cable loss" on a chain with
+  frequency-dependent cable tables. A script whose frequency then moves WITHOUT the agent (the
+  CW drift) must not re-realize either: `PowerMap.pinned_applied` + `gain_for_power(...,
+  applied_db=)` fold the SDR gain with the component pinned where the agent set it.
 - **Safety / failure.** A one-shot that fails or times out (`_ACTIVE_SET_TIMEOUT_S`) is logged
   and the transmit still proceeds — the script clamps its own SDR gain to a safe range
   regardless. (A future option could make an attenuator-set failure refuse the transmit.)

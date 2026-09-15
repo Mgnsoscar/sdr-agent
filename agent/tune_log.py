@@ -34,6 +34,34 @@ from paramkit import rf as _rf
 # zeroed, attenuators at max), so there is no meaningful emitted power to fold into quantities.
 _MUTED_POWER_ROW = ("—", "", "RF off — muted")
 
+# Frequency units a script may declare its CAL_FREQ_PARAM in (paramkit ``unit=``), to Hz.
+_HZ_PER_UNIT = {"hz": 1.0, "khz": 1e3, "mhz": 1e6, "ghz": 1e9}
+
+
+def freq_hz_of(spec: Optional[dict], values: Optional[Dict[str, Any]]) -> Optional[float]:
+    """A task's transmit frequency in Hz: the script's ``CAL_FREQ_PARAM`` value in ``values``
+    (``{dest: value}`` — a launch command's args or a live tune), else that param's schema
+    default, scaled by the unit the param is DECLARED in (every shipped script declares its
+    carrier in MHz — the GPS ``-Center-frequency``, the CW ``--freq``; a Hz-declared param
+    scales by 1). This is the frequency the script itself folds its
+    calibration at, so everything the agent realizes for the same task (the attenuator, the
+    export's realized gain) must fold here too. None when the script declares no frequency
+    param or the value is unusable."""
+    if not spec:
+        return None
+    dest = spec.get("calibration_freq_param")
+    if not dest:
+        return None
+    param = next((p for p in (spec.get("params") or []) if p.get("dest") == dest), None)
+    raw = (values or {}).get(dest)
+    if raw is None and param is not None:
+        raw = param.get("default")
+    v = _num(raw)
+    if v is None:
+        return None
+    unit = str((param or {}).get("unit") or "hz").strip().lower()
+    return v * _HZ_PER_UNIT.get(unit, 1.0)
+
 
 # ── Small derived-formula evaluator (mirrors sdr-client state/power_fold.eval_formula) ──
 # The scripts' derived fields (a passband bandwidth from the sidelobe count, an equivalent-

@@ -90,6 +90,80 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — arm a whole day of scheduled plans at once (1.27.3): COMPLETE (branch `claude/arm-multiple-scheduled-plans`, stacked on 1.27.2; client "Arm all" in `sdr-client`)
+Owner ask: four non-overlapping plans in the schedule; arm ALL of them and have them start/stop on
+their own. Scheduled runs already fire at absolute times, so the blockers were the two arm guards in
+`sequence_runner.arm` (both refused a LATER, disjoint window):
+- **A0 ("task(s) already running")** fired whenever the plan's task was on air — even when it was on
+  air BECAUSE of an earlier scheduled run whose window ends before the new one. New
+  **`_tasks_owned_by_active_runs()`**: task names an ARMED/RUNNING/HOLDING run has LAUNCHED (a fired
+  `start`/`run`, not `"skipped"`) and not yet STOPPED (no fired `stop` after it). A0 now exempts those
+  (guard A decides — the run's channel span is known); a task started by hand / by another owner, a
+  merely-armed run's task, or a task the run already stopped and someone restarted, is still refused.
+- **A (window overlap)** counted the launch lead-in (`earliest_fire`, e.g. the START 1 s before on-air)
+  but NOT the stop tail (the STOP 1 s after off-air), so two back-to-back client-authored windows
+  (`START −1 s` / `STOP +1 s`) were refused when touching, yet ACCEPTED with a 1 s gap — where run 1's
+  STOP would land on run 2's freshly launched task. New static **`_channel_end(on_air_end, fires)`** =
+  `max(on_air_end, last fire_at)` (None when open-ended); `_active_span` (now a classmethod) uses it
+  for every active run and `arm` uses it for the new run's `new_end`, so a gap of lead-in + tail is
+  required and the refusal names it (message still carries `overlaps run <id>`, plus "this run would
+  occupy the channel HH:MM:SS–HH:MM:SS UTC, counting its launch lead-in … and its stop tail …; leave
+  a gap").
+`config.py` bumps `AGENT_VERSION 1.27.2 → 1.27.3` (behaviour only, NO capability — an older agent just
+refuses the later arm the old way; the client's "Arm all" works against any agent, one entry at a time).
+`argspec`/`ramp` untouched (drift guard intact). Tests: `tests/test_arm_guards.py` (`_channel_end`; a
+later disjoint window arms while an earlier run is ON AIR; an overlapping one is still refused; a task
+running outside any run / after its run stopped it is still refused; touching + 1 s-gap windows collide
+with the tail reason, a 2 s gap arms; four disjoint hour windows arm in one go). Suite 513 → 519.
+Client side: `sdr-client/ui/timeline_tab.py` "Arm all (N)" on the schedule tab (see its CLAUDE.md).
+
+## Current state — the attenuator is realized at the task's CARRIER, not `center_freq_hz` (1.27.2): COMPLETE (branch `claude/active-freq-consistency`, agent + scripts)
+Owner report: "suddenly the calibrations I have done are off by about the cable loss of the cable I
+used while measuring" — after adding frequency-dependent cable tables to the chain (many copies of
+the same cable, all but one bypassed — bypass verified irrelevant). De-embed math, bypass and the
+panel round-trip all checked out numerically; the real cause was a SPLIT mismatch on a chain with a
+programmable attenuator: the agent realized the attenuator at the signal's `center_freq_hz`
+(`_gate_precommand` → `active_settings(name, power)` with NO frequency; nothing ever set
+`SDR_CAL_FREQ_HZ`), while the script folded its SDR gain at the LIVE carrier. `AchievableGrid.realize`
+picks the closest exact hit, so the SDR/attenuator split jumps with frequency on a frequency-dependent
+chain (sample cal: 83.0/21.5 at 1500 MHz vs 80.5/19.5 at 1575 MHz → 2 dB off) — the two halves belonged
+to different realizations. Fixed, behaviour only (`AGENT_VERSION 1.27.1 → 1.27.2`, no capability):
+- **`tune_log.freq_hz_of(spec, values)`** (new, shared) — a task's carrier in Hz: the script's
+  `CAL_FREQ_PARAM` value (a launch's args / a tune) else its schema default, scaled by the param's
+  DECLARED unit (MHz on every shipped script — GPS `-Center-frequency`, CW `--freq`; a Hz-declared
+  param folds right too). None without a freq param.
+- **`process_manager`** — `_freq_from_command(cmd, spec)` reads it off the launch command (last flag
+  wins). `_gate_precommand` keeps `freq_hz` in the per-task gate state (seeded from the command,
+  updated by a tune of the freq dest) and passes it to `active_settings` / `_mute_settings`;
+  `set_params` fires the precommand on a CARRIER retune too (not only power / RF gate). `start` /
+  `restart` go through `_with_launch_freq`: the launch env gets `SDR_CAL_FREQ_HZ` (an explicit task
+  config / request value wins) so the injected artifact's v1 curve + bounds fold at the carrier.
+- **`run_table.build_task_table`** realizes each row at the carrier in effect on THAT row (the
+  `power_realizer` closure already took a `freq`), so the exported SDR gain / attenuation columns
+  reproduce what the unit commanded.
+- **`calibration.resolve`** (latent second bug) — the measurement de-embed and the source-bias ZERO now
+  anchor at the signal's `center_freq_hz` (`meas_freq`) whatever `freq_hz` the caller folds the
+  read-outs at. Before, an explicit fold frequency re-zeroed the flatness AT the carrier (erasing the
+  correction exactly where the tone was) and evaluated the bench cable there — so an artifact resolved
+  at the carrier modelled the SDR differently from one resolved without, and `realize` split
+  differently. Now both agree at every frequency.
+- **`paramkit/calkit.PowerMap`** — `has_actives`, `pinned_applied(power, freq)` (the realization's
+  total applied dB — what the agent commands) and `gain_for_power` / `power_for_gain(...,
+  applied_db=)` fold the SDR gain with the components PINNED there, for a script whose frequency
+  moves WITHOUT the agent (`sdr-scripts` `cw_drift_tx.py` pins at the start carrier; re-realizing per
+  frequency would hop the assumed attenuation by whole steps while the hardware stayed put). A no-op
+  without actives. Verified: the pinned fold reproduces `realize` exactly (0 dB) across insertion
+  loss / engagement / gain steps.
+`argspec`/`ramp` untouched (drift guard intact); no client change (it never set the env). Tests:
+`tests/test_active_freq_consistency.py` (unit scaling; the command carrier; the split genuinely
+moves; a launch positions the attenuator at the command's carrier, a carrier retune repositions it,
+power / RF tunes keep it; the launch env carries the carrier and an explicit env wins; the export
+realizes per row), `tests/test_calibration_freq_anchor.py` (bias zero + de-embed stay at
+`center_freq_hz`; the artifact models the SDR at a carrier identically from either resolve; the split
+no longer depends on the fold frequency), `tests/test_calkit_pinned.py`. Suite 498 → 513. Docs:
+`docs/calibration-v2.md` §12.3 + §9/§11 notes. **Rollout:** OTA-push 1.27.2; no re-calibration and
+no client change needed. The drift script's pin needs paramkit ≥ 1.27.2 on the unit.
+
 ## Current state — proceed's off-air lands after the WHOLE post-hold content (`/code-review` fixes, 1.27.1): COMPLETE (branch `claude/step-to-step-anchoring`, agent-only)
 A `/code-review` of the ramp-pause work found three `proceed`-path defects (two pre-existing since
 Phase 1). Fixed in `sequence_runner.py`, behaviour only — `AGENT_VERSION 1.27.0 → 1.27.1`, no capability:

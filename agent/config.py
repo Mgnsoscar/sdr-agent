@@ -77,10 +77,13 @@ CAL_RUN_DIR          = Path(os.environ.get("SDR_CAL_RUN_DIR", STATE_DIR / "run" 
 # maps --power (dBm) → gain, falling back to its baked defaults if the var is absent.
 CAL_SIGNAL_ID_ENV    = "SDR_CAL_SIGNAL_ID"
 CALIBRATION_FILE_ENV = "SDR_CALIBRATION_FILE"
-# Optional: the task's transmit centre frequency in Hz. When set (the client sources
-# it from the script's CAL_FREQ_PARAM), the agent folds the artifact's v1-compat curve
-# and scalar bounds at this frequency; a frequency-aware script still re-folds per its
-# live frequency from the artifact's passive_hops. See docs/calibration-v2.md.
+# The task's transmit carrier in Hz. The agent DERIVES it at launch from the command's
+# CAL_FREQ_PARAM (scaled by the unit the script declares it in — MHz on every shipped script;
+# a Hz-declared one folds right too) and sets it on the task env, so the injected artifact's v1-compat curve
+# and --power bounds fold at the carrier; the attenuator the agent positions and the run-log
+# export realize at that same carrier (re-derived on a live retune of the param). A value
+# already present in the task config / request env overrides the derivation. A frequency-
+# aware script still re-folds per its live frequency from the artifact's passive_hops.
 CAL_FREQ_HZ_ENV      = "SDR_CAL_FREQ_HZ"
 
 # ── OTA update layout ─────────────────────────────────────────────────────────
@@ -384,7 +387,15 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # and the stop-anchored (off-air) steps' backward extent is added (a stop-anchored down-ramp used to
 # resolve BEFORE T_resume and burst-fire); PATCH on-air-end refuses a Hold-aware run (it rebuilt the
 # fires without the Hold's bases and dropped every hold/enter fire). Behaviour only, no capability.
-AGENT_VERSION = "1.27.1"
+# 1.27.2: calibrated power on a FREQUENCY-DEPENDENT chain with an attenuator was off by whole
+# attenuator steps whenever the carrier differed from the signal's center_freq_hz — the agent
+# positioned the attenuator at center_freq_hz while the script folded its SDR gain at the
+# carrier, and the SDR/attenuator split the realization picks jumps with frequency. The agent
+# now realizes at the launch command's carrier (CAL_FREQ_PARAM → Hz) and re-realizes on a live
+# retune of it; the resolver anchors the measurement de-embed + source-bias zero at
+# center_freq_hz regardless of the fold frequency; calkit can fold with the components PINNED
+# (a drifting tone). Behaviour only, no capability.
+AGENT_VERSION = "1.27.3"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list

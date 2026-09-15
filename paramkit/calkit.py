@@ -320,37 +320,65 @@ class PowerMap:
         dr = self._reported_shift(params)
         return self._achievable(freq, params)[0].snap(float(delivered_dbm) - dr) + dr
 
+    @property
+    def has_actives(self) -> bool:
+        """Whether the chain carries programmable (active) components the agent commands."""
+        return bool(self._actives)
+
+    def pinned_applied(self, delivered_dbm: float, freq: Optional[float] = None,
+                       params: Optional[dict] = None) -> Optional[float]:
+        """The active components' total applied gain (signed dB, negative = attenuation) the
+        SDR-first realization picks for ``delivered_dbm`` at ``freq`` — what the agent commands
+        the components to at launch / on a tune. None without active components. The SDR/
+        component split is chosen ONCE, by the party that commands the components (the agent, at
+        the launch carrier); a script whose frequency then moves WITHOUT the agent's knowledge (a
+        drift) must NOT re-realize — it folds its SDR gain with the components pinned here
+        (``gain_for_power(..., applied_db=…)``), else the split it assumes and the one physically
+        set drift apart by whole attenuator steps."""
+        if not self._actives or not self.has_absolute:
+            return None
+        res = self.realize(float(delivered_dbm), freq, params)
+        return float(sum(float(s["applied_db"]) for s in res["settings"]))
+
     # ── the two functions the script calls ──────────────────────────────────────
     def gain_for_power(self, delivered_dbm: float, freq: Optional[float] = None,
-                       params: Optional[dict] = None) -> float:
+                       params: Optional[dict] = None, applied_db: Optional[float] = None) -> float:
         """Commanded SDR gain (dB) for a requested delivered power at ``freq`` (defaults to
         the artifact's representative frequency), clamped to [min, ceiling(freq)]. The power
         is in the REPORTED quantity; a reported bridge (evaluated at ``params``) converts it
         to the operating quantity before inverting the curve. With an active component the
         gain comes from the SDR-first realization (the SDR carries the signal; the component
         fills below the engagement threshold) — the host commands the component to the
-        matching value so together they deliver the requested power."""
+        matching value so together they deliver the requested power. Pass ``applied_db`` (the
+        components' total applied gain, from :meth:`pinned_applied`) to fold the SDR gain with
+        the components PINNED there instead of re-realizing — for a script whose frequency moves
+        without the agent re-commanding the components."""
         if not self.has_absolute:
             raise NoAbsoluteScale(
                 "this signal is not calibrated on this unit — absolute --power (dBm) has "
                 "no meaning here; provide --gain (raw dB) instead")
         f = self._eff(freq)
-        if self._actives:
+        if self._actives and applied_db is None:
             return self.realize(float(delivered_dbm), freq, params)["sdr_gain_db"]
+        pin = float(applied_db) if (applied_db is not None and self._actives) else 0.0
         op_power = float(delivered_dbm) - self._reported_shift(params)
-        g = self._invert(op_power - self._op_delta(f) - self._source_bias_at(f))
+        g = self._invert(op_power - self._op_delta(f) - self._source_bias_at(f) - pin)
         return self._snap(g, f, params)
 
     def power_for_gain(self, gain_db: float, freq: Optional[float] = None,
-                       params: Optional[dict] = None) -> float:
+                       params: Optional[dict] = None, applied_db: Optional[float] = None) -> float:
         """Delivered power (dBm) at the operating plane for an (actual) gain at ``freq``, in
         the REPORTED quantity (the reported bridge is applied on top). The gain is snapped to
-        the hardware grid first, so the reported power reflects what the SDR really settles on."""
+        the hardware grid first, so the reported power reflects what the SDR really settles on.
+        ``applied_db`` adds the active components' pinned applied gain (see gain_for_power);
+        without it the components are taken at rest."""
         if not self.has_absolute:
             raise NoAbsoluteScale("uncalibrated: no absolute power scale for this signal")
         f = self._eff(freq)
         g = self._snap(float(gain_db), f, params)
-        op = _interp_ex(g, self._gains, self._powers, self._extrapolate) + self._op_delta(f) + self._source_bias_at(f)
+        pin = float(applied_db) if (applied_db is not None and self._actives) else 0.0
+        op = (_interp_ex(g, self._gains, self._powers, self._extrapolate)
+              + self._op_delta(f) + self._source_bias_at(f) + pin)
         return op + self._reported_shift(params)
 
     @property

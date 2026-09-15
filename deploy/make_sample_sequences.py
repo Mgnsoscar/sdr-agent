@@ -53,7 +53,7 @@ SEQUENCES = [
         name="Mock CW tone — RF-gated",
         description="Launch the CW mock 1 s before on-air with RF off; RF on at on-air, "
                     "off at off-air; stop 1 s after. No hardware.",
-        args=["--freq", "1575420000", "--power", "-60", "--rf", "off"],
+        args=["--freq", "1575.42", "--power", "-60", "--rf", "off"],
     ),
 ]
 
