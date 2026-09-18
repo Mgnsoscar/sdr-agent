@@ -90,6 +90,35 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — RF-fault detection & sequence recovery: DESIGN (build pending owner go-ahead) (branch `claude/system-familiarization-f5mezz`, cross-repo)
+Field incident: an `fm_chirp` `--power` sweep (Pi 5) hit a GNU Radio **`vmcircbuf`** (shared-memory
+buffer) error **at startup** but the script did NOT exit, so the agent showed the task RUNNING while the
+SDR sent nothing; recovery was a manual plan-rebuild + eyeballed ramp position. Root cause + fix are
+written up in **`docs/rf-fault-recovery.md`** (engineering design) and **`docs/incident-fm-chirp-vmcircbuf.md`**
+(one-page for stakeholders). NOT built yet. In one paragraph: liveness is exit-code-only
+(`ManagedProcess._watch` blocks on `proc.wait()`), so a halted-but-alive flowgraph is invisible; the fix
+LAYERS detection (a `paramkit/txhealth.watch_flowgraph` done-watcher that turns a silent GR halt into a
+non-zero exit — GR doesn't re-raise to Python, so `tb.wait()` returning with `stop` unset IS the signal —
+plus a ~2 s agent log-scan/heartbeat watchdog over `_tasks_owned_by_active_runs()`), stamps a NEW
+`ProcessStatus.health`/`TaskHealthEvent` + couples the fault into the run, ALARMS loudly (implement the
+`sdr-client` `main_window._on_alert` stub), auto-drops RF (SIGTERM→SIGKILL) while KEEPING the archived log
++ a resource snapshot (`/dev/shm`, `vm.max_map_count`, backend) so the next one self-diagnoses, and
+RECOVERS via a new `SequenceRunner.restart_run` + `POST /sequence-runs/{id}/restart` that reuses the
+persisted original `on_air_at`/`on_air_end`, marks `fire_at<=now` fires `"skipped"` (the `hold_now`
+sentinel), reconstructs the current ramp level from the last past tune fire (NOT eyeballed), and relaunches
+muted-then-gated (`_gate_precommand`/`_co_time_rank`, no hot blip). Recovery has two owner-set knobs:
+trigger (task-level Auto-restart checkbox → relaunch with crash-time params; sequence/plan policy default
+auto+resync, else operator-confirmed with replay-forward vs resync; plan overrides sequence) and semantics
+(resync = rejoin the original schedule / replay = restart from the crash point, whole run shifts later);
+auto budget default 2. Prevention (the actual `vmcircbuf` cause): raise `vm.max_map_count`/`/dev/shm`,
+agent `/dev/shm`+IPC hygiene around the task lifecycle, graceful shutdown, optional GR backend pin. Optional
+fast-warm IQ-buffer cache (L1C/L2C 30 s regen) keyed on shape params only. Gated by NEW capabilities
+`task-rf-health` + `sequence-restart` (version bump from `1.27.3`); `argspec`/`ramp` untouched (drift guard).
+Phasing: P0 prevention/ops · P1 detect+alarm+safe-stop+snapshot · P2 restart&resync/replay · P3 fast-warm+
+unattended auto. OPEN: retrieve the unit's archived `run_<ts>.log` + `df /dev/shm`/`vm.max_map_count`/`ipcs`
+to confirm the exact startup mechanism (default `mmap_shm_open` self-cleans, so a leaky `sysv_shm` fallback
+or `/dev/shm` pressure is the suspect).
+
 ## Current state — arm a whole day of scheduled plans at once (1.27.3): COMPLETE (branch `claude/arm-multiple-scheduled-plans`, stacked on 1.27.2; client "Arm all" in `sdr-client`)
 Owner ask: four non-overlapping plans in the schedule; arm ALL of them and have them start/stop on
 their own. Scheduled runs already fire at absolute times, so the blockers were the two arm guards in
