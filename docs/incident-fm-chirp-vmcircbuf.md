@@ -31,11 +31,14 @@ Two separate issues combined. One is the *technical* fault; the others are *why 
    RAM area called `/dev/shm`. When the transmit program **started up**, it occasionally could not
    allocate one of these buffers and **halted its radio output**, while the surrounding program kept
    running. This is a **startup-time, intermittent** failure — the *same* signal had run flawlessly
-   for three hours the day before. It is a known class of resource-availability issue on Linux, not
-   a logic bug in our code, and it is **independent of the power ramp itself** (the ramp changes no
-   buffers). The exact triggering resource (buffer-area space, a memory-mapping limit, or leftover
-   buffers from earlier hard-stopped runs) can be **confirmed from the unit's own logs**, which are
-   retained for 7 days but were not on hand at the time of writing.
+   for three hours the day before, and the fault has occurred ~10–12 times, always at startup. It is
+   a known class of resource-availability issue in the radio framework, **not a logic bug in our
+   code**, and it is **independent of the power ramp itself** (the ramp changes no buffers). The unit
+   had been **power-cycled and idle** before the test with **no prior task run**, so it is a
+   *transient allocation failure at first launch on a clean system* — not accumulated leftovers. Our
+   configuration makes it more likely than it needs to be (the radio framework's buffer backend is
+   not pinned on these units), which we can harden; the exact trigger will be **confirmed from the
+   unit's own logs and a resource snapshot**, captured automatically once detection ships.
 
 2. **We could not *see* it.** The software judged a task "running" purely by whether its program was
    still alive — not by whether radio was actually going out. A halted-but-alive program therefore

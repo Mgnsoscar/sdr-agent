@@ -144,8 +144,38 @@ Independent of the exact `vmcircbuf` mechanism, code review found a real, fixabl
   compete with GR for the same `/dev/shm`.
 
 **Severity is unit-dependent** (Pi 5 `/dev/shm` ≈ 50 % RAM; a small GR flowgraph failing means
-`/dev/shm` was nearly full, needing substantial accumulation or a small tmpfs) — `df -h /dev/shm` on
-the affected unit settles whether this was *the* cause of the incident. It is worth fixing regardless.
+`/dev/shm` was nearly full, needing substantial accumulation or a small tmpfs). **Ruled out for the
+reported incident:** the unit was **power-cycled** (which wipes the `/dev/shm` tmpfs) and **no task
+ran between boot and the test**, so there were no orphans to accumulate. This leak is therefore a
+real bug worth fixing for kill-heavy sessions, but **not** the cause of *this* fresh-boot failure —
+see §3.6.
+
+### 3.6 Fresh-boot, first-launch signature — the remaining explanation
+
+The reported incident was a **power-cycle → arm → (2 h idle) → first task launch → startup
+`vmcircbuf`**. That rules out every *accumulation* mechanism (orphaned `/dev/shm`, `sysv_shm`
+segments, cross-session pressure — all cleared by the power-cycle) and points to a **transient GNU
+Radio buffer-allocation failure at flowgraph construction on a clean system**. Contributing factors
+found in the code/deploy config:
+
+- **GR's buffer backend is not pinned, and the Pi service does not set `HOME`.** GNU Radio picks its
+  `vmcircbuf` backend by *probing* on first use (allocating test buffers) and caching the choice in
+  `~/.gnuradio/prefs/vmcircbuf_default_factory`. The X410 unit sets `HOME=/root`
+  (`deploy/x410/install.sh`); the **Pi service (`deploy/sdr-agent.service`) sets neither `HOME` nor a
+  backend pin**, and no seeded prefs exist in the repo — so GR's selection and the startup probe are
+  left to defaults. The probe and the first real allocation both run **at startup**, matching the
+  signature.
+- **Large, high-rate buffers are more exposed.** fm_chirp runs at **61.38 Msps**, sizing its GR
+  buffers larger than a low-rate signal's; a bigger double-mapped allocation is a bit more prone to an
+  occasional transient failure. Consistent with the fault appearing on the sweep.
+- **Partly irreducible.** A rare transient allocation failure at construction cannot be fully
+  engineered away; hence the primary cure is **detect-as-crash + auto-restart within the warm-up
+  lead-in** (§7.0), which makes it a non-event regardless of mechanism.
+
+**Fixes (Phase 0):** pin the backend explicitly in the task launch env
+(`GR_VMCIRCBUF_DEFAULT_FACTORY`, or seed the prefs file) so no probe runs at startup; set a stable,
+writable `HOME`/`GR_PREFS_PATH` for launched tasks (as X410 does); raise the ceilings (§3.4). The
+Phase-1 resource+backend snapshot (§6.3) will confirm the exact mechanism on the next occurrence.
 
 **Fixes (Phase 0):** (a) an agent `/dev/shm` sweep in `_cleanup()` **and** at boot **and** before each
 launch, removing staged dirs whose owning PID is dead; (b) a SIGTERM handler in the scripts that also
