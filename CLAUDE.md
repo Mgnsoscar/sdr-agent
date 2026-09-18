@@ -90,6 +90,42 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — RF-fault RECOVERY (Phase 2): COMPLETE (1.29.0, capability `sequence-restart`) (branch `claude/system-familiarization-f5mezz`, cross-repo)
+Operator-driven recovery: one "Restart" click brings a faulted run back on air at the level it should
+be at, with a resync/replay choice. Design + full record: `docs/rf-fault-recovery.md` §7 + §14c. The
+UNATTENDED auto-restart trigger + fast-warm cache stay **Phase 3** (§11). Suite 554 → 560. `argspec`/
+`ramp` untouched (drift guard intact).
+- **`sequence_runner.restart_run(run_id, RestartRequest)`** (adjacent to `proceed`/`hold_now`). A run
+  whose task faulted is still RUNNING with `run.fault`/`fault_task` stamped + that task's un-fired steps
+  `'skipped'` (Phase-1 `on_task_fault`). restart_run recovers **IN PLACE** (no re-arm, no channel-guard
+  re-run, run log stays open): (1) reconstruct **L_now** (`_reconstruct_level`) = the last FIRED
+  power-carrying step of the faulted task `fire_at<=now` (a ramp is a staircase → the last-passed level
+  is exactly the peer level, no interpolation); (2) skip past-due un-fired fires; (3) **re-instate the
+  faulted task's FUTURE `'skipped'` fires** (its ramp remainder + STOP) on their original `fire_at`
+  (`resync`, default) or shifted by the downtime `now-fault_at` (`replay`, which floats `on_air_end` +
+  refuses a peer collision via `_guard_replay_channel`); (4) **relaunch** with ONE synthetic `start`
+  fire at `now` (`_relaunch_start_fire`): the original launch args with `--power`→L_now + the RF gate
+  forced ON, so the task is **born transmitting at L_now** — the attenuator is positioned at the carrier
+  BEFORE the process starts, no hot blip; (5) clear `run.fault`.
+- **Two deliberate as-built deviations from the doc's §7.3** (from the understand-map's traps, both
+  documented in §14c): (a) **in-place, not abort-and-re-arm** — Phase 1 chose a non-terminal `fault`
+  FIELD on a still-RUNNING run precisely so Phase 2 recovers in place (the doc's "abort the predecessor"
+  assumed the older fault→terminal model); (b) **one launch-at-L_now fire, not the 3-fire
+  muted-then-gated dance** — a co-timed relaunch→tune→rf-on at `fire_at=now` is fragile (the
+  `_co_time_rank` ordering trap + the control-socket-bind race silently drops the tune). Launching
+  directly at L_now RF-on carries the level on the launch command → same no-blip guarantee, no race.
+- **`main.py`** `POST /sequence-runs/{id}/restart` (404 unknown / 409 not-RUNNING|no-fault|collision).
+  **`models.py`** `RestartRequest{mode='resync'|'replay', restart_at}` + the `sequence_restart` webhook
+  type. **`config.py`** capability `sequence-restart`, `AGENT_VERSION 1.28.0 → 1.29.0`.
+- **`sdr-client`** (client-only): `restart_sequence_run`, a "Restart" button on a FAULTED run row
+  (sequence + plan; the plan row also gains the RF-FAULT pill), the resync/replay choice, gated on both
+  `task-rf-health` + `sequence-restart`. See its CLAUDE.md.
+Tests: `tests/test_sequence_restart.py` (L_now incl. launch-level fallback; resync re-instates future +
+relaunch shape; replay shifts fires + off-air; replay collision refusal; 404/409 guards; a **LIVE**
+end-to-end that faults a real ramping task at −70, restarts, and completes on schedule) +
+`test_meta_endpoint`. **NEXT — Phase 3**: the task Auto-restart-on-fault checkbox + sequence/plan
+auto-restart policy (unattended, budget 2) + the fast-warm IQ cache. **Rollout:** OTA-push 1.29.0.
+
 ## Current state — RF-fault DETECTION (Phase 1): COMPLETE (1.28.0, capability `task-rf-health`) (branch `claude/system-familiarization-f5mezz`, cross-repo)
 Detect a dead-but-alive GNU Radio flowgraph (a halt that does NOT exit — the SDR is silent while the
 task reads RUNNING), alarm loudly on the client, auto-drop RF, and capture a self-diagnosing resource
@@ -187,7 +223,7 @@ live: the agent boots clean headless (pre-image no-ops with no radio, `/health` 
 alarm + a fault-time resource/backend/UHD-log snapshot (which reads the P0 env work back). Full
 design + phasing in `docs/rf-fault-recovery.md`.
 
-## Current state — RF-fault detection & sequence recovery: DESIGN — P0–P1 BUILT (1.28.0); P2–P3 pending (branch `claude/system-familiarization-f5mezz`, cross-repo)
+## Current state — RF-fault detection & sequence recovery: DESIGN — P0–P2 BUILT (1.29.0); P3 pending (branch `claude/system-familiarization-f5mezz`, cross-repo)
 Field incident: an `fm_chirp` `--power` sweep (Pi 5) hit a GNU Radio **`vmcircbuf`** (shared-memory
 buffer) error **at startup** but the script did NOT exit, so the agent showed the task RUNNING while the
 SDR sent nothing; recovery was a manual plan-rebuild + eyeballed ramp position. Root cause + fix are

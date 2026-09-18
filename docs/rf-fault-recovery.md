@@ -730,6 +730,70 @@ needs a re-provision, unchanged. Rebuild the client bundle from 1.28.0 + re-stag
 `sdr-client/bundles/`. **Deferred to Phase 2**: `SequenceRunner.restart_run` + `POST …/restart`,
 resync/replay, the `sequence-restart` capability, and the client Restart button.
 
+## 14c. Phase 2 — BUILT (`AGENT_VERSION 1.29.0`, capability `sequence-restart`; branch `claude/system-familiarization-f5mezz`)
+
+Operator-driven recovery — one click brings a faulted run back on air at the level it should be at,
+with the resync/replay choice (§7.2). The unattended auto-restart trigger + fast-warm cache stay
+**Phase 3** (§11: "fast-warm + unattended auto").
+
+**`sdr-agent` — `SequenceRunner.restart_run(run_id, RestartRequest)`** (adjacent to proceed/hold_now).
+A run whose task faulted is still RUNNING with `run.fault`/`fault_task` stamped and that task's un-fired
+steps `'skipped'` (Phase-1 `on_task_fault`). restart_run recovers **IN PLACE** on that same run (no
+re-arm, no channel-guard re-run, the run log stays open):
+1. **Reconstruct L_now** (`_reconstruct_level`) = the level the faulted task was transmitting at `now`
+   — the value of its last FIRED power-carrying step (`params['power']` on a ramp tune, or the launch
+   `--power`) with `fire_at <= now`. A ramp is a staircase of held levels, so the last-passed level is
+   exactly what a never-faulted peer transmits now — no interpolation, no eyeballing.
+2. **Skip past-due un-fired fires** (the elapsed up-ramp of the faulted task is already skipped; the
+   §7.3-step-3 general rule catches any straggler).
+3. **Re-instate the faulted task's FUTURE fires** the fault skipped (its ramp remainder + STOP) so the
+   run continues and stops — on their ORIGINAL `fire_at` (`resync`, the default) or shifted later by the
+   downtime `now - fault_at` (`replay`, which also floats `on_air_end` and refuses a peer collision via
+   `_guard_replay_channel` over `_active_span`).
+4. **Relaunch** (`_relaunch_start_fire`) with ONE synthetic `start` fire at `now`: the original launch
+   args with `--power` overridden to L_now and the RF gate forced ON (`_set_arg_value`), so the task is
+   **born transmitting at exactly L_now** — the attenuator is positioned for L_now at the carrier BEFORE
+   the process starts (`start → _gate_precommand(cmd=)`), so there is no hot blip.
+5. **Clear `run.fault`** — recovered.
+
+> **As-built deviations from §7.3, both deliberate** (from the pre-build understand-map's two traps):
+> (a) **In-place, not abort-and-re-arm.** §7.3 step 1 ("abort the predecessor, re-arm on its own
+> window") assumed the pre-Phase-1 model where a fault made the run terminal. Phase 1 chose a
+> non-terminal `fault` FIELD on a still-RUNNING run *specifically so Phase 2 could recover in place,
+> lower-risk* — so there is no predecessor to abort and no overlap guard to fight. (b) **One
+> launch-at-L_now fire, not the 3-fire muted-then-gated dance.** A relaunch-muted → tune-to-L_now →
+> RF-on sequence at a co-timed `fire_at=now` is fragile: the ordering trap (a bare muted start ranks
+> AFTER the power tune in `_co_time_rank`) and the socket-bind trap (`set_params` fires before the
+> relaunched script binds its control socket → silently dropped → the level never applies) both bite.
+> Launching directly at L_now with RF on carries the level on the launch command (no post-launch tune),
+> giving the same no-blip guarantee (attenuator positioned before start) with no socket race. The
+> re-instated FUTURE ramp tunes are safe — they fire at their own later `fire_at`, well after the
+> relaunched script is up.
+
+Endpoint `POST /sequence-runs/{id}/restart` (`RestartRequest{mode, restart_at}`; 404 unknown / 409
+not-RUNNING | no-fault | replay-collision). `config.py`: capability `sequence-restart`, `AGENT_VERSION
+1.28.0 → 1.29.0`. `models.py`: `RestartRequest` + the `sequence_restart` webhook type. `argspec`/`ramp`
+untouched.
+
+**`sdr-client`** (client-only): `api/models.py` `RestartRunRequest{mode}`; `api/client.py`
+`restart_sequence_run`; `ui/timeline_model.py` `SEQUENCE_RESTART_CAPABILITY` + `sequence_restart_supported`;
+a **"Restart"** button on a FAULTED run row (`ui/sequences_panel.py` `_SequenceRow`, and `ui/plans_tab.py`
+`_PlanRow` — which also gains the RF-FAULT pill it was missing), gated on BOTH `task-rf-health` (the
+fault must be detectable) AND `sequence-restart`; `_on_restart` poses the resync/replay choice and posts
+the restart. Multi-unit plan restart recovers the first faulted unit's run (single-unit exact) — the
+per-unit fan-out is the known TODO, mirroring the plan-export run-id TODO.
+
+**Tests**: `sdr-agent` 554 → 560 (`test_sequence_restart.py` — L_now reconstruction incl. launch-level
+fallback; resync re-instates future fires + the relaunch shape at L_now/RF-on; replay shifts fires +
+off-air; replay collision refusal; the 404/409 guards; a **LIVE** end-to-end that faults a real ramping
+task at −70, restarts it, and drives it to completion on schedule) + `test_meta_endpoint`. `sdr-client`
+1129 → 1136 (`test_restart_ui.py` — model + wrapper post; the gate; the Restart button visibility on
+both rows; the resync/replay/cancel routing; the plan fault pill + `_fault_run_for`).
+
+**Rollout:** OTA-push 1.29.0; the client bundle rebuilt from 1.29.0. **Deferred to Phase 3**: the
+task-level Auto-restart-on-fault checkbox + the sequence/plan auto-restart policy (unattended trigger,
+budget 2) and the fast-warm IQ cache (§8).
+
 ## 14. Open items
 
 - Retrieve the archived `run_<ts>.log` from the affected unit + `df /dev/shm` /
