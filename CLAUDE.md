@@ -134,12 +134,17 @@ the exit machine). Suite 537 → 553. `argspec`/`ramp` untouched (drift guard in
   fault-snapshot diagnosis dialog, fault pills on the task/sequence rows + fleet card, `task-rf-health`
   gate (Phase-2 Restart only). See its CLAUDE.md.
 Tests: `tests/test_txhealth.py`, `tests/test_task_health.py`, `tests/test_fault_snapshot.py`,
-`test_meta_endpoint.py` (asserts the capability). **Verified LIVE**: the marker injected into a running
-mock task → rf_fault + auto-drop + a snapshot recovering the P0 env work (`mmap_shm_open`, HOME) from
-`/proc/pid/environ`; an ordinary crash does NOT false-positive. **Adversarial review** (find→verify):
-0 confirmed defects (a split-token log miss + an abandoned-shutdown auto-drop were both refuted —
-whole-line atomic writes + the redundant exit path; and `shutdown` reaps every proc via its own
-idempotent stop gather). **NEXT — Phase 2**: `restart_run` + `POST …/restart`, resync/replay,
+`test_meta_endpoint.py` (asserts the capability). Suite 537 → 554. **Verified LIVE**: the marker
+injected into a running mock task → rf_fault + auto-drop + a snapshot recovering the P0 env work
+(`mmap_shm_open`, HOME) from `/proc/pid/environ`; an ordinary crash does NOT false-positive.
+**Adversarial review** (find→verify, all dims): two findings REFUTED (a split-token log miss + an
+abandoned-shutdown auto-drop — whole-line atomic writes + the redundant exit path; `shutdown` reaps
+every proc via its own idempotent stop gather) and two LOW findings FIXED — **`system._count_maps` now
+reads `/proc/<pid>/maps` in BINARY** and counts `b"\n"`, so a mapped file with a non-UTF-8 pathname
+can't raise `UnicodeDecodeError` out of the best-effort snapshot (the sibling helpers already guarded
+it; `_count_maps` was the lone outlier); and the **client fault dialog now flags a leaky sysv_shm
+COMPILED default when the GR env pin is unset** (was env-only). Both with regression tests. **NEXT —
+Phase 2**: `restart_run` + `POST …/restart`, resync/replay,
 `sequence-restart`. **Rollout:** OTA-push 1.28.0; no re-provision for detection (agent/script code);
 rebuild the client bundle from 1.28.0.
 

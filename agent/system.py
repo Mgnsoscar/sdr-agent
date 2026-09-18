@@ -356,10 +356,13 @@ def _read_int_file(path: str) -> Optional[int]:
 
 def _count_maps(pid: int) -> Optional[int]:
     """Number of VMAs = lines in /proc/<pid>/maps — what vm.max_map_count actually caps (cheaper
-    and more accurate than psutil.memory_maps, which groups by path)."""
+    and more accurate than psutil.memory_maps, which groups by path). Read in BINARY and count b'\\n'
+    so a mapped file with a non-UTF-8 pathname (which appears verbatim in the maps line) can't raise a
+    UnicodeDecodeError out of the best-effort snapshot — the sibling helpers guard the same way
+    (_read_int_file catches ValueError, _tail_file decodes with errors='replace')."""
     try:
-        with open(f"/proc/{pid}/maps") as fh:
-            return sum(1 for _ in fh)
+        with open(f"/proc/{pid}/maps", "rb") as fh:
+            return sum(chunk.count(b"\n") for chunk in iter(lambda: fh.read(65536), b""))
     except OSError:
         return None
 

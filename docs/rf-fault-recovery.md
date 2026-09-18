@@ -714,9 +714,15 @@ never sends).
 end-to-end: the fault marker injected into a running mock task → `rf_fault` health + auto-drop + a
 snapshot recovering the P0 env work (`mmap_shm_open` backend, HOME) from the live task's `/proc/pid/environ`;
 an ordinary crash (no fault signature) does NOT false-positive. **Adversarial review** (find→verify,
-5 dimensions): 0 confirmed defects (the two surfaced findings — a split-token log miss, an abandoned
-shutdown auto-drop — were refuted: whole-line atomic writes + the redundant exit path; and `shutdown`
-reaps every RUNNING proc via its own idempotent `stop` gather).
+5 dimensions): two findings refuted (a split-token log miss — whole-line atomic writes + the redundant
+exit path; an abandoned shutdown auto-drop — `shutdown` reaps every RUNNING proc via its own idempotent
+`stop` gather) and two LOW findings FIXED, both in the self-diagnosis machinery: (1) `system._count_maps`
+read `/proc/<pid>/maps` in text mode and caught only `OSError`, so a non-UTF-8 mapped pathname would
+raise `UnicodeDecodeError` (a `ValueError`) out of the "never raises" snapshot and lose it — now it
+reads BINARY and counts `b"\n"` (the sibling helpers `_read_int_file`/`_tail_file` already guarded the
+same way); (2) the client fault dialog flagged a leaky backend on the env value alone, so a `sysv_shm`
+COMPILED default with the P0 env pin disabled went unflagged — now the suspect check keys on the
+EFFECTIVE backend (`env or compiled`). Both with regression tests (suite 554 / 1129).
 
 **Rollout:** OTA-push 1.28.0 (behaviour + the new capability). No re-provision needed for detection
 (the watchdog + done-watcher are agent/script code); the Phase-0 sysctl/service-env hardening still

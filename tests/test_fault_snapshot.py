@@ -40,3 +40,18 @@ def test_snapshot_none_pid_never_raises_and_writes_nothing():
     assert isinstance(snap, FaultSnapshot)
     assert snap.vmcircbuf_backend_env                          # config fallback
     assert snap.snapshot_path == ""                            # no task_dir → nothing written
+
+
+def test_count_maps_survives_a_non_utf8_maps_line(monkeypatch):
+    # A mapped file whose pathname holds non-UTF-8 bytes appears verbatim in /proc/<pid>/maps. A
+    # text-mode read would raise UnicodeDecodeError (a ValueError, not OSError) out of the best-effort
+    # snapshot; the binary read must count the lines instead of raising. `open` is unqualified in
+    # system.py, so shadowing the module global redirects _count_maps at this crafted content.
+    import io
+    raw = b"7f0000-7f0100 r-xp /lib/x\xff\xfe.so\n7f0200-7f0300 rw-p /dev/shm/y\n"
+    monkeypatch.setattr(sysmon, "open", lambda p, *a, **k: io.BytesIO(raw), raising=False)
+    assert sysmon._count_maps(1234) == 2                       # two b"\n", no UnicodeDecodeError
+
+    # And the real path still reads (binary open on this process's own maps).
+    monkeypatch.undo()
+    assert sysmon._count_maps(os.getpid()) > 0
