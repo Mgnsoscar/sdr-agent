@@ -49,7 +49,10 @@ Two separate issues combined. One is the *technical* fault; the others are *why 
 - **Prevent the fault** (cheap, first): raise the relevant Linux limits on the unit, keep the buffer
   area clean between runs, shut transmit tasks down gracefully, and — for this class of intermittent
   startup failure — **retry automatically**, which succeeds on the first attempt the large majority
-  of the time.
+  of the time. Because transmit tasks start with a **warm-up lead-in before going on-air**, an
+  automatic startup retry typically finishes warming up *before broadcast time* — so the failure
+  becomes **invisible to the test**, with at most a benign notice to the operator (a loud alarm is
+  raised only if a retry genuinely cannot make the scheduled on-air time).
 - **Detect it in seconds:** the transmit program now reports a halted radio, and the unit software
   raises a **loud, unmissable alarm** (sound, on-screen flash, notification) instead of a misleading
   "running" status. It also **captures the unit's resource state at the moment of failure**, so the

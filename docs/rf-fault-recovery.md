@@ -235,6 +235,30 @@ and turns "I hope that was the last time" into a measurable outcome.
 
 Recovery is governed by **two orthogonal choices**, per the owner's decisions.
 
+### 7.0 Recovery depends on WHEN the fault hits
+
+The right recovery — and how invisible it can be — depends on where in the run the fault lands.
+
+- **Pre-roll (before on-air) — the common startup-`vmcircbuf` case.** The task launches with a
+  warm-up lead-in and RF muted; if it faults here, **nothing has gone on-air yet**, so recovery is
+  the *simple* case: **relaunch the crashed task** and leave the run's future fires (the scheduled
+  RF-on tune, the ramp, the STOP) untouched on the original timeline — no resync math, no level
+  reconstruction. The agent knows the task's launch instant and the RF-on tune's `fire_at`, so it
+  computes the **remaining lead-in** and:
+  - if `now + restart + warm-up ≤ RF-on` → **RF comes on-air on schedule; a benign notice, not an
+    alarm** (the operator need not act — the fault is masked);
+  - else → **loud alarm** (on-air will be missed/late; the retry can't warm up in time).
+  As a backstop, if RF-on fires and the task is not confirmed radiating, alarm. The **fast-warm IQ
+  cache (§8)** shrinks the warm-up, widening the set of faults that recover silently — decisive for
+  the slow-warming L1C/L2C; for fm_chirp (near-instant build) a restart fits any normal lead-in.
+  **This case is fully covered by Phase 1 detection + a task-level auto-restart — the mid-run resync
+  machinery below is not needed for it.**
+- **Mid-run (after on-air).** The full `restart_run` path (§7.3): skip the past, reconstruct the
+  level, relaunch muted-then-gated, and apply the resync-vs-replay choice (Knob B).
+- **Exit vs. hang.** A construction-time failure typically **exits non-zero** (already a crash the
+  agent sees today); a just-after-start halt **hangs** (the Layer-1 done-watcher converts it to a
+  non-zero exit). Either way it becomes a detectable crash, so the same recovery applies.
+
 ### 7.1 Knob A — who triggers recovery (configurable, by level)
 
 **Task-level** (a standalone task, or the task-editor default):
@@ -405,6 +429,10 @@ Each phase is independently useful and capability-gated.
   which then offers **replay-forward** (whole thing from the crash point) vs **resync** (restart what
   crashed and rejoin). Set in the sequence/plan editor; **a plan overrides its sequences**.
 - **Auto-restart budget:** default **2**.
+- **Pre-roll recovery:** a fault before on-air is auto-restarted (simple relaunch); if the retry
+  warms up before the RF-on instant, RF goes on-air **on schedule with a benign notice, not an
+  alarm** — alarm only when the retry can't make on-air in time. This makes the rare startup
+  `vmcircbuf` a non-event (Phase 1 + task auto-restart; no mid-run resync needed).
 - **Underflow rule:** fault on **sustained** pile-up, not incidental blips.
 - **Root cause:** startup-time GR `vmcircbuf` allocation failure (GR's own `/dev/shm` buffers, not
   staged IQ); mechanism to be confirmed from the captured error; prevented by §3.4 regardless.
