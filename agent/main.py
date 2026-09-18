@@ -158,6 +158,10 @@ async def lifespan(app: FastAPI):
     )
     await _runner.startup()
 
+    # RF-fault DETECTION (Phase 1): when the health watchdog confirms a task fault, couple it into
+    # the owning run (stamp run.fault, stop tuning the dead task, emit sequence_rf_fault).
+    _manager.set_fault_hook(_runner.on_task_fault)
+
     # The unit's replica of the PC's plans + schedule (stored, never executed here).
     _client_state = ClientStateStore(cfg.PLANS_FILE, cfg.SCHEDULE_FILE)
 

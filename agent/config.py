@@ -399,7 +399,13 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # GR vmcircbuf backend + UHD file logging), a dead-PID /dev/shm sweep (boot / pre-launch /
 # post-kill), and boot-time SDR pre-imaging. Behaviour only, NO new capability (no HTTP surface;
 # an older agent just lacks the hardening) — the bump lets OTA push it onto deployed units.
-AGENT_VERSION = "1.27.4"
+# 1.28.0: RF-fault DETECTION (Phase 1, docs/rf-fault-recovery.md §5/§6) — a script done-watcher
+# (paramkit.txhealth) turns a silent GR halt into a non-zero exit; a ~2 s agent health watchdog
+# log-scans running tasks for the fault signature and flips ProcessStatus.health → rf_fault WITHOUT
+# an exit; a TaskHealthEvent fires over SSE, the fault couples into the owning run (run.fault +
+# stop tuning the dead task), RF is auto-dropped, and a §6.3 resource snapshot is captured. Adds
+# capability `task-rf-health` (the client gates its fault pill / loud alarm on it).
+AGENT_VERSION = "1.28.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -528,6 +534,12 @@ AGENT_CAPABILITIES = [
                                          # length (SequenceRun.paused_fires). A ≤1.26 agent instead
                                          # delays the pause until the ramp finishes, so the client
                                          # gates a hold-aware arm of such a sequence on this string.
+    "task-rf-health",                    # RF-fault DETECTION (Phase 1): the agent reports a task's
+                                         # RF/flowgraph health (ProcessStatus.health) and fires a
+                                         # TaskHealthEvent over SSE when a task goes dead-but-alive
+                                         # (a halted GR flowgraph). The client gates its fault pill +
+                                         # loud alarm on this string; an older agent simply never
+                                         # reports a fault. (sequence-restart is Phase 2, not here.)
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
@@ -585,6 +597,25 @@ SHM_SWEEP_ENABLED = _env_flag("SDR_SHM_SWEEP", True)
 # one-time image load at on-air (the "started after on-air" miss). A no-op with no radio on PATH.
 PREIMAGE_ON_BOOT   = _env_flag("SDR_PREIMAGE_ON_BOOT", True)
 PREIMAGE_TIMEOUT_S = float(os.environ.get("SDR_PREIMAGE_TIMEOUT_S", "45"))
+
+
+# ── RF-fault DETECTION (Phase 1, docs/rf-fault-recovery.md §5.2) ───────────────
+# The agent health watchdog log-scans each running task's NEW log bytes on this cadence for a fault
+# signature and, when a task an active run owns goes dead-but-alive, flips its health to rf_fault.
+HEALTH_WATCH_ENABLED = _env_flag("SDR_HEALTH_WATCH", True)
+HEALTH_POLL_S        = float(os.environ.get("SDR_HEALTH_POLL_S", "2.0"))
+
+# Curated fault signatures the log-scan matches (case-insensitive, substring). The authoritative one
+# is the Layer-1 done-watcher marker (paramkit.txhealth.FAULT_MARKER) — a script emits it the instant
+# its flowgraph halts on its own; a test pins that this list contains it verbatim. The GR buffer /
+# shm-allocation phrasings are the BACKSTOP for the TRUE WEDGE where the flowgraph never exits (so the
+# Layer-1 non-zero exit never fires). A benign single mention is guarded by only alarming a task an
+# active run owns and firing once per run (the _fault_alarmed latch), never re-reading old bytes.
+HEALTH_FAULT_PATTERNS = [
+    "HEALTH state=faulted",     # == paramkit.txhealth.FAULT_MARKER (kept in step by a test)
+    "vmcircbuf",                # the GNU Radio circular-buffer subsystem error
+    "boost::interprocess",      # the POSIX-shm allocation failure GR raises under the hood
+]
 
 # ── Auth (optional shared secret) ────────────────────────────────────────────
 # Set SDR_API_KEY on both the Pi and your client. Leave empty to disable auth.

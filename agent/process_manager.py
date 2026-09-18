@@ -27,6 +27,7 @@ from typing import Deque, Dict, List, Optional
 
 from . import config as _agentcfg   # module import; container methods use a local `cfg`
 from . import calibration as _calib
+from . import system as _sysmon
 from . import tune_log as _tune_log
 from .argspec import extract_params
 from paramkit import rf as _rf
@@ -34,7 +35,7 @@ from paramkit import txstage as _txstage
 from .log_manager import LogManager
 from .models import (
     CrashEvent, ExitRecord, ProcessState, ProcessStatus,
-    StartRequest, TaskConfig, TaskEvent,
+    StartRequest, TaskConfig, TaskEvent, TaskHealth, TaskHealthEvent,
 )
 
 try:
@@ -409,6 +410,25 @@ class ManagedProcess:
         # Ring buffer of recent exits (newest appended last)
         self.history: Deque[ExitRecord] = deque(maxlen=10)
 
+        # ── RF-fault health (Phase 1, docs/rf-fault-recovery.md §5.2/§5.3) ────────
+        # A SEPARATE axis from `state` — a halted GR flowgraph is still process-RUNNING. Plain
+        # attributes (the ManagedProcess no-lock convention); the health watchdog writes them,
+        # status() reads them. `health` is a TaskHealth value string.
+        self.health: str = TaskHealth.OK.value
+        self.health_detail: str = ""
+        self.last_output_at: Optional[str] = None
+        self._resource_snapshot = None          # FaultSnapshot captured at the fault
+        # Per-task incremental log-scan cursor for read_since (reset each start; a rotation is
+        # detected by the inode so a stale offset can't read the wrong run).
+        self._log_offset: int = 0
+        self._log_inode = None
+        # Fire the health event + couple the run ONCE per run (a benign single log mention can't
+        # re-alarm); cleared on the next start so a relaunch re-arms detection.
+        self._fault_alarmed: bool = False
+        # Async run-coupling hook (task_name, detail) -> None, set by the ProcessManager so a
+        # detected fault can reach the SequenceRunner (stamp run.fault, stop tuning the dead task).
+        self._fault_hook = None
+
     # ── Public interface ──────────────────────────────────────────────────────
 
     async def start(self, request: Optional[StartRequest] = None) -> None:
@@ -418,6 +438,14 @@ class ManagedProcess:
         # An explicit start clears any prior stop request and breaker trip.
         self._stop_requested = False
         self.restart_giving_up = False
+        # A fresh run re-arms fault detection: clear health + the alarm latch, and reset the
+        # log-scan cursor (start() rotates current.log below, so the new run reads from a new inode).
+        self.health = TaskHealth.OK.value
+        self.health_detail = ""
+        self._resource_snapshot = None
+        self._fault_alarmed = False
+        self._log_offset = 0
+        self._log_inode = None
         self.state = ProcessState.STARTING
         req = request or StartRequest()
 
@@ -527,15 +555,18 @@ class ManagedProcess:
 
     def status(self) -> ProcessStatus:
         return ProcessStatus(
-            name          = self.config.name,
-            description   = self.config.description,
-            state         = self.state,
-            pid           = self.pid,
-            exit_code     = self.exit_code,
-            started_at    = self.started_at,
-            stopped_at    = self.stopped_at,
-            restart_count = self.restart_count,
-            log_file      = str(self.log.current),
+            name           = self.config.name,
+            description    = self.config.description,
+            state          = self.state,
+            pid            = self.pid,
+            exit_code      = self.exit_code,
+            started_at     = self.started_at,
+            stopped_at     = self.stopped_at,
+            restart_count  = self.restart_count,
+            log_file       = str(self.log.current),
+            health         = self.health,
+            health_detail  = self.health_detail,
+            last_output_at = self.last_output_at,
         )
 
     # ── Live parameters (retune a running task) ────────────────────────────────
@@ -588,10 +619,17 @@ class ManagedProcess:
             logger.info("Task '%s' stopped (exit=%s)", self.config.name, code)
 
         elif code != 0:
-            # Unexpected exit — fire crash event before deciding on restart
+            # Unexpected exit — fire an event before deciding on restart.
             self.state = ProcessState.CRASHED
             logger.warning("Task '%s' crashed (exit=%s)", self.config.name, code)
-            await self._fire_crash_event(code)
+            # An RF fault (the Layer-1 done-watcher forced this non-zero exit, or the watchdog
+            # already flagged it) surfaces as the LOUD TaskHealthEvent + run coupling + snapshot,
+            # NOT a plain crash — _flag_rf_fault is idempotent, so a prior watchdog alarm no-ops it
+            # (no double-alarm). An ordinary crash keeps the existing CrashEvent path.
+            if await self._is_rf_fault_exit():
+                await self._flag_rf_fault(self.health_detail or "flowgraph halted (non-zero exit)")
+            else:
+                await self._fire_crash_event(code)
 
             if not self.config.restart_on_crash:
                 return
@@ -663,6 +701,67 @@ class ManagedProcess:
         # Fire and forget — don't let a slow subscriber delay crash handling
         asyncio.create_task(self._dispatcher.fire(event))
 
+    async def _fire_health_event(self, detail: str, snapshot) -> None:
+        """Dispatch the loud RF-fault TaskHealthEvent (mirrors _fire_crash_event's shape/dispatch)."""
+        try:
+            last_lines = await self.log.tail(20)
+        except Exception:      # noqa: BLE001
+            last_lines = []
+        event = TaskHealthEvent(
+            unit_id          = self._unit_id,
+            task_name        = self.config.name,
+            task_description = self.config.description,
+            health           = TaskHealth.RF_FAULT,
+            detail           = detail,
+            at               = _utcnow(),
+            last_log_lines   = list(last_lines),
+            snapshot         = snapshot,
+        )
+        asyncio.create_task(self._dispatcher.fire(event))
+
+    async def _flag_rf_fault(self, detail: str) -> None:
+        """Mark this task RF-faulted (dead-but-alive, docs/rf-fault-recovery.md §5.3): set health,
+        capture the §6.3 resource snapshot, fire the loud TaskHealthEvent, and invoke the run-coupling
+        hook. Idempotent per run via `_fault_alarmed`, so both detection layers / a repeated log
+        mention can't double-alarm. Does NOT stop the task — the watchdog auto-drops RF after."""
+        if self._fault_alarmed:
+            return
+        self._fault_alarmed = True
+        self.health = TaskHealth.RF_FAULT.value
+        self.health_detail = detail
+        # Capture BEFORE any auto-drop stop, so a halted-but-alive flowgraph still has a live /proc.
+        snap = None
+        try:
+            uhd_log = str(Path(self.log.task_dir) / _agentcfg.UHD_LOG_FILE_NAME)
+            snap = await _sysmon.fault_snapshot(
+                self.pid, uhd_log_path=uhd_log,
+                task_dir=str(self.log.task_dir), log_path=str(self.log.current),
+            )
+            self._resource_snapshot = snap
+        except Exception as exc:   # noqa: BLE001 — a snapshot failure never blocks the alarm
+            logger.debug("fault snapshot failed for '%s': %s", self.config.name, exc)
+        try:
+            await self._fire_health_event(detail, snap)
+        except Exception as exc:   # noqa: BLE001
+            logger.warning("could not fire health event for '%s': %s", self.config.name, exc)
+        if self._fault_hook is not None:
+            try:
+                await self._fault_hook(self.config.name, detail)
+            except Exception as exc:   # noqa: BLE001 — coupling failure never blocks the alarm
+                logger.warning("fault hook failed for '%s': %s", self.config.name, exc)
+
+    async def _is_rf_fault_exit(self) -> bool:
+        """True if this task's exit is (or corroborates) an RF fault: health already flagged, or the
+        log tail carries a fault signature (the Layer-1 done-watcher marker / a GR buffer error)."""
+        if self.health == TaskHealth.RF_FAULT.value:
+            return True
+        try:
+            lines = await self.log.tail(40)
+        except Exception:      # noqa: BLE001
+            return False
+        hay = "\n".join(lines).lower()
+        return any(p.lower() in hay for p in _agentcfg.HEALTH_FAULT_PATTERNS)
+
     async def _cleanup(self, set_state: bool = True) -> None:
         if self._log_fh:
             try:
@@ -715,11 +814,24 @@ class ProcessManager:
         # Per-task RF-gate bookkeeping: the last-known {power, rf_on} so a live tune that toggles
         # only one of them still positions the attenuators correctly (see _gate_precommand).
         self._gate_state: Dict[str, dict] = {}
+        # RF-fault DETECTION (Phase 1): the health-watchdog coroutine + the run-coupling hook it
+        # (and the exit path) invoke on a confirmed fault (set by the SequenceRunner via lifespan).
+        self._health_task: Optional[asyncio.Task] = None
+        self._fault_hook = None
 
     def _make_proc(self, cfg: TaskConfig) -> ManagedProcess:
-        return ManagedProcess(
+        proc = ManagedProcess(
             cfg, LogManager(self._log_root, cfg.name), self._dispatcher, self._unit_id
         )
+        proc._fault_hook = self._fault_hook
+        return proc
+
+    def set_fault_hook(self, hook) -> None:
+        """Register the run-coupling callback (task_name, detail) -> awaitable, invoked when a task
+        is confirmed RF-faulted. Applied to every current and future ManagedProcess."""
+        self._fault_hook = hook
+        for proc in self._procs.values():
+            proc._fault_hook = hook
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -731,12 +843,59 @@ class ProcessManager:
                     await proc.start()
                 except Exception as exc:
                     logger.error("Failed to autostart '%s': %s", name, exc)
+        # RF-fault DETECTION (Phase 1): the periodic health watchdog (§5.2).
+        if _agentcfg.HEALTH_WATCH_ENABLED and self._health_task is None:
+            self._health_task = asyncio.create_task(self._health_loop(), name="task-health")
 
     async def shutdown(self) -> None:
+        if self._health_task is not None:
+            self._health_task.cancel()
+            self._health_task = None
         running = [p for p in self._procs.values() if p.state == ProcessState.RUNNING]
         if running:
             logger.info("Stopping %d task(s) on shutdown ...", len(running))
             await asyncio.gather(*[p.stop() for p in running], return_exceptions=True)
+
+    async def _health_loop(self) -> None:
+        """Periodic RF-fault watchdog (docs/rf-fault-recovery.md §5.2). Every HEALTH_POLL_S it scans
+        each RUNNING task's NEW log bytes for a fault signature (the Layer-1 done-watcher marker, or a
+        GR buffer error for the TRUE-WEDGE case where the flowgraph never exits). On a hit for a
+        not-yet-alarmed task it flags the RF fault (health event + snapshot + run coupling) and
+        auto-drops RF by stopping the dead task. Best-effort; one task's error never stops the loop."""
+        while True:
+            try:
+                await asyncio.sleep(_agentcfg.HEALTH_POLL_S)
+                for proc in list(self._procs.values()):
+                    if proc.state != ProcessState.RUNNING or proc._fault_alarmed:
+                        continue
+                    try:
+                        await self._scan_task_health(proc)
+                    except Exception as exc:   # noqa: BLE001 — never let one task stall the loop
+                        logger.debug("health scan failed for '%s': %s", proc.config.name, exc)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:           # noqa: BLE001 — the loop must survive anything
+                logger.warning("health watchdog loop error: %s", exc)
+
+    async def _scan_task_health(self, proc: "ManagedProcess") -> None:
+        """Read a task's new log bytes; on a fault signature, flag the fault and auto-drop RF."""
+        text, new_off, new_inode = await proc.log.read_since(proc._log_offset, proc._log_inode)
+        proc._log_offset, proc._log_inode = new_off, new_inode
+        if not text:
+            return
+        proc.last_output_at = _utcnow()
+        low = text.lower()
+        hit = next((p for p in _agentcfg.HEALTH_FAULT_PATTERNS if p.lower() in low), None)
+        if hit is None:
+            return
+        logger.warning("Task '%s' RF fault detected (matched %r)", proc.config.name, hit)
+        await proc._flag_rf_fault(f"log signature: {hit}")
+        # Auto-drop RF: free the single TX channel (SIGTERM→grace→SIGKILL — a halted flowgraph may
+        # not honour SIGTERM). Idempotent, so it can't collide with a concurrent abort/deadman.
+        try:
+            await proc.stop()
+        except Exception as exc:   # noqa: BLE001
+            logger.warning("auto-drop-RF stop failed for '%s': %s", proc.config.name, exc)
 
     # ── Event stream (SSE) ────────────────────────────────────────────────────
 

@@ -77,6 +77,18 @@ class LogManager:
                 except OSError:
                     pass
 
+        # Also bound the fault snapshots (docs/rf-fault-recovery.md §6.3) written beside the run
+        # logs, so they never accumulate on the SD card — same keep-N / max-age policy.
+        snaps = sorted(self.task_dir.glob("snapshot_*.json"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        for idx, path in enumerate(snaps):
+            if idx >= keep_runs or path.stat().st_mtime < cutoff:
+                try:
+                    path.unlink()
+                    deleted += 1
+                except OSError:
+                    pass
+
         return deleted
 
     def open_for_write(self):
@@ -104,6 +116,28 @@ class LogManager:
                 return all_lines[-lines:]
         except OSError:
             return []
+
+    async def read_since(self, offset: int, inode):
+        """Return bytes appended to current.log since a stored (offset, inode) — the primitive the
+        health watchdog scans incrementally (docs/rf-fault-recovery.md §5.2). On a rotation (the
+        inode changed — current.log was renamed to run_<ts>.log and re-created) or a truncation,
+        restart from the fresh file's start. Returns (text, new_offset, new_inode). Non-blocking."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._read_since, offset, inode)
+
+    def _read_since(self, offset: int, inode):
+        try:
+            with self.current.open("rb") as fh:
+                cur_inode = os.fstat(fh.fileno()).st_ino
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                # Read only new bytes on the SAME file; on a rotation/truncation follow from the top.
+                start = offset if (inode is not None and cur_inode == inode and 0 <= offset <= size) else 0
+                fh.seek(start)
+                data = fh.read()
+                return data.decode("utf-8", errors="replace"), start + len(data), cur_inode
+        except OSError:
+            return "", offset, inode
 
     async def stream(self, websocket, lines: int = 50):
         """

@@ -10,6 +10,7 @@ the asyncio event loop.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import shutil
@@ -21,7 +22,7 @@ from typing import Optional
 
 import psutil
 
-from .models import SdrDevice, SdrStatus, SystemHealth
+from .models import FaultSnapshot, SdrDevice, SdrStatus, SystemHealth
 
 logger = logging.getLogger(__name__)
 
@@ -338,3 +339,155 @@ async def pre_image_sdr(timeout: float = 45.0) -> str:
     """Async wrapper: run the blocking device open in the thread pool so it never stalls the loop."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _preimage_sdr, timeout)
+
+
+# ── Fault-time resource snapshot (docs/rf-fault-recovery.md §6.3) ──────────────
+# Captured when a task is detected dead-but-alive, so the NEXT vmcircbuf is self-diagnosing. Reads
+# the Phase-0 launch-env work (the pinned backend, HOME, the UHD file log) BACK. Every field is
+# independently guarded and blanks on failure — the whole capture never raises and works with no
+# hardware. Dispatched off-thread by the async wrapper so it never stalls the event loop.
+
+def _read_int_file(path: str) -> Optional[int]:
+    try:
+        return int(Path(path).read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _count_maps(pid: int) -> Optional[int]:
+    """Number of VMAs = lines in /proc/<pid>/maps — what vm.max_map_count actually caps (cheaper
+    and more accurate than psutil.memory_maps, which groups by path)."""
+    try:
+        with open(f"/proc/{pid}/maps") as fh:
+            return sum(1 for _ in fh)
+    except OSError:
+        return None
+
+
+def _tail_file(path, n: int) -> list:
+    try:
+        p = Path(path)
+        if not p.exists():
+            return []
+        with p.open("rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 8192))     # last ~8 KB is plenty for n lines
+            text = fh.read().decode("utf-8", errors="replace")
+        return text.splitlines()[-n:]
+    except OSError:
+        return []
+
+
+def _gnuradio_default_factory() -> str:
+    """The COMPILED-in vmcircbuf default from `gnuradio-config-info --prefs` ([vmcircbuf]
+    default_factory) — what GR uses under GR_DONT_LOAD_PREFS=1 when no GR_CONF_* env pin is set.
+    Blank when the tool is absent (no-GR box) or the section isn't present."""
+    exe = shutil.which("gnuradio-config-info")
+    if exe is None:
+        return ""
+    try:
+        out = subprocess.run([exe, "--prefs"], capture_output=True, text=True, timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    section = None
+    for line in (out.stdout or "").splitlines():
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            section = s[1:-1].strip().lower()
+        elif section == "vmcircbuf" and s.lower().startswith("default_factory"):
+            _, _, val = s.partition("=")
+            return val.strip()
+    return ""
+
+
+def _ipcs_summary() -> str:
+    exe = shutil.which("ipcs")
+    if exe is None:
+        return ""
+    try:
+        out = subprocess.run([exe, "-m"], capture_output=True, text=True, timeout=3)
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    return (out.stdout or "")[:2048].strip()
+
+
+def capture_fault_snapshot(pid: Optional[int], uhd_log_path=None, task_dir=None,
+                           log_path=None) -> FaultSnapshot:
+    """Build the §6.3 snapshot, write the full JSON beside the run log, and return it. Best-effort:
+    never raises. Capture BEFORE the auto-drop-RF stop so a halted-but-alive flowgraph still has a
+    readable /proc/<pid>; a reaped pid (the Layer-1 clean-exit path) blanks only the PID-scoped
+    fields while the machine-wide ones still populate."""
+    from . import config as cfg
+    now = datetime.now(timezone.utc)
+    ts = now.strftime("%Y%m%dT%H%M%SZ")
+    notes: list = []
+    snap = FaultSnapshot(captured_at=now.isoformat().replace("+00:00", "Z"),
+                         log_path=str(log_path) if log_path else "")
+
+    try:
+        du = shutil.disk_usage("/dev/shm")
+        snap.shm_used_bytes, snap.shm_total_bytes = du.used, du.total
+    except OSError:
+        notes.append("/dev/shm unavailable")
+
+    snap.map_max = _read_int_file("/proc/sys/vm/max_map_count")
+
+    proc = None
+    if pid:
+        try:
+            proc = psutil.Process(pid)
+        except Exception:      # noqa: BLE001 — NoSuchProcess etc.
+            notes.append("pid gone (fields from config)")
+    if proc is not None:
+        snap.map_count = _count_maps(pid)
+        try:
+            snap.rss_bytes = proc.memory_info().rss
+        except Exception:      # noqa: BLE001
+            pass
+        try:
+            snap.nofile_soft, snap.nofile_hard = proc.rlimit(psutil.RLIMIT_NOFILE)
+        except Exception:      # noqa: BLE001
+            pass
+        try:
+            env = proc.environ()
+            snap.vmcircbuf_backend_env = env.get(cfg.GR_VMCIRCBUF_ENV, "")
+            snap.task_home = env.get("HOME", "")
+        except Exception:      # noqa: BLE001 — AccessDenied / Zombie
+            notes.append("task env unreadable")
+
+    # Fall back to the INTENDED config values (not necessarily what the task ran with) when the
+    # live env wasn't readable — and say so, so the diagnostic isn't misread.
+    if not snap.vmcircbuf_backend_env:
+        snap.vmcircbuf_backend_env = cfg.GR_VMCIRCBUF_FACTORY
+        notes.append("backend from config, not live env")
+    if not snap.task_home:
+        snap.task_home = str(cfg.TASK_HOME)
+
+    snap.vmcircbuf_backend_compiled = _gnuradio_default_factory()
+
+    backends = (snap.vmcircbuf_backend_env + " " + snap.vmcircbuf_backend_compiled).lower()
+    if "sysv" in backends:
+        snap.ipcs_summary = _ipcs_summary()
+
+    if uhd_log_path:
+        snap.uhd_log_tail = _tail_file(uhd_log_path, 40)
+
+    snap.notes = notes
+
+    if task_dir is not None:
+        try:
+            out = Path(task_dir) / f"snapshot_{ts}.json"
+            snap.snapshot_path = str(out)          # record it BEFORE dumping so the file self-references
+            out.write_text(json.dumps(snap.model_dump(), indent=2))
+        except OSError:
+            snap.snapshot_path = ""
+    return snap
+
+
+async def fault_snapshot(pid: Optional[int], uhd_log_path=None, task_dir=None,
+                         log_path=None) -> FaultSnapshot:
+    """Async wrapper — run the blocking capture in the thread pool (never stalls the event loop)."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, capture_fault_snapshot, pid, uhd_log_path, task_dir,
+                                      log_path)

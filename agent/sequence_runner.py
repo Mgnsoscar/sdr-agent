@@ -437,6 +437,23 @@ class SequenceRunner:
         end = cls._channel_end(_parse(run.on_air_end) if run.on_air_end else None, run.steps)
         return start, end
 
+    @staticmethod
+    def _live_tasks_of(run: SequenceRun) -> set:
+        """Task names THIS run has launched (a fired START/RUN) and not yet stopped (no fired STOP
+        after it) — i.e. on air BECAUSE of this run's currently-live window. A 'skipped' sentinel
+        is not a launch, so a faulted (skip-sentineled) task drops out."""
+        launched: set = set()
+        stopped: set = set()
+        for s in run.steps:
+            if not s.fired_actual or s.fired_actual == "skipped":
+                continue
+            if s.action in ("start", "run"):
+                launched.add(s.task_name)
+                stopped.discard(s.task_name)          # a later launch re-owns it
+            elif s.action == "stop":
+                stopped.add(s.task_name)
+        return launched - stopped
+
     def _tasks_owned_by_active_runs(self) -> set:
         """Task names an ARMED/RUNNING/HOLDING run has launched (a fired START/RUN) and not
         yet stopped (no fired STOP after it). Such a task is on air BECAUSE of a scheduled
@@ -445,20 +462,35 @@ class SequenceRunner:
         other owner, whose end nobody knows)."""
         owned: set = set()
         for run in self._runs.values():
-            if run.state not in _ACTIVE_STATES:
-                continue
-            launched: set = set()
-            stopped: set = set()
-            for s in run.steps:
-                if not s.fired_actual or s.fired_actual == "skipped":
-                    continue
-                if s.action in ("start", "run"):
-                    launched.add(s.task_name)
-                    stopped.discard(s.task_name)      # a later launch re-owns it
-                elif s.action == "stop":
-                    stopped.add(s.task_name)
-            owned |= launched - stopped
+            if run.state in _ACTIVE_STATES:
+                owned |= self._live_tasks_of(run)
         return owned
+
+    async def on_task_fault(self, task_name: str, detail: str) -> None:
+        """RF-fault run coupling (docs/rf-fault-recovery.md §5.3). The ProcessManager health
+        watchdog (or the exit path) calls this when a task is confirmed dead-but-alive. Stamp the
+        OWNING active run (the one whose window is currently live), mark that task's un-fired steps
+        'skipped' so the tick stops tuning a dead task, and emit sequence_rf_fault. A task no active
+        run owns → nothing to couple here (the task-level TaskHealthEvent already surfaced it).
+        Idempotent per run (a run already carrying a fault is left alone)."""
+        async with self._lock:
+            for run in self._runs.values():
+                if run.state not in _ACTIVE_STATES or run.fault:
+                    continue
+                if task_name not in self._live_tasks_of(run):
+                    continue
+                run.fault = detail
+                run.fault_task = task_name
+                run.fault_at = _utcnow_iso()
+                skipped = 0
+                for s in run.steps:
+                    if s.task_name == task_name and s.fired_actual is None:
+                        s.fired_actual = "skipped"   # the tick skips it → no tune at a dead task
+                        skipped += 1
+                logger.warning("Run %s: task '%s' RF-faulted — skipped %d pending step(s) (%s)",
+                               run.id, task_name, skipped, detail)
+                self._persist_runs()
+                await self._fire(run, "sequence_rf_fault", detail=f"{task_name}: {detail}")
 
     @staticmethod
     def _split_hold_windows(
