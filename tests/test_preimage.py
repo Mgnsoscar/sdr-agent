@@ -63,43 +63,95 @@ def test_preimage_swallows_timeout_and_oserror(monkeypatch):
 
 # ── boot wiring ─────────────────────────────────────────────────────────────
 
-def test_boot_prevention_sweeps_then_preimages(monkeypatch):
+class _FakeManager:
+    def __init__(self, running):
+        self._running = set(running)
+
+    def task_names(self):
+        return ["a", "b", "c"]
+
+    def is_running(self, name):
+        return name in self._running
+
+
+def test_boot_sweep_runs_and_never_raises(monkeypatch):
     calls = []
     monkeypatch.setattr(main, "_sweep_shm_orphans", lambda: calls.append("sweep"))
+    main._boot_sweep()
+    assert calls == ["sweep"]
 
-    async def fake_preimage(timeout):
-        calls.append(("preimage", timeout))
-        return "ok"
-    monkeypatch.setattr(main.sysmon, "pre_image_sdr", fake_preimage)
-    monkeypatch.setattr(cfg, "PREIMAGE_ON_BOOT", True)
-    monkeypatch.setattr(cfg, "PREIMAGE_TIMEOUT_S", 7.0)
-
-    asyncio.run(main._boot_prevention())
-    assert calls == ["sweep", ("preimage", 7.0)]
-
-
-def test_boot_prevention_skips_preimage_when_disabled(monkeypatch):
-    calls = []
-    monkeypatch.setattr(main, "_sweep_shm_orphans", lambda: calls.append("sweep"))
-
-    async def fake_preimage(timeout):
-        calls.append("preimage")
-        return "ok"
-    monkeypatch.setattr(main.sysmon, "pre_image_sdr", fake_preimage)
-    monkeypatch.setattr(cfg, "PREIMAGE_ON_BOOT", False)
-
-    asyncio.run(main._boot_prevention())
-    assert calls == ["sweep"]            # sweep still runs; pre-image skipped
-
-
-def test_boot_prevention_never_raises(monkeypatch):
     def boom():
         raise RuntimeError("sweep exploded")
     monkeypatch.setattr(main, "_sweep_shm_orphans", boom)
+    main._boot_sweep()                   # swallowed → no exception
+
+
+def test_preimage_when_idle_preimages_when_device_free(monkeypatch):
+    monkeypatch.setattr(main, "_manager", None)      # no manager → device assumed free
+    monkeypatch.setattr(cfg, "PREIMAGE_ON_BOOT", True)
+    monkeypatch.setattr(cfg, "PREIMAGE_TIMEOUT_S", 7.0)
+    seen = {}
+
+    async def fake_preimage(timeout):
+        seen["timeout"] = timeout
+        return "imaged"
+    monkeypatch.setattr(main.sysmon, "pre_image_sdr", fake_preimage)
+
+    asyncio.run(main._preimage_when_idle())
+    assert seen["timeout"] == 7.0
+
+
+def test_preimage_when_idle_skips_when_a_task_holds_the_device(monkeypatch):
+    monkeypatch.setattr(main, "_manager", _FakeManager(running={"b"}))
+    monkeypatch.setattr(cfg, "PREIMAGE_ON_BOOT", True)
+    called = {"n": 0}
+
+    async def fake_preimage(timeout):
+        called["n"] += 1
+        return "imaged"
+    monkeypatch.setattr(main.sysmon, "pre_image_sdr", fake_preimage)
+
+    asyncio.run(main._preimage_when_idle())
+    assert called["n"] == 0              # a running task holds the device → never probed
+
+
+def test_preimage_when_idle_skips_when_disabled(monkeypatch):
+    monkeypatch.setattr(main, "_manager", None)
+    monkeypatch.setattr(cfg, "PREIMAGE_ON_BOOT", False)
+    called = {"n": 0}
+
+    async def fake_preimage(timeout):
+        called["n"] += 1
+    monkeypatch.setattr(main.sysmon, "pre_image_sdr", fake_preimage)
+
+    asyncio.run(main._preimage_when_idle())
+    assert called["n"] == 0
+
+
+def test_preimage_when_idle_hard_bound_is_caught(monkeypatch):
+    """A wedged probe whose reaping never returns must not hang the coroutine: the outer wait_for
+    bound raises TimeoutError, which is caught — the agent keeps running."""
+    monkeypatch.setattr(main, "_manager", None)
+    monkeypatch.setattr(cfg, "PREIMAGE_ON_BOOT", True)
+
+    async def hang(timeout):
+        return "never"
+    monkeypatch.setattr(main.sysmon, "pre_image_sdr", hang)
+
+    async def fake_wait_for(coro, timeout):
+        coro.close()                     # avoid 'coroutine was never awaited'
+        raise asyncio.TimeoutError
+    monkeypatch.setattr(main.asyncio, "wait_for", fake_wait_for)
+
+    asyncio.run(main._preimage_when_idle())   # TimeoutError swallowed → no exception
+
+
+def test_preimage_when_idle_never_raises(monkeypatch):
+    monkeypatch.setattr(main, "_manager", None)
+    monkeypatch.setattr(cfg, "PREIMAGE_ON_BOOT", True)
 
     async def preimage_boom(timeout):
         raise RuntimeError("probe exploded")
     monkeypatch.setattr(main.sysmon, "pre_image_sdr", preimage_boom)
-    monkeypatch.setattr(cfg, "PREIMAGE_ON_BOOT", True)
 
-    asyncio.run(main._boot_prevention())   # both failures swallowed → no exception
+    asyncio.run(main._preimage_when_idle())   # swallowed → no exception

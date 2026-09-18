@@ -41,6 +41,14 @@ pip3 install --break-system-packages --root-user-action=ignore --ignore-installe
 
 echo "==> Installing systemd service"
 cp sdr-agent.service "$SERVICE_FILE"
+
+if [ -f deploy/99-sdr-agent.conf ]; then
+    echo "==> Installing kernel tuning (vm.max_map_count)"
+    cp deploy/99-sdr-agent.conf /etc/sysctl.d/99-sdr-agent.conf
+    sysctl -p /etc/sysctl.d/99-sdr-agent.conf >/dev/null 2>&1 || \
+        echo "    (note: could not apply sysctl now; it takes effect on next boot)"
+fi
+
 systemctl daemon-reload
 systemctl enable sdr-agent
 systemctl restart sdr-agent

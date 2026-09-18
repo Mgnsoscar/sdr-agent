@@ -106,9 +106,12 @@ guard intact). Suite 519 → 537.
   level, capturing the FPGA image load while the console stays off). `_sweep_shm_orphans()`
   (flag-gated, best-effort) runs before each managed launch and in `_cleanup()` (post-exit/SIGKILL).
 - **`system.py`** — `pre_image_sdr()` opens the SDR via `uhd_usrp_probe` (loads the FPGA image), NOT
-  `uhd_find_devices`; no-op when the tool isn't on PATH. **`main.py`** — `_boot_prevention()` in
-  `lifespan` (after `_seed_scripts_dir`, before `_manager.startup()` so the device is free): the boot
-  `/dev/shm` sweep + an awaited, timeout-bounded boot pre-image, both best-effort.
+  `uhd_find_devices`; no-op when the tool isn't on PATH. **`main.py`** — `_boot_sweep()` (before
+  `_manager.startup()` so no live task's buffers are swept) + `_preimage_when_idle()` fired **DETACHED**
+  (`create_task`, never awaited) after startup, gated on the device being free + hard-bounded by
+  `wait_for`. Detaching is deliberate (a `/code-review` finding): a wedged USB SDR can leave
+  `uhd_usrp_probe` unkillable in D-state, and awaiting it on the lifespan path could hang boot and
+  brick the unit — the exact fault this defends against; detached, boot always completes.
 - **`config.py`** — new knobs `TASK_HOME`/`GR_VMCIRCBUF_FACTORY`/`UHD_LOG_FILE_LEVEL`/
   `SHM_SWEEP_ENABLED`/`PREIMAGE_ON_BOOT`/`PREIMAGE_TIMEOUT_S` (each `""`/`0` disables its pin/step).
 - **Deploy** — new `deploy/99-sdr-agent.conf` (`vm.max_map_count=262144`) installed by

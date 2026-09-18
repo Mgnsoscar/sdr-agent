@@ -600,18 +600,26 @@ the "Update agent…" button** (an OTA restart never re-installs the unit file o
   (post-exit / post-SIGKILL). `place_ramp`/`argspec`/`ramp` untouched (drift guard intact).
 - **`system.py`**: `pre_image_sdr()` / `_preimage_sdr()` — a best-effort `uhd_usrp_probe` OPEN
   (loads the FPGA image), NOT `uhd_find_devices`; a no-op when the tool isn't on PATH (dev/CI/mock).
-- **`main.py`**: `_boot_prevention()` in `lifespan`, **after `_seed_scripts_dir()` and before
-  `_manager.startup()`** (so the device is free and no autostart task's buffers can be swept):
-  the boot `/dev/shm` sweep, then an **awaited** (timeout-bounded) boot pre-image.
+- **`main.py`**: in `lifespan`, `_boot_sweep()` runs the `/dev/shm` sweep **before `_manager.startup()`**
+  (so no live/autostart task's buffers are swept), then `_preimage_when_idle()` is fired **DETACHED**
+  (`asyncio.create_task`, **never awaited**) **after** startup. Detaching is a deliberate safety
+  choice from a `/code-review` finding: a wedged USB SDR can leave `uhd_usrp_probe` unkillable in
+  uninterruptible **D-state** sleep, which a `subprocess.run` timeout cannot reap (`kill()` then an
+  *un-timed* `wait()`) — so **awaiting** it on the lifespan critical path could hang boot forever and
+  leave the unit unreachable with no remote recovery, the exact wedged-hardware case this feature
+  defends against. Detached, boot always completes; the task self-bounds with an outer
+  `asyncio.wait_for` and skips when a task already holds the device. (A truly D-state probe still
+  leaks one background executor thread until the I/O returns — harmless; the agent runs normally.)
 
 **`sdr-agent` — deploy/ops**
 - **`deploy/99-sdr-agent.conf`** (new): `vm.max_map_count = 262144`, installed to `/etc/sysctl.d/`
-  from `provision_install.sh`, `migrate_layout.sh`, and `x410/install.sh` (+ a non-fatal `/dev/shm`
-  size check). Auto-bundled (`build_bundle.sh` copies `deploy/` recursively).
-- **`deploy/sdr-agent.service`** (Pi): `Environment=HOME=/root`,
-  `Environment=GR_CONF_VMCIRCBUF_DEFAULT_FACTORY=mmap_shm_open`, `LimitNOFILE=65536`.
-  **`deploy/x410/install.sh`**: `LimitNOFILE` + the GR pin in the unit heredoc (HOME already set).
-  **`deploy/run_local.sh`**: the GR pin in the dev env (dev mirrors prod).
+  from **all four** install paths — `provision_install.sh`, `migrate_layout.sh`, `x410/install.sh`,
+  and the classic repo-root `install.sh` (+ a non-fatal `/dev/shm` size check on the Pi paths).
+  Auto-bundled (`build_bundle.sh` copies `deploy/` recursively).
+- **Service units — both hardened** with `HOME` + `GR_CONF_VMCIRCBUF_DEFAULT_FACTORY=mmap_shm_open` +
+  `LimitNOFILE=65536`: the OTA `deploy/sdr-agent.service` (Pi) AND the classic root `sdr-agent.service`
+  (a `/code-review` follow-up closed that gap). **`deploy/x410/install.sh`**: `LimitNOFILE` + the GR
+  pin in the unit heredoc (HOME already set). **`deploy/run_local.sh`**: the GR pin in the dev env.
 
 **`sdr-scripts`** — the 13 RPi loop-file stagers (Galileo/GLONASS/BeiDou/iridium) + the 4 FIFO
 stagers (gps_l1p/gps_l2p/white_noise/gaussian_noise) now stage via `txstage.staging_dir(...)`

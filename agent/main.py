@@ -133,15 +133,22 @@ async def lifespan(app: FastAPI):
     # previous release's library into the persistent dir so it isn't lost with the old release.
     _seed_scripts_dir()
 
-    # RF-fault prevention (docs/rf-fault-recovery.md Phase 0), before any task launches: reclaim
-    # dead-PID /dev/shm staging orphans from a prior boot, then pre-image the SDR (load its FPGA
-    # image now, while the device is provably free) so the first task warms up fast instead of
-    # paying the one-time image load at on-air. Best-effort; a no-radio box makes pre-image a no-op.
-    await _boot_prevention()
+    # RF-fault prevention (docs/rf-fault-recovery.md Phase 0): reclaim dead-PID /dev/shm staging
+    # orphans from a prior boot BEFORE any task launches (so a live task's buffers are never swept).
+    # Fast + safe (a listdir + PID-liveness check; never opens a device).
+    _boot_sweep()
 
     tasks = cfg.load_tasks()
     _manager = ProcessManager(tasks, cfg.LOG_DIR, cfg.UNIT_ID)
     await _manager.startup()
+
+    # Pre-image the SDR (load its FPGA image) so the first task warms up fast — DETACHED from this
+    # startup path, never awaited: a wedged USB SDR can leave `uhd_usrp_probe` unkillable in
+    # uninterruptible (D-state) sleep, and subprocess timeouts can't reap that; awaiting it here
+    # would hang the lifespan and leave the agent unreachable with no remote recovery — the exact
+    # wedged-hardware case this feature defends against. As a background task it can never block
+    # boot; it self-bounds and skips if a task already holds the device (§3.7, §14a).
+    asyncio.create_task(_preimage_when_idle(), name="sdr-preimage")
 
     _scheduler = Scheduler(_manager, cfg.UNIT_ID, cfg.EVENTS_FILE)
     await _scheduler.startup()
@@ -644,25 +651,40 @@ def _seed_scripts_dir() -> None:
         logger.warning("Could not seed scripts dir %s from %s: %s", dest, src, exc)
 
 
-async def _boot_prevention() -> None:
-    """RF-fault Phase-0 boot hooks, run once at startup BEFORE any task launches (so the device is
-    free for the pre-image and the sweep can't touch a live task's buffers). Both best-effort — a
-    failure here never blocks the agent coming up.
-      1. Sweep dead-PID /dev/shm staging orphans (SDR_SHM_SWEEP=0 to disable).
-      2. Pre-image the SDR via uhd_usrp_probe (SDR_PREIMAGE_ON_BOOT=0 to disable). Awaited (bounded
-         by SDR_PREIMAGE_TIMEOUT_S) so the image is loaded before autostart tasks can grab the
-         device; a no-op with no radio on PATH, so dev/CI/mock units are unaffected."""
+def _boot_sweep() -> None:
+    """Reclaim dead-PID /dev/shm staging orphans at boot (SDR_SHM_SWEEP=0 to disable). Best-effort —
+    never blocks startup. Runs BEFORE the manager autostarts tasks, so it can't sweep a live task's
+    buffers."""
     try:
         _sweep_shm_orphans()
     except Exception as exc:            # noqa: BLE001 — never block startup
         logger.warning("Boot /dev/shm sweep failed: %s", exc)
 
+
+async def _preimage_when_idle() -> None:
+    """Best-effort boot pre-image (SDR_PREIMAGE_ON_BOOT=0 to disable), run as a DETACHED background
+    task so it can NEVER hang boot. Two safety layers over the raw probe:
+      * skip when a task already holds the single TX channel (it is imaging the device itself, and
+        opening it again would collide);
+      * a hard `asyncio.wait_for` bound over the whole call, so even if `uhd_usrp_probe` wedges in
+        uninterruptible D-state (a bad USB SDR) and its reaping thread blocks, THIS coroutine still
+        returns — the agent keeps running and the first task just pays the image load if still cold.
+    A no-op when no radio is on PATH (dev / CI / mock), so those units are unaffected."""
     if not cfg.PREIMAGE_ON_BOOT:
         return
     try:
-        result = await sysmon.pre_image_sdr(cfg.PREIMAGE_TIMEOUT_S)
+        if _manager is not None and any(_manager.is_running(n) for n in _manager.task_names()):
+            logger.info("Boot SDR pre-image skipped: a task already holds the device")
+            return
+        result = await asyncio.wait_for(
+            sysmon.pre_image_sdr(cfg.PREIMAGE_TIMEOUT_S),
+            timeout=cfg.PREIMAGE_TIMEOUT_S + 10,
+        )
         logger.info("Boot SDR pre-image: %s", result)
-    except Exception as exc:            # noqa: BLE001 — never block startup
+    except asyncio.TimeoutError:
+        logger.warning("Boot SDR pre-image did not return within its hard bound; continuing — the "
+                       "first task will pay the image load if the device is still cold.")
+    except Exception as exc:            # noqa: BLE001 — best-effort; never disturb a running agent
         logger.warning("Boot SDR pre-image failed: %s", exc)
 
 

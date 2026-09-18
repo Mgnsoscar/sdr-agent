@@ -9,9 +9,16 @@ WorkingDirectory=/opt/sdr-agent
 # /opt/sdr-agent/scripts) can `import paramkit`. Subprocesses inherit the agent's
 # environment, so this covers them too.
 Environment=PYTHONPATH=/opt/sdr-agent
+# RF-fault prevention (docs/rf-fault-recovery.md §3.6): a stable, writable HOME + a belt-and-
+# suspenders GR vmcircbuf backend pin (the agent also pins it per task; the scripts set
+# GR_DONT_LOAD_PREFS=1, so this GR_CONF_* launch-env override is the only backend pin GR reads).
+Environment=HOME=/root
+Environment=GR_CONF_VMCIRCBUF_DEFAULT_FACTORY=mmap_shm_open
 ExecStart=/usr/bin/python3 -m uvicorn agent.main:app --host 0.0.0.0 --port 8765
 Restart=on-failure
 RestartSec=5
+# Generous open-file limit for the GNU Radio flowgraphs the agent's tasks launch (§3.4).
+LimitNOFILE=65536
 
 # Optional: set a shared secret
 # Environment=SDR_API_KEY=changeme
