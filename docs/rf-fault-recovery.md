@@ -112,15 +112,46 @@ at that instant. Phase 1 below makes the **next** occurrence self-diagnosing.
 2. **Graceful shutdown first.** Stop a transmit task with **SIGTERM + a grace period**; `SIGKILL`
    only as a last resort, and always **sweep stale shm/IPC afterwards**. (The Phase-1 done-watcher
    makes clean exits the norm, which is itself preventative.)
-3. **Agent `/dev/shm`/IPC hygiene around the task lifecycle**: before launching a transmit task —
-   and after a hard kill — remove GR shared-memory artifacts whose owning PID is dead (POSIX
-   `/dev/shm/*` and, if `sysv_shm` is in use, `ipcs`/`ipcrm` orphans). This breaks any
-   hang→kill→orphan→startup-failure ratchet.
+3. **Agent `/dev/shm`/IPC hygiene around the task lifecycle** — a **confirmed, concrete gap** (§3.5),
+   not just a precaution: before launching a transmit task, and after a hard kill, remove staged
+   shared-memory artifacts whose owning PID is dead (`/dev/shm/gal_*`/`gr-*`, and if `sysv_shm` is in
+   use, `ipcs`/`ipcrm` orphans). This breaks the hang→SIGKILL→orphan→startup-failure ratchet.
 4. **Pin a known-good buffer backend** if the captured error implicates one:
    `~/.gnuradio/prefs/vmcircbuf_default_factory` (e.g. `mmap_shm_open` vs `mmap_tmpfile`).
 5. **For this fault class, auto-restart is highly effective.** An *intermittent startup* failure
    almost always clears on the first retry, so the default policy (§7) recovers it with little
    operator involvement.
+
+### 3.5 Confirmed hygiene gap: staged `/dev/shm` files leak on a hard kill
+
+Independent of the exact `vmcircbuf` mechanism, code review found a real, fixable leak that
+*contributes to `/dev/shm` pressure* and matches the "poor buffer cleanup" hypothesis:
+
+- The Galileo streamed signals (`gal_e5`/`gal_e6`/`gal_prs_tx.py`) stage a **32–33 MB IQ file into
+  `/dev/shm`** (`tempfile.mkdtemp(dir="/dev/shm")`) and remove it only via
+  **`atexit.register(shutil.rmtree, …)`**.
+- `atexit` **does not run on `SIGKILL`**, a C++ abort (`SIGABRT`/`SIGSEGV`), or power loss.
+- The agent's `ManagedProcess.stop()` is `SIGTERM` → wait **10 s** → **`SIGKILL`**. A hung/wedged task
+  (its `finally: tb.wait()` blocks — exactly the fault we detect) never exits in 10 s, so it is
+  **`SIGKILL`ed → the 32 MB file is orphaned.**
+- The agent's `_cleanup()` unlinks the task's **control socket** but **does nothing about `/dev/shm`**,
+  and nothing sweeps it at boot — so orphans persist until reboot.
+- The leak is **cumulative across the unit's uptime**, not concurrent: a Galileo run force-killed in an
+  earlier session shrinks the `/dev/shm` headroom a later fm_chirp startup needs, even with "no other
+  tasks running." A reboot clears `/dev/shm` (consistent with "fine the next day").
+- Note GNU Radio's own default backend (`mmap_shm_open`) **unlinks immediately**, so GR's *own*
+  buffers do not leak on kill — the leak is strictly the **staged IQ files**, which nonetheless
+  compete with GR for the same `/dev/shm`.
+
+**Severity is unit-dependent** (Pi 5 `/dev/shm` ≈ 50 % RAM; a small GR flowgraph failing means
+`/dev/shm` was nearly full, needing substantial accumulation or a small tmpfs) — `df -h /dev/shm` on
+the affected unit settles whether this was *the* cause of the incident. It is worth fixing regardless.
+
+**Fixes (Phase 0):** (a) an agent `/dev/shm` sweep in `_cleanup()` **and** at boot **and** before each
+launch, removing staged dirs whose owning PID is dead; (b) a SIGTERM handler in the scripts that also
+`rmtree`s the staging dir (belt-and-suspenders on the graceful path); (c) longer term, move the
+remaining `file_source` stagers off `/dev/shm` to in-RAM `vector_source_c` (as GPS/fm_chirp already
+did) or a swept, size-capped location.
 
 ---
 
