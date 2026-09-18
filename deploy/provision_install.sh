@@ -117,6 +117,15 @@ install -m644 "$HERE/deploy/sdr-agent-confirm.service"  /etc/systemd/system/sdr-
 install -m644 "$HERE/deploy/sdr-agent-confirm.timer"    /etc/systemd/system/sdr-agent-confirm.timer
 install -m755 "$HERE/deploy/sdr-agent-confirm.sh"       /usr/local/bin/sdr-agent-confirm
 
+echo "==> Installing kernel tuning (vm.max_map_count) + checking /dev/shm"
+install -m644 "$HERE/deploy/99-sdr-agent.conf"          /etc/sysctl.d/99-sdr-agent.conf
+sysctl -p /etc/sysctl.d/99-sdr-agent.conf >/dev/null 2>&1 || \
+    echo "    (note: could not apply sysctl now; it takes effect on next boot)"
+_shm_mb=$(df -Pm /dev/shm 2>/dev/null | awk 'NR==2{print $2}' || true)
+if [ -n "${_shm_mb:-}" ] && [ "${_shm_mb}" -lt 256 ]; then
+    echo "    (warning: /dev/shm is only ${_shm_mb} MiB — GNU Radio stages IQ there; expected ~50% of RAM)"
+fi
+
 echo "==> Writing service env drop-in ($DROPIN/override.conf)"
 mkdir -p "$DROPIN"
 {

@@ -114,5 +114,6 @@ exec env \
     SDR_STATE_DIR="$STATE" \
     SDR_UNIT_ID="${SDR_UNIT_ID:-broadcaster-lab}" \
     SDR_UNIT_TYPE="${SDR_UNIT_TYPE:-broadcaster}" \
+    GR_CONF_VMCIRCBUF_DEFAULT_FACTORY="${GR_CONF_VMCIRCBUF_DEFAULT_FACTORY:-mmap_shm_open}" \
     PYTHONPATH="$HERE" \
     python3 -m uvicorn agent.main:app --host 0.0.0.0 --port "$PORT"

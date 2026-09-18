@@ -30,6 +30,7 @@ from . import calibration as _calib
 from . import tune_log as _tune_log
 from .argspec import extract_params
 from paramkit import rf as _rf
+from paramkit import txstage as _txstage
 from .log_manager import LogManager
 from .models import (
     CrashEvent, ExitRecord, ProcessState, ProcessStatus,
@@ -182,6 +183,44 @@ def _ensure_paramkit_on_path(env: dict) -> dict:
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = base + (os.pathsep + existing if existing else "")
     return env
+
+
+def _launch_env_pins(task_dir) -> dict:
+    """RF-fault prevention (Phase 0, docs/rf-fault-recovery.md §3.4/§3.6/§3.7): the launch-env PINS
+    applied to every transmit task. Merged ABOVE ambient os.environ but BELOW the task's cfg.env /
+    request env_overrides, so each is a default the task/operator can still override:
+      * HOME           — a stable, writable home so GNU Radio's ~/.gnuradio handling is deterministic.
+      * GR vmcircbuf   — pin the buffer backend (the scripts set GR_DONT_LOAD_PREFS=1, so a prefs-file
+                         pin is ignored; this GR_CONF_* launch-env override is the only one GR reads).
+      * UHD file log   — capture the FPGA image load / UHD errors to a PER-TASK file while the console
+                         stays off (UHD_LOG_CONSOLE_LEVEL is left untouched). Needs the task's log dir.
+    Each key is omitted when its config value is blank (so nothing is forced when unconfigured)."""
+    pins: dict = {}
+    if _agentcfg.TASK_HOME:
+        pins["HOME"] = str(_agentcfg.TASK_HOME)
+    if _agentcfg.GR_VMCIRCBUF_FACTORY:
+        pins[_agentcfg.GR_VMCIRCBUF_ENV] = _agentcfg.GR_VMCIRCBUF_FACTORY
+    if _agentcfg.UHD_LOG_FILE_LEVEL and task_dir is not None:
+        pins[_agentcfg.UHD_LOG_FILE_ENV] = str(Path(task_dir) / _agentcfg.UHD_LOG_FILE_NAME)
+        pins[_agentcfg.UHD_LOG_FILE_LEVEL_ENV] = _agentcfg.UHD_LOG_FILE_LEVEL
+    return pins
+
+
+def _sweep_shm_orphans() -> int:
+    """Reclaim dead-PID /dev/shm staging orphans (paramkit.txstage 'sdrtx-' dirs left by a task the
+    agent SIGKILLed / that crashed). Best-effort — hygiene must never break a launch or teardown;
+    disabled with SDR_SHM_SWEEP=0. Called at boot, before each managed launch, and after each task
+    ends (docs/rf-fault-recovery.md §3.5)."""
+    if not _agentcfg.SHM_SWEEP_ENABLED:
+        return 0
+    try:
+        n = _txstage.sweep_orphans()
+        if n:
+            logger.info("Swept %d orphaned /dev/shm staging dir(s)", n)
+        return n
+    except Exception as exc:   # noqa: BLE001 — never let cleanup break the caller
+        logger.debug("shm sweep skipped: %s", exc)
+        return 0
 
 
 def _build_command(command: list, args: list, replace: bool) -> list:
@@ -383,7 +422,10 @@ class ManagedProcess:
         req = request or StartRequest()
 
         cmd = _build_command(self.config.command, req.args, req.replace_args)
-        env = {**os.environ, **self.config.env, **req.env_overrides}
+        # RF-fault prevention pins sit ABOVE ambient os.environ but BELOW the task's own cfg.env /
+        # request env_overrides — deterministic defaults the task can still override.
+        env = {**os.environ, **_launch_env_pins(self.log.task_dir),
+               **self.config.env, **req.env_overrides}
         _ensure_paramkit_on_path(env)   # scripts live in the persistent dir now — keep `import paramkit` working
         # stdout is redirected to a file, so Python would block-buffer print()
         # output (appearing only in ~8 KB bursts or at exit) while stderr/logging
@@ -419,6 +461,10 @@ class ManagedProcess:
         self.log.rotate()
         self.log.cleanup()   # prune old archives so the SD card never fills
         self._log_fh = self.log.open_for_write()
+
+        # Reclaim any dead-PID /dev/shm staging orphan before we build a fresh flowgraph, so a
+        # prior hard-killed task can't starve this launch's GR buffers (docs/rf-fault-recovery §3.5).
+        _sweep_shm_orphans()
 
         logger.info("Starting task '%s': %s", self.config.name, cmd)
 
@@ -635,6 +681,11 @@ class ManagedProcess:
                 pass
             self._ctrl_sock = None
 
+        # Reclaim this task's /dev/shm staging if it was SIGKILLed (a wedged tb.wait() that the
+        # 10 s grace escalated to SIGKILL never ran the script's atexit). The sweep touches only
+        # dead-PID 'sdrtx-' orphans, so a live sibling task is never harmed (§3.5).
+        _sweep_shm_orphans()
+
         if set_state:
             self.state = ProcessState.STOPPED
 
@@ -744,7 +795,7 @@ class ProcessManager:
         # its linked active components (attenuator, …) first — muted (attenuators at max) when the
         # command leaves the RF output gate off.
         await self._gate_precommand(name, cmd=cmd)
-        env = {**os.environ, **cfg.env}
+        env = {**os.environ, **_launch_env_pins(mp.log.task_dir), **cfg.env}
         _ensure_paramkit_on_path(env)   # scripts live in the persistent dir now — keep `import paramkit` working
         env.setdefault("PYTHONUNBUFFERED", "1")   # flush print()/stdout live, like logging
         try:
@@ -1080,7 +1131,7 @@ class ProcessManager:
         mp = self._get(name)
         cfg = mp.config
         cmd = _build_command(cfg.command, list(args), replace=True)
-        env = {**os.environ, **cfg.env}
+        env = {**os.environ, **_launch_env_pins(mp.log.task_dir), **cfg.env}
         _ensure_paramkit_on_path(env)   # scripts live in the persistent dir now — keep `import paramkit` working
         env.setdefault("PYTHONUNBUFFERED", "1")
         try:

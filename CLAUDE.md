@@ -90,7 +90,43 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
-## Current state — RF-fault detection & sequence recovery: DESIGN (build pending owner go-ahead) (branch `claude/system-familiarization-f5mezz`, cross-repo)
+## Current state — RF-fault PREVENTION (Phase 0): COMPLETE (1.27.4) (branch `claude/system-familiarization-f5mezz`, cross-repo)
+The prevention/ops layer of the RF-fault design (`docs/rf-fault-recovery.md` §14a "Phase 0 — BUILT").
+Behaviour only, NO capability (`AGENT_VERSION 1.27.3 → 1.27.4`); `argspec`/`ramp` untouched (drift
+guard intact). Suite 519 → 537.
+- **`paramkit/txstage.py`** (new, shared pure-stdlib) — `staging_dir(signal)` stages under a TAGGED,
+  PID-bearing name `/dev/shm/sdrtx-<pid>-<signal>-…`; `sweep_orphans()` reclaims ONLY dead-PID
+  `sdrtx-*` entries (never a live sibling, a foreign object, or GR's own `vmcircbuf_*`). The tag is
+  the contract between the scripts (which stage) and the agent (which sweeps).
+- **`process_manager.py`** — `_launch_env_pins(task_dir)` merged at all THREE launch env sites
+  (`start`/`run_oneshot`/`_launch_oneshot_wait`) BETWEEN `os.environ` and `cfg.env`, so the pins beat
+  ambient but `cfg.env`/`req.env_overrides` still win: `HOME` (stable+writable), the GR vmcircbuf
+  backend (`GR_CONF_VMCIRCBUF_DEFAULT_FACTORY` — the only pin GR reads, since scripts set
+  `GR_DONT_LOAD_PREFS=1`), and per-task UHD file logging (`UHD_LOG_FILE` next to `current.log` +
+  level, capturing the FPGA image load while the console stays off). `_sweep_shm_orphans()`
+  (flag-gated, best-effort) runs before each managed launch and in `_cleanup()` (post-exit/SIGKILL).
+- **`system.py`** — `pre_image_sdr()` opens the SDR via `uhd_usrp_probe` (loads the FPGA image), NOT
+  `uhd_find_devices`; no-op when the tool isn't on PATH. **`main.py`** — `_boot_prevention()` in
+  `lifespan` (after `_seed_scripts_dir`, before `_manager.startup()` so the device is free): the boot
+  `/dev/shm` sweep + an awaited, timeout-bounded boot pre-image, both best-effort.
+- **`config.py`** — new knobs `TASK_HOME`/`GR_VMCIRCBUF_FACTORY`/`UHD_LOG_FILE_LEVEL`/
+  `SHM_SWEEP_ENABLED`/`PREIMAGE_ON_BOOT`/`PREIMAGE_TIMEOUT_S` (each `""`/`0` disables its pin/step).
+- **Deploy** — new `deploy/99-sdr-agent.conf` (`vm.max_map_count=262144`) installed by
+  `provision_install.sh`/`migrate_layout.sh`/`x410/install.sh` (+ a non-fatal `/dev/shm` size check);
+  `sdr-agent.service` gains `HOME=/root` + the GR pin + `LimitNOFILE=65536`; `x410/install.sh` gains
+  `LimitNOFILE` + the GR pin; `run_local.sh` mirrors the GR pin. Auto-bundled. **NB: the deploy/sysctl/
+  service-env hardening reaches field units via a RE-PROVISION / migrate, NOT the OTA "Update agent…"
+  button** (which only restarts the service).
+- **`sdr-scripts`** — the 13 RPi loop-file + 4 FIFO stagers now use `txstage.staging_dir` (see its
+  CLAUDE.md); `fm_chirp` + GPS vector_source scripts stage nothing (untouched).
+Tests: `tests/test_txstage.py`, `tests/test_launch_env_pins.py`, `tests/test_preimage.py`. Verified
+live: the agent boots clean headless (pre-image no-ops with no radio, `/health` ok, no traceback).
+**DEFERRED within P0**: arm-time pre-image (needs a device mutex — P1) + the x410-stager tag migration.
+**NEXT — Phase 1**: detect (script `txhealth.watch_flowgraph` done-watcher + agent watchdog) + a loud
+alarm + a fault-time resource/backend/UHD-log snapshot (which reads the P0 env work back). Full
+design + phasing in `docs/rf-fault-recovery.md`.
+
+## Current state — RF-fault detection & sequence recovery: DESIGN — P0 BUILT (1.27.4); P1–P3 pending (branch `claude/system-familiarization-f5mezz`, cross-repo)
 Field incident: an `fm_chirp` `--power` sweep (Pi 5) hit a GNU Radio **`vmcircbuf`** (shared-memory
 buffer) error **at startup** but the script did NOT exit, so the agent showed the task RUNNING while the
 SDR sent nothing; recovery was a manual plan-rebuild + eyeballed ramp position. Root cause + fix are

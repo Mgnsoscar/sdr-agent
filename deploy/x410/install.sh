@@ -106,16 +106,33 @@ Environment=SDR_AGENT_BASE=$LINK
 Environment=SDR_STATE_DIR=$SHARED
 Environment=SDR_UNIT_ID=$UNIT_ID
 Environment=SDR_MDNS_EXCLUDE_IFACES=int0
+# RF-fault prevention (docs/rf-fault-recovery.md): belt-and-suspenders GR vmcircbuf backend pin
+# (the agent also pins it per task) — GR_DONT_LOAD_PREFS=1 in the scripts means this GR_CONF_*
+# launch-env override is the only backend pin GR reads. HOME=/root is set above.
+Environment=GR_CONF_VMCIRCBUF_DEFAULT_FACTORY=mmap_shm_open
 ${SDR_API_KEY:+Environment=SDR_API_KEY=$SDR_API_KEY}
 ExecStart=$PYBIN -m uvicorn agent.main:app --host 0.0.0.0 --port $PORT
 Restart=on-failure
 RestartSec=5
+# Generous open-file limit for the GNU Radio flowgraphs the agent's tasks launch (§3.4).
+LimitNOFILE=65536
 StandardOutput=journal
 StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+echo "==> Installing kernel tuning (vm.max_map_count)"
+cat > /etc/sysctl.d/99-sdr-agent.conf <<'SYSCTL'
+# SDR agent — raise the per-process memory-map ceiling for GNU Radio's vmcircbuf buffers
+# (each mapped twice), so a large flowgraph can't exhaust it at construction — a candidate
+# cause of the startup vmcircbuf allocation failure (docs/rf-fault-recovery.md §3.4).
+# On the X410 /etc is on rootfs; a full NI OS image update wipes it — re-run install.sh.
+vm.max_map_count = 262144
+SYSCTL
+sysctl -p /etc/sysctl.d/99-sdr-agent.conf >/dev/null 2>&1 || \
+    echo "    (note: could not apply sysctl now; it takes effect on next boot)"
 
 echo "==> Enabling + starting the agent"
 systemctl daemon-reload

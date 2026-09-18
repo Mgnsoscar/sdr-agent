@@ -153,11 +153,20 @@ ran between boot and the test**, so there were no orphans to accumulate. This le
 real bug worth fixing for kill-heavy sessions, but **not** the cause of *this* fresh-boot failure —
 see §3.6.
 
-**Fixes (Phase 0):** (a) an agent `/dev/shm` sweep in `_cleanup()` **and** at boot **and** before each
-launch, removing staged dirs whose owning PID is dead; (b) a SIGTERM handler in the scripts that also
-`rmtree`s the staging dir (belt-and-suspenders on the graceful path); (c) longer term, move the
-remaining `file_source` stagers off `/dev/shm` to in-RAM `vector_source_c` (as GPS/fm_chirp already
-did) or a swept, size-capped location.
+**Fixes (Phase 0) — SHIPPED (1.27.4), with a refinement:** the two halves meet in a shared
+`paramkit/txstage.py`. (a) The scripts stage under a TAGGED, PID-bearing name
+(`/dev/shm/sdrtx-<pid>-<signal>-…`) via `txstage.staging_dir(signal)`; (b) the agent
+`txstage.sweep_orphans()` removes ONLY those tagged names whose owning PID is **dead**, run in
+`ManagedProcess._cleanup()` (post-exit / post-SIGKILL), before every managed launch, and once at
+boot (`main._boot_prevention`). The tag is what makes the sweep safe — it never touches a live
+sibling's buffers, GR's own `vmcircbuf_*` objects, or a foreign owner's shm. **Refinement over the
+original plan:** this agent-side dead-PID sweep *supersedes* a per-script SIGTERM `rmtree` handler —
+it is strictly more robust, because it also reclaims a **`SIGKILL`/crash** orphan (no handler runs
+then), which is exactly the RF-fault path. The scripts keep their existing `atexit`/`finally`
+cleanup as the graceful backstop. (c) Longer term, move the remaining `file_source` stagers off
+`/dev/shm` to in-RAM `vector_source_c` — still a follow-up. **Deferred within Phase 0:** the x410
+`*_channel.py` stagers (bare `mkstemp`, delete-after-load, tiny exposure) are not yet on the tagged
+prefix — the agent sweep only reclaims tagged orphans, so migrate them when convenient.
 
 ### 3.6 Fresh-boot, first-launch signature — the remaining explanation
 
@@ -510,12 +519,14 @@ widening the warm-up gap that makes resync imperfect. Add a **per-signal IQ-buff
 
 ## 11. Phasing / rollout
 
-- **Phase 0 — prevention & ops (cheap, parallel).** Raise ceilings; **pin the GR `vmcircbuf`
-  backend via `GR_CONF_VMCIRCBUF_DEFAULT_FACTORY` in the launch env** (not the prefs file —
-  `GR_DONT_LOAD_PREFS=1`) **+ set a stable `HOME`** for launched tasks (§3.6); **pre-image the SDR at
-  boot/arm** (§3.7); **route UHD logs to a file** so the console-off blind spot doesn't hide device
-  errors (§3.7); agent `/dev/shm`/IPC hygiene + graceful shutdown (§3.5). Directly attacks the
-  incident's fresh-boot cause and the "started after on-air" warm-up overrun.
+- **Phase 0 — prevention & ops (cheap, parallel). ✅ SHIPPED (`AGENT_VERSION 1.27.4`, no capability).**
+  Raise ceilings; **pin the GR `vmcircbuf` backend via `GR_CONF_VMCIRCBUF_DEFAULT_FACTORY` in the
+  launch env** (not the prefs file — `GR_DONT_LOAD_PREFS=1`) **+ set a stable `HOME`** for launched
+  tasks (§3.6); **pre-image the SDR at boot** (§3.7); **route UHD logs to a file** so the console-off
+  blind spot doesn't hide device errors (§3.7); agent `/dev/shm` hygiene (§3.5). Directly attacks the
+  incident's fresh-boot cause and the "started after on-air" warm-up overrun. **What shipped — see the
+  "Phase 0 — BUILT" section below for the full change list; two items deferred: arm-time pre-image
+  (needs a device mutex — Phase 1 territory) and the x410-stager tagged-prefix migration.**
 - **Phase 1 — recognize + alarm + safe-stop + keep-logs + snapshot.** Script done-watcher; agent
   watchdog + health field/event + run coupling; client loud alert + fault pill + "View fault log".
   *Independently solves "recognize it" and makes the next fault self-diagnosing.*
@@ -564,6 +575,68 @@ Each phase is independently useful and capability-gated.
   "installing image" line is suppressed, so its **absence in this incident's log is not evidence** the
   image didn't load — hence UHD logs get routed to a file (§3.7) and the FPGA cost is treated as
   independent of the `vmcircbuf` (§3.7), not its cause.
+
+## 14a. Phase 0 — BUILT (`AGENT_VERSION 1.27.4`, no capability; branch `claude/system-familiarization-f5mezz`)
+
+The prevention/ops layer, shipped cross-repo. Behaviour-only version bump so OTA can push the agent
+code; **the deploy/sysctl/HOME hardening reaches field units only via a re-provision / migrate, NOT
+the "Update agent…" button** (an OTA restart never re-installs the unit file or runs sysctl).
+
+**`sdr-agent` — new shared helper**
+- **`paramkit/txstage.py`** (pure stdlib, shared by scripts + agent): `SHM_PREFIX="sdrtx-"`,
+  `staging_dir(signal)` (tagged+PID `mkdtemp` under `/dev/shm` + `atexit` rmtree), `sweep_orphans()`
+  (remove only dead-PID `sdrtx-*` entries — never a live/foreign/untagged object), `_pid_alive`.
+
+**`sdr-agent` — agent code**
+- **`config.py`**: `TASK_HOME` (default `STATE_DIR`, a guaranteed-writable home), `GR_VMCIRCBUF_FACTORY`
+  (default `mmap_shm_open`, applied via `GR_CONF_VMCIRCBUF_DEFAULT_FACTORY`; `""` omits the pin),
+  `UHD_LOG_FILE_LEVEL` (default `info`; `""` omits UHD file logging), `SHM_SWEEP_ENABLED`,
+  `PREIMAGE_ON_BOOT`/`PREIMAGE_TIMEOUT_S`. `AGENT_VERSION 1.27.3 → 1.27.4`.
+- **`process_manager.py`**: `_launch_env_pins(task_dir)` merged at all **three** launch env-build
+  sites (`start`, `run_oneshot`, `_launch_oneshot_wait`) **between** `os.environ` and `cfg.env` —
+  so the pins beat ambient but `cfg.env`/`req.env_overrides` still win (HOME + GR backend +
+  `UHD_LOG_FILE`/level, the last a per-task file next to `current.log`). `_sweep_shm_orphans()`
+  (flag-gated, best-effort) called **before each managed launch** and in **`_cleanup()`**
+  (post-exit / post-SIGKILL). `place_ramp`/`argspec`/`ramp` untouched (drift guard intact).
+- **`system.py`**: `pre_image_sdr()` / `_preimage_sdr()` — a best-effort `uhd_usrp_probe` OPEN
+  (loads the FPGA image), NOT `uhd_find_devices`; a no-op when the tool isn't on PATH (dev/CI/mock).
+- **`main.py`**: `_boot_prevention()` in `lifespan`, **after `_seed_scripts_dir()` and before
+  `_manager.startup()`** (so the device is free and no autostart task's buffers can be swept):
+  the boot `/dev/shm` sweep, then an **awaited** (timeout-bounded) boot pre-image.
+
+**`sdr-agent` — deploy/ops**
+- **`deploy/99-sdr-agent.conf`** (new): `vm.max_map_count = 262144`, installed to `/etc/sysctl.d/`
+  from `provision_install.sh`, `migrate_layout.sh`, and `x410/install.sh` (+ a non-fatal `/dev/shm`
+  size check). Auto-bundled (`build_bundle.sh` copies `deploy/` recursively).
+- **`deploy/sdr-agent.service`** (Pi): `Environment=HOME=/root`,
+  `Environment=GR_CONF_VMCIRCBUF_DEFAULT_FACTORY=mmap_shm_open`, `LimitNOFILE=65536`.
+  **`deploy/x410/install.sh`**: `LimitNOFILE` + the GR pin in the unit heredoc (HOME already set).
+  **`deploy/run_local.sh`**: the GR pin in the dev env (dev mirrors prod).
+
+**`sdr-scripts`** — the 13 RPi loop-file stagers (Galileo/GLONASS/BeiDou/iridium) + the 4 FIFO
+stagers (gps_l1p/gps_l2p/white_noise/gaussian_noise) now stage via `txstage.staging_dir(...)`
+(tagged, sweepable), fixing two copy-paste tag bugs (`gps_l1p`, `glonass_of`) in passing. The
+incident script `fm_chirp` and the GPS `vector_source` scripts stage nothing → untouched.
+
+**Tests** (`sdr-agent`, suite 519 → 537): `tests/test_txstage.py` (sweep removes only dead-PID
+tagged orphans; keeps live/foreign/unparseable; a launch after a simulated hard kill reclaims the
+orphan; the disable flag), `tests/test_launch_env_pins.py` (pins at all three sites; HOME beats
+ambient; cfg.env/req.env_overrides beat the pins; blank config omits the key), `tests/test_preimage.py`
+(uses `uhd_usrp_probe` not `uhd_find_devices`; no-op without the tool; boot wiring sweeps-then-images,
+skips when disabled, never raises). `sdr-scripts` 99 pass (byte-compile + suite). **Verified live**:
+the agent boots clean headless — `_boot_prevention` runs, the pre-image no-ops (no radio on PATH),
+`/health` returns ok, no traceback.
+
+**Deferred within Phase 0** (documented, not built): arm-time pre-image (a scheduled arm can fire
+while another run holds the device — safe only with a real device mutex, which is Phase-1 territory
+alongside the `/sdr` device-busy gate the probe also lacks); the x410 `*_channel.py` tagged-prefix
+migration (bare `mkstemp`, delete-after-load, minimal exposure).
+
+**Rollout:** OTA-push 1.27.4 for the agent code; **re-provision / migrate** each unit (or re-provision
+via the client with a rebuilt bundle) to apply the sysctl + service-env hardening. Rebuild the client
+bundle from 1.27.4 (`deploy/build_bundle.sh`) + re-stage into `sdr-client/bundles/`. Before shipping
+the GR backend pin to the field, confirm the override var name against the deployed GR with
+`gnuradio-config-info --prefs` (§14) — an unknown name is a harmless no-op, but confirm to be sure.
 
 ## 14. Open items
 

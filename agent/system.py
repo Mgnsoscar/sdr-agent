@@ -310,3 +310,31 @@ def _probe_sdr() -> SdrStatus:
 async def get_sdr_status() -> SdrStatus:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _probe_sdr)
+
+
+def _preimage_sdr(timeout: float) -> str:
+    """Open the SDR once so UHD loads the FPGA image — the slow, variable first-open cost that
+    otherwise lands inside the first transmit task's flowgraph construction (and has once made a
+    signal start after its on-air time). Uses ``uhd_usrp_probe``, which OPENS the device and loads
+    the image, NOT ``uhd_find_devices`` (enumerate-only, the /sdr path — it never loads the image).
+    Best-effort and never raises. A no-op when ``uhd_usrp_probe`` is not on PATH (a no-radio box, so
+    it costs nothing in dev/CI). MUST be called only while no task holds the single TX channel —
+    the caller guarantees that (boot, before any task launches). See docs/rf-fault-recovery.md §3.7."""
+    exe = shutil.which("uhd_usrp_probe")
+    if exe is None:
+        return "uhd_usrp_probe not on PATH — pre-image skipped"
+    try:
+        subprocess.run([exe], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # The image load happens early in device init, so the probe very likely loaded it before
+        # timing out on the (slower) full property enumeration — not a failure, just bounded.
+        return f"uhd_usrp_probe timed out after {timeout}s (image likely loaded)"
+    except OSError as exc:
+        return f"SDR pre-image failed: {exc}"
+    return "SDR pre-imaged (FPGA image loaded)"
+
+
+async def pre_image_sdr(timeout: float = 45.0) -> str:
+    """Async wrapper: run the blocking device open in the thread pool so it never stalls the loop."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _preimage_sdr, timeout)

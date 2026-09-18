@@ -93,7 +93,7 @@ from .updater import Updater, UpdateError
 from . import calibration as _calib
 from .client_state import ClientStateStore
 from .argspec import extract_params
-from .process_manager import ProcessManager
+from .process_manager import ProcessManager, _sweep_shm_orphans
 from .scheduler import Scheduler
 from .sequence_runner import SequenceRunner
 from .mdns import MdnsAdvertiser
@@ -132,6 +132,12 @@ async def lifespan(app: FastAPI):
     # seeds the release's bundled scripts; the first boot after an agent upgrade migrates the
     # previous release's library into the persistent dir so it isn't lost with the old release.
     _seed_scripts_dir()
+
+    # RF-fault prevention (docs/rf-fault-recovery.md Phase 0), before any task launches: reclaim
+    # dead-PID /dev/shm staging orphans from a prior boot, then pre-image the SDR (load its FPGA
+    # image now, while the device is provably free) so the first task warms up fast instead of
+    # paying the one-time image load at on-air. Best-effort; a no-radio box makes pre-image a no-op.
+    await _boot_prevention()
 
     tasks = cfg.load_tasks()
     _manager = ProcessManager(tasks, cfg.LOG_DIR, cfg.UNIT_ID)
@@ -636,6 +642,28 @@ def _seed_scripts_dir() -> None:
         logger.info("Seeded persistent scripts dir %s from %s (%d file[s])", dest, src, copied)
     except OSError as exc:
         logger.warning("Could not seed scripts dir %s from %s: %s", dest, src, exc)
+
+
+async def _boot_prevention() -> None:
+    """RF-fault Phase-0 boot hooks, run once at startup BEFORE any task launches (so the device is
+    free for the pre-image and the sweep can't touch a live task's buffers). Both best-effort — a
+    failure here never blocks the agent coming up.
+      1. Sweep dead-PID /dev/shm staging orphans (SDR_SHM_SWEEP=0 to disable).
+      2. Pre-image the SDR via uhd_usrp_probe (SDR_PREIMAGE_ON_BOOT=0 to disable). Awaited (bounded
+         by SDR_PREIMAGE_TIMEOUT_S) so the image is loaded before autostart tasks can grab the
+         device; a no-op with no radio on PATH, so dev/CI/mock units are unaffected."""
+    try:
+        _sweep_shm_orphans()
+    except Exception as exc:            # noqa: BLE001 — never block startup
+        logger.warning("Boot /dev/shm sweep failed: %s", exc)
+
+    if not cfg.PREIMAGE_ON_BOOT:
+        return
+    try:
+        result = await sysmon.pre_image_sdr(cfg.PREIMAGE_TIMEOUT_S)
+        logger.info("Boot SDR pre-image: %s", result)
+    except Exception as exc:            # noqa: BLE001 — never block startup
+        logger.warning("Boot SDR pre-image failed: %s", exc)
 
 
 @app.post("/scripts/upload", tags=["scripts"], dependencies=[Depends(verify_key)])

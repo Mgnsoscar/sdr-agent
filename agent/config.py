@@ -395,7 +395,11 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # retune of it; the resolver anchors the measurement de-embed + source-bias zero at
 # center_freq_hz regardless of the fold frequency; calkit can fold with the components PINNED
 # (a drifting tone). Behaviour only, no capability.
-AGENT_VERSION = "1.27.3"
+# 1.27.4: RF-fault prevention (Phase 0, docs/rf-fault-recovery.md) — launch-env pins (HOME +
+# GR vmcircbuf backend + UHD file logging), a dead-PID /dev/shm sweep (boot / pre-launch /
+# post-kill), and boot-time SDR pre-imaging. Behaviour only, NO new capability (no HTTP surface;
+# an older agent just lacks the hardening) — the bump lets OTA push it onto deployed units.
+AGENT_VERSION = "1.27.4"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -531,6 +535,56 @@ AGENT_CAPABILITIES = [
 # that's the system python3 with UHD, distinct from the agent's own bundled python.
 # Override with SDR_TASK_INTERPRETER only if tasks need a specific interpreter path.
 TASK_INTERPRETER = os.environ.get("SDR_TASK_INTERPRETER", "python3")
+
+
+# ── RF-fault prevention (docs/rf-fault-recovery.md Phase 0) ────────────────────
+# Launch-env PINS applied to every transmit task's environment (process_manager merges them
+# ABOVE ambient os.environ but BELOW the task's own cfg.env / request env_overrides, so a task
+# can still override any of them). Prevention for the GNU Radio `vmcircbuf` startup failure and
+# the "flying blind on UHD" diagnostic gap:
+
+def _env_flag(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+# A stable, WRITABLE HOME for launched tasks. The Pi service historically set none, leaving a
+# task's ~ undefined/varies (so GNU Radio's ~/.gnuradio handling was non-deterministic). Default
+# to STATE_DIR — the agent already owns and writes it (logs/data/scripts), so ~/.gnuradio always
+# lands somewhere writable. Override with SDR_TASK_HOME (empty → don't pin, inherit ambient HOME).
+TASK_HOME = os.environ.get("SDR_TASK_HOME", str(STATE_DIR))
+
+# Pin the GNU Radio vmcircbuf backend via GR's config-override env var. The scripts set
+# GR_DONT_LOAD_PREFS=1 (a repo-wide os.environ.setdefault, for a faster startup), so GR never
+# reads ~/.gnuradio/prefs — a prefs-file pin is IGNORED; it MUST be this launch-env override.
+# `mmap_shm_open` is GR's standard, self-unlinking (self-cleaning on death) default: pinning it
+# makes the backend deterministic and skips the startup probe, and it is a no-op-or-better on a
+# correctly-configured box. VERIFY-FIRST: the exact override var NAME can differ by GR version
+# (§14) — an unknown var name is a harmless no-op. Set SDR_GR_VMCIRCBUF_FACTORY="" to omit the
+# pin entirely (e.g. once gnuradio-config-info confirms a different scheme).
+GR_VMCIRCBUF_ENV     = "GR_CONF_VMCIRCBUF_DEFAULT_FACTORY"
+GR_VMCIRCBUF_FACTORY = os.environ.get("SDR_GR_VMCIRCBUF_FACTORY", "mmap_shm_open")
+
+# Route UHD's log to a FILE (per task, next to current.log) at a useful level, WITHOUT touching
+# the scripts' UHD_LOG_CONSOLE_LEVEL=off — so the FPGA image-load line, UHD init warnings and any
+# device error are captured on disk even though the console stays silent (the blind spot that hid
+# the "installing image" line in the incident). "info" catches the image load. Empty → no file log.
+UHD_LOG_FILE_ENV       = "UHD_LOG_FILE"
+UHD_LOG_FILE_LEVEL_ENV = "UHD_LOG_FILE_LEVEL"
+UHD_LOG_FILE_LEVEL     = os.environ.get("SDR_UHD_LOG_FILE_LEVEL", "info")
+UHD_LOG_FILE_NAME      = "uhd.log"   # basename inside each task's log dir
+
+# Sweep dead-PID /dev/shm staging orphans (paramkit.txstage, prefix "sdrtx-") at boot, before each
+# launch, and after each task ends. Cheap + safe (removes only our tagged, dead-owner dirs).
+SHM_SWEEP_ENABLED = _env_flag("SDR_SHM_SWEEP", True)
+
+# Pre-image the SDR at boot: open the device with `uhd_usrp_probe` (which loads the FPGA image)
+# while no task holds it, so the first real task warms up fast/predictably instead of paying the
+# one-time image load at on-air (the "started after on-air" miss). A no-op with no radio on PATH.
+PREIMAGE_ON_BOOT   = _env_flag("SDR_PREIMAGE_ON_BOOT", True)
+PREIMAGE_TIMEOUT_S = float(os.environ.get("SDR_PREIMAGE_TIMEOUT_S", "45"))
 
 # ── Auth (optional shared secret) ────────────────────────────────────────────
 # Set SDR_API_KEY on both the Pi and your client. Leave empty to disable auth.

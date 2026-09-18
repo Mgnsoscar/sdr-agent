@@ -13,6 +13,13 @@ Environment=PYTHONPATH=/opt/sdr-agent
 Environment=SDR_STATE_DIR=/opt/sdr-agent-shared
 Environment=SDR_RELEASES_DIR=/opt/sdr-agent-releases
 Environment=SDR_CURRENT_LINK=/opt/sdr-agent
+# RF-fault prevention (docs/rf-fault-recovery.md §3.6): a stable, writable HOME so GNU Radio's
+# ~/.gnuradio handling is deterministic (the agent per-task pin overrides this for launched tasks;
+# this is the agent process's own home). Belt-and-suspenders GR vmcircbuf backend pin — the agent
+# also pins it per task; a service-level default reaches any GR the agent invokes directly. The
+# scripts set GR_DONT_LOAD_PREFS=1, so this GR_CONF_* launch-env override is the only pin GR reads.
+Environment=HOME=/root
+Environment=GR_CONF_VMCIRCBUF_DEFAULT_FACTORY=mmap_shm_open
 # --timeout-graceful-shutdown bounds uvicorn's "waiting for connections to close" on
 # SIGTERM. Without it, a restart (as an OTA update triggers) hangs indefinitely while a
 # client holds keep-alive connections open and keeps polling — so the old process only
@@ -24,6 +31,9 @@ RestartSec=5
 # Backstop the graceful shutdown so a stuck restart can never outlast the OTA
 # confirm grace (kept well under it, and above the graceful-shutdown timeout above).
 TimeoutStopSec=20
+# A generous open-file limit for the agent's children (GNU Radio flowgraphs open many fds —
+# vmcircbuf buffers, UHD, control sockets); inherited by launched transmit tasks. (§3.4)
+LimitNOFILE=65536
 
 # Set a shared secret so /admin/* (and the rest of the API) require it.
 # Environment=SDR_API_KEY=changeme

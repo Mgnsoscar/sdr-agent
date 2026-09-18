@@ -4,7 +4,10 @@
 **Prepared:** 2026-09-18
 **Severity:** High (visible test disruption in front of stakeholders; no safety/hardware damage)
 **Status:** Root cause characterized; fix designed and phased (see
-`docs/rf-fault-recovery.md`). Awaiting go-ahead to build.
+`docs/rf-fault-recovery.md`). **Phase 0 (prevention) is now implemented** — the shared-memory
+ceilings are raised, the buffer area is kept clean around each run, the radio's buffer backend is
+pinned, the SDR is pre-imaged at boot, and the radio's own log is captured to disk. Detection +
+alarm (Phase 1) and one-click restart-and-resync (Phase 2) are the next builds.
 
 ---
 

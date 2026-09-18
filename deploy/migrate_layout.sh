@@ -58,6 +58,11 @@ install -m644 "$HERE/deploy/sdr-agent-confirm.service"  /etc/systemd/system/sdr-
 install -m644 "$HERE/deploy/sdr-agent-confirm.timer"    /etc/systemd/system/sdr-agent-confirm.timer
 install -m755 "$HERE/deploy/sdr-agent-confirm.sh"       /usr/local/bin/sdr-agent-confirm
 
+echo "==> Installing kernel tuning (vm.max_map_count)"
+install -m644 "$HERE/deploy/99-sdr-agent.conf"          /etc/sysctl.d/99-sdr-agent.conf
+sysctl -p /etc/sysctl.d/99-sdr-agent.conf >/dev/null 2>&1 || \
+    echo "    (note: could not apply sysctl now; it takes effect on next boot)"
+
 systemctl daemon-reload
 systemctl enable --now sdr-agent-confirm.timer
 systemctl restart sdr-agent
