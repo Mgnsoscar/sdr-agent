@@ -90,6 +90,59 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — RF-fault DETECTION (Phase 1): COMPLETE (1.28.0, capability `task-rf-health`) (branch `claude/system-familiarization-f5mezz`, cross-repo)
+Detect a dead-but-alive GNU Radio flowgraph (a halt that does NOT exit — the SDR is silent while the
+task reads RUNNING), alarm loudly on the client, auto-drop RF, and capture a self-diagnosing resource
+snapshot. Design + full change list: `docs/rf-fault-recovery.md` §14b "Phase 1 — BUILT". Detection is
+LAYERED so no single blind spot hides a halt; **health is a SEPARATE axis from `ProcessState`** (a
+halted flowgraph is still process-RUNNING — its fault can't be a `ProcessState` value without racing
+the exit machine). Suite 537 → 553. `argspec`/`ramp` untouched (drift guard intact).
+- **`paramkit/txhealth.py`** (new, shared) — `watch_flowgraph(tb, stop, *, reason=…, stream=…)`: a
+  daemon thread that calls `tb.wait()`; GR does NOT re-raise a halted flowgraph to Python, so
+  `tb.wait()` RETURNING with `stop` still UNSET IS the fault signal. It prints `FAULT_MARKER`
+  (`HEALTH state=faulted reason="…"`, flushed whole), sets `stop`, latches `.faulted=True`; the script
+  does `return 1 if _health.faulted else 0`. Marker + non-zero exit = Layer 1.
+- **`process_manager.py`** — Layer 2 **watchdog** `_health_loop` (every `HEALTH_POLL_S`≈2 s) scans each
+  RUNNING not-yet-alarmed task's NEW log bytes (`log.read_since`, inode/truncation-safe) for a
+  `HEALTH_FAULT_PATTERNS` signature (marker / `vmcircbuf` / `boost::interprocess`) — the ONLY path for
+  the true-wedge case (no exit + no done-watcher). A hit → `_flag_rf_fault(detail)` (idempotent latch:
+  `health=RF_FAULT`, snapshot, event, `_fault_hook`) → auto-drop RF via `proc.stop()` (SIGTERM→SIGKILL;
+  idempotent). `_watch`'s crash branch routes an rf-fault exit (health flagged OR log tail matches) to
+  `_flag_rf_fault` too. `_fire_health_event` puts a `TaskHealthEvent` on the SSE stream. `set_fault_hook`
+  wired in `main.py` after the manager + runner exist.
+- **`sequence_runner.py`** — `on_task_fault(task_name, detail)` COUPLES a task fault into the owning run
+  (under `self._lock`, via the refactored `_live_tasks_of`): stamps `run.fault`/`fault_task`/`fault_at`,
+  marks that task's un-fired steps `"skipped"` (the `hold_now` sentinel), persists, fires
+  `sequence_rf_fault`. An rf_fault FIELD on a still-RUNNING run — NOT a terminal `SequenceState` (the
+  restart is Phase 2).
+- **`system.py`** — `capture_fault_snapshot(...)` (async wrapper `fault_snapshot`, off-loop): a
+  best-effort snapshot that READS THE PHASE-0 ENV WORK BACK — effective `GR_CONF_VMCIRCBUF_DEFAULT_FACTORY`
+  (env vs `gnuradio-config-info --prefs` compiled), `/dev/shm` used/total, `/proc/pid/maps` count vs
+  `vm.max_map_count`, RSS, `RLIMIT_NOFILE`, HOME, `ipcs -m` (only if a SysV backend is implicated), the
+  UHD-log tail → `snapshot_<ts>.json` beside the run log (`snapshot_path` set BEFORE the write). Every
+  subprocess `timeout`-bounded + guarded; never raises. `log_manager.cleanup` prunes `snapshot_*.json`.
+- **`models.py`** — `TaskHealth` (only OK/RF_FAULT set in P1; STALLED/UNKNOWN reserved),
+  `ProcessStatus.health`/`health_detail`/`last_output_at`, `FaultSnapshot`, `TaskHealthEvent`,
+  `SequenceRun.fault`/`fault_task`/`fault_at`, the `sequence_rf_fault` webhook type (all defaulted).
+  **`config.py`** — `HEALTH_WATCH_ENABLED`/`HEALTH_POLL_S`/`HEALTH_FAULT_PATTERNS`, capability
+  `task-rf-health`, `AGENT_VERSION 1.27.4 → 1.28.0`.
+- **`sdr-scripts`** — the 30 CLEAN-set RPi scripts (repeat=True/continuous, incl. `fm_chirp`) adopt
+  `watch_flowgraph(tb, stop)`; the 4 FIFO stagers (`gps_l1p`/`gps_l2p`/`white_noise`/`gaussian_noise`,
+  repeat=False) are EXCLUDED (a normal EOF returns `tb.wait()` with `stop` unset → a FALSE fault; they
+  rely on the watchdog). See its CLAUDE.md.
+- **`sdr-client`** — the loud alarm (`main_window._on_alert` beep+flash / `_on_fault` raise+tray), the
+  fault-snapshot diagnosis dialog, fault pills on the task/sequence rows + fleet card, `task-rf-health`
+  gate (Phase-2 Restart only). See its CLAUDE.md.
+Tests: `tests/test_txhealth.py`, `tests/test_task_health.py`, `tests/test_fault_snapshot.py`,
+`test_meta_endpoint.py` (asserts the capability). **Verified LIVE**: the marker injected into a running
+mock task → rf_fault + auto-drop + a snapshot recovering the P0 env work (`mmap_shm_open`, HOME) from
+`/proc/pid/environ`; an ordinary crash does NOT false-positive. **Adversarial review** (find→verify):
+0 confirmed defects (a split-token log miss + an abandoned-shutdown auto-drop were both refuted —
+whole-line atomic writes + the redundant exit path; and `shutdown` reaps every proc via its own
+idempotent stop gather). **NEXT — Phase 2**: `restart_run` + `POST …/restart`, resync/replay,
+`sequence-restart`. **Rollout:** OTA-push 1.28.0; no re-provision for detection (agent/script code);
+rebuild the client bundle from 1.28.0.
+
 ## Current state — RF-fault PREVENTION (Phase 0): COMPLETE (1.27.4) (branch `claude/system-familiarization-f5mezz`, cross-repo)
 The prevention/ops layer of the RF-fault design (`docs/rf-fault-recovery.md` §14a "Phase 0 — BUILT").
 Behaviour only, NO capability (`AGENT_VERSION 1.27.3 → 1.27.4`); `argspec`/`ramp` untouched (drift
@@ -129,7 +182,7 @@ live: the agent boots clean headless (pre-image no-ops with no radio, `/health` 
 alarm + a fault-time resource/backend/UHD-log snapshot (which reads the P0 env work back). Full
 design + phasing in `docs/rf-fault-recovery.md`.
 
-## Current state — RF-fault detection & sequence recovery: DESIGN — P0 BUILT (1.27.4); P1–P3 pending (branch `claude/system-familiarization-f5mezz`, cross-repo)
+## Current state — RF-fault detection & sequence recovery: DESIGN — P0–P1 BUILT (1.28.0); P2–P3 pending (branch `claude/system-familiarization-f5mezz`, cross-repo)
 Field incident: an `fm_chirp` `--power` sweep (Pi 5) hit a GNU Radio **`vmcircbuf`** (shared-memory
 buffer) error **at startup** but the script did NOT exit, so the agent showed the task RUNNING while the
 SDR sent nothing; recovery was a manual plan-rebuild + eyeballed ramp position. Root cause + fix are

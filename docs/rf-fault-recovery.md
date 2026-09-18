@@ -646,6 +646,84 @@ bundle from 1.27.4 (`deploy/build_bundle.sh`) + re-stage into `sdr-client/bundle
 the GR backend pin to the field, confirm the override var name against the deployed GR with
 `gnuradio-config-info --prefs` (§14) — an unknown name is a harmless no-op, but confirm to be sure.
 
+## 14b. Phase 1 — BUILT (`AGENT_VERSION 1.28.0`, capability `task-rf-health`; branch `claude/system-familiarization-f5mezz`)
+
+Detection + loud alarm + auto-drop-RF + a self-diagnosing fault snapshot, shipped cross-repo. The
+detection is LAYERED so no single blind spot hides a halt, and health is a **separate axis** from the
+exit-driven `ProcessState` (a halted flowgraph is still process-RUNNING — its fault can't be a
+`ProcessState` value without racing the exit machine).
+
+**`sdr-agent` — detection core**
+- **`paramkit/txhealth.py`** (new, shared): `watch_flowgraph(tb, stop, *, reason=…, stream=…)` — a
+  daemon thread that calls `tb.wait()`; GNU Radio does NOT re-raise a halted flowgraph to Python, so
+  `tb.wait()` RETURNING with the `stop` flag still UNSET IS the fault signal. On that, it prints the
+  `FAULT_MARKER` line (`HEALTH state=faulted reason="…"`, flushed whole), sets `stop`, and latches
+  `.faulted=True` (a `Watcher`); the script then `return 1 if _health.faulted else 0`. A clean stop
+  (`stop` already set) is a no-op. The marker + non-zero exit is Layer 1; a whole-line atomic write
+  means the agent's log scan can't split the token.
+- **`process_manager.py`** — the Layer-2 **watchdog**: `_health_loop` (every `HEALTH_POLL_S`≈2 s)
+  scans each RUNNING, not-yet-alarmed task's NEW log bytes (`ManagedProcess.log.read_since`, inode/
+  truncation-safe) for a `HEALTH_FAULT_PATTERNS` signature (the marker, `vmcircbuf`, `boost::interprocess`)
+  — this is the ONLY path for the true-wedge case (no exit + no done-watcher, e.g. the FIFO-excluded
+  scripts). A hit → `proc._flag_rf_fault(detail)` (idempotent latch: sets `health=RF_FAULT`, captures
+  the snapshot, fires the event, calls the runner's `_fault_hook`) → auto-drop RF via `proc.stop()`
+  (SIGTERM→grace→SIGKILL; idempotent so it never collides with an abort/deadman). `_watch`'s crash
+  branch routes an rf-fault exit (health already flagged OR the log tail matches) to `_flag_rf_fault`
+  instead of a plain crash event, so the Layer-1 exit path stamps health too. `_fire_health_event`
+  puts a `TaskHealthEvent` on the SSE stream (fire-and-forget). `set_fault_hook` is wired in `main.py`
+  AFTER both the manager and runner exist.
+- **`sequence_runner.py`** — `on_task_fault(task_name, detail)` COUPLES a task fault into the run that
+  owns it (under `self._lock`, via the refactored `_live_tasks_of`): stamps `run.fault`/`fault_task`/
+  `fault_at`, marks that task's un-fired steps `"skipped"` (the `hold_now` sentinel — the run stops
+  re-commanding a dead task), persists, and fires `sequence_rf_fault`. An rf_fault FIELD on a still-
+  RUNNING run — NOT a terminal `SequenceState` (lower-risk; the actual restart is Phase 2).
+- **`system.py`** — `capture_fault_snapshot(pid, uhd_log, task_dir, log_path)` (async wrapper
+  `fault_snapshot`, off-loop via the executor): a best-effort resource snapshot that READS THE PHASE-0
+  ENV WORK BACK — the effective `GR_CONF_VMCIRCBUF_DEFAULT_FACTORY` (env vs `gnuradio-config-info
+  --prefs` compiled default), `/dev/shm` used/total, `/proc/pid/maps` count vs `vm.max_map_count`, RSS,
+  `RLIMIT_NOFILE`, `HOME`, `ipcs -m` (only when a SysV backend is implicated), the per-task UHD-log
+  tail — written to `snapshot_<ts>.json` beside the run log (`snapshot_path` set BEFORE the write).
+  Every subprocess is `timeout`-bounded + guarded; never raises. `log_manager.cleanup` prunes
+  `snapshot_*.json` on the same keep-N/max-age policy as the run logs.
+- **`models.py`** — `TaskHealth` enum (only OK/RF_FAULT set in P1; STALLED/UNKNOWN reserved),
+  `ProcessStatus.health`/`health_detail`/`last_output_at`, `FaultSnapshot`, `TaskHealthEvent`,
+  `SequenceRun.fault`/`fault_task`/`fault_at`, and the `sequence_rf_fault` webhook type. All defaulted
+  (skew-safe). **`config.py`** — `HEALTH_WATCH_ENABLED`/`HEALTH_POLL_S`/`HEALTH_FAULT_PATTERNS`; the
+  `task-rf-health` capability; `AGENT_VERSION 1.27.4 → 1.28.0`. `argspec`/`ramp` untouched.
+
+**`sdr-scripts`** — the 30 CLEAN-set RPi scripts (repeat=True/continuous, incl. the incident `fm_chirp`)
+adopt `watch_flowgraph(tb, stop)` after `tb.start()` + the gated return. The FIFO caution-set
+(`gps_l1p`/`gps_l2p`/`white_noise`/`gaussian_noise`, repeat=False) is **EXCLUDED** — a normal EOF also
+returns `tb.wait()` with `stop` unset and would read as a FALSE fault; they rely on the agent watchdog.
+
+**`sdr-client`** — the loud alarm + fault surfacing (all client-only): `api/models.py` mirrors the
+health axis field-for-field (defaulted); `webhook/classify.py` routes `task_health` to `TaskHealthEvent`
+with a branch BEFORE the generic `task_`→`TaskEvent` rule; `ui/main_window.py` implements the alarm —
+`_on_alert` (beep + taskbar flash, every alert) and the fault-only `_on_fault` (un-minimise + raise +
+a persistent system-tray balloon), all headless/no-tray no-op-safe; `ui/fault_detail_dialog.py` (new)
+renders the snapshot as a self-diagnosis (backend / `/dev/shm` / VMA maps / fd limit, `vmcircbuf`
+suspects flagged) + the log tail, opened by double-clicking the alert-feed fault row; a fault overrides
+the state pill (red "RF FAULT") on the task row, the sequence row, and wins the fleet card's task line;
+`ui/theme.py` `rf_fault` colour; `ui/timeline_model.py` `task-rf-health` gate (reserved for the Phase-2
+Restart button — the P1 pill/alarm render unconditionally, since they only reflect data an older agent
+never sends).
+
+**Tests**: `sdr-agent` 540 → 553 (`test_txhealth.py`, `test_task_health.py`, `test_fault_snapshot.py`,
+`test_meta_endpoint.py`); `sdr-scripts` 99 → 102 (`test_txhealth_adoption.py` — 30 clean adopters, the
+4 FIFO excluded, mocks unaffected); `sdr-client` 1108 → 1128 (`test_rf_fault_ui.py`). **Verified live**
+end-to-end: the fault marker injected into a running mock task → `rf_fault` health + auto-drop + a
+snapshot recovering the P0 env work (`mmap_shm_open` backend, HOME) from the live task's `/proc/pid/environ`;
+an ordinary crash (no fault signature) does NOT false-positive. **Adversarial review** (find→verify,
+5 dimensions): 0 confirmed defects (the two surfaced findings — a split-token log miss, an abandoned
+shutdown auto-drop — were refuted: whole-line atomic writes + the redundant exit path; and `shutdown`
+reaps every RUNNING proc via its own idempotent `stop` gather).
+
+**Rollout:** OTA-push 1.28.0 (behaviour + the new capability). No re-provision needed for detection
+(the watchdog + done-watcher are agent/script code); the Phase-0 sysctl/service-env hardening still
+needs a re-provision, unchanged. Rebuild the client bundle from 1.28.0 + re-stage into
+`sdr-client/bundles/`. **Deferred to Phase 2**: `SequenceRunner.restart_run` + `POST …/restart`,
+resync/replay, the `sequence-restart` capability, and the client Restart button.
+
 ## 14. Open items
 
 - Retrieve the archived `run_<ts>.log` from the affected unit + `df /dev/shm` /
