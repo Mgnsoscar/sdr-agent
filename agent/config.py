@@ -405,7 +405,15 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # an exit; a TaskHealthEvent fires over SSE, the fault couples into the owning run (run.fault +
 # stop tuning the dead task), RF is auto-dropped, and a §6.3 resource snapshot is captured. Adds
 # capability `task-rf-health` (the client gates its fault pill / loud alarm on it).
-AGENT_VERSION = "1.28.0"
+# 1.29.0: RF-fault RECOVERY (Phase 2, docs/rf-fault-recovery.md §7) — SequenceRunner.restart_run +
+# POST /sequence-runs/{id}/restart recover a RUNNING run whose task RF-faulted (Phase 1 stamped
+# run.fault). IN-PLACE on the same run: reconstruct the crash-time level L_now from the last fired
+# power-carrying step, relaunch the faulted task transmitting at L_now with RF on (born at the level
+# — the attenuator is positioned before the process starts, no hot blip, no socket-bind race), and
+# re-instate the ramp remainder + STOP that the fault had skipped — on the ORIGINAL schedule (resync,
+# the default) or shifted later by the downtime (replay). Adds capability `sequence-restart` (the
+# client gates its Restart button on it; an older agent 404s the endpoint).
+AGENT_VERSION = "1.29.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -539,7 +547,13 @@ AGENT_CAPABILITIES = [
                                          # TaskHealthEvent over SSE when a task goes dead-but-alive
                                          # (a halted GR flowgraph). The client gates its fault pill +
                                          # loud alarm on this string; an older agent simply never
-                                         # reports a fault. (sequence-restart is Phase 2, not here.)
+                                         # reports a fault.
+    "sequence-restart",                  # RF-fault RECOVERY (Phase 2): POST /sequence-runs/{id}/
+                                         # restart recovers a run whose task RF-faulted — relaunch
+                                         # the task at its crash-time level (RF on) and re-instate
+                                         # the ramp remainder + STOP, on the original schedule
+                                         # (resync) or shifted by the downtime (replay). The client
+                                         # gates its Restart button on this string.
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills

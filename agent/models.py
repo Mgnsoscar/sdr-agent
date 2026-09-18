@@ -580,9 +580,23 @@ class ProceedRequest(BaseModel):
     steps: Optional[list[SequenceStep]] = None
 
 
+class RestartRequest(BaseModel):
+    """Body for the (Phase 2) POST /sequence-runs/{id}/restart — recover a RUNNING run whose task
+    was detected dead-but-alive (Phase 1 stamped run.fault). docs/rf-fault-recovery.md §7.
+
+    mode: "resync" (default) keeps the original on_air_at/on_air_end — the faulted task's remaining
+    ramp points + STOP keep their absolute fire_at, so the signal rejoins the schedule at the level
+    it should be at now (the missed slice is a silence gap). "replay" shifts the faulted task's
+    remaining fires and on_air_end LATER by the downtime, so the whole remaining profile is delivered.
+    restart_at: the recovery instant (absolute UTC ISO-8601); the server clock is used when omitted
+    (only set by tests / a deterministic caller)."""
+    mode: str = "resync"               # "resync" | "replay"
+    restart_at: Optional[str] = None   # UTC ISO-8601; None → server now
+
+
 class SequenceWebhook(BaseModel):
     """Event emitted on the SSE stream on sequence-run lifecycle transitions."""
-    type: str                          # sequence_started | sequence_on_air | sequence_step | sequence_off_air | sequence_stopped | sequence_aborted | sequence_modified | sequence_hold | sequence_proceed | sequence_hold_timeout | sequence_rf_fault
+    type: str                          # sequence_started | sequence_on_air | sequence_step | sequence_off_air | sequence_stopped | sequence_aborted | sequence_modified | sequence_hold | sequence_proceed | sequence_hold_timeout | sequence_rf_fault | sequence_restart
     unit_id: str
     run_id: str
     sequence_name: str

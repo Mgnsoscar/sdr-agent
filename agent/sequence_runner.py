@@ -38,8 +38,8 @@ from typing import Dict, List, Optional, Tuple
 from . import ramp
 from .log_manager import LogManager
 from .models import (
-    ArmSequenceRequest, CreateSequenceRequest, ProceedRequest, Sequence, SequenceRun,
-    SequenceState, SequenceStep, StepAction, StepFire, StepOverride,
+    ArmSequenceRequest, CreateSequenceRequest, ProceedRequest, RestartRequest, Sequence,
+    SequenceRun, SequenceState, SequenceStep, StepAction, StepFire, StepOverride,
     SequenceWebhook,
 )
 from .process_manager import ProcessManager, _POWER_FLAGS
@@ -1169,6 +1169,227 @@ class SequenceRunner:
                          detail="holding (fast-forwarded) — awaiting proceed")
         logger.info("Run %s HOLDING (fast-forwarded; %d window-A step(s) skipped)", run.id, skipped)
         return run
+
+    async def restart_run(self, run_id: str, req: RestartRequest) -> SequenceRun:
+        """RF-fault RECOVERY (docs/rf-fault-recovery.md §7). Recover a RUNNING run whose task was
+        detected dead-but-alive — Phase-1 `on_task_fault` stamped run.fault/fault_task and marked
+        that task's un-fired steps 'skipped' (so the tick stopped tuning a dead task), while KEEPING
+        the run RUNNING (a fault is a FIELD, not a terminal state — §5.3). This recovers IN PLACE on
+        that same run (no re-arm, no channel-guard re-run, the run log stays open):
+
+          1. Reconstruct L_now = the level the faulted task was transmitting at `now` — the value of
+             its last FIRED power-carrying step (a ramp point's tune, or the launch --power). A ramp
+             is a staircase of held levels, so the last-passed level is EXACTLY what a never-faulted
+             peer transmits now — no interpolation, no eyeballing.
+          2. Skip every past-due un-fired fire (the elapsed up-ramp of the faulted task is already
+             skipped; this catches any straggler), leaving future fires to run.
+          3. Re-instate the faulted task's FUTURE fires that the fault skipped (its ramp remainder +
+             its STOP), so the run continues + stops. resync (default): on their ORIGINAL fire_at, so
+             the signal rejoins the schedule. replay: shifted later by the downtime (now - fault_at),
+             with on_air_end shifted too, so the whole remaining profile is delivered.
+          4. Relaunch the faulted task with ONE synthetic `start` fire at `now`: its original launch
+             args with --power overridden to L_now and the RF gate forced ON. The task is born
+             transmitting at exactly L_now — the attenuator is positioned for L_now at the carrier
+             BEFORE the process starts (start → _gate_precommand(cmd=)), so there is no hot blip and
+             no control-socket race (we do NOT tune-after-launch, which would fire before the
+             relaunched script binds its socket and be silently dropped — the level rides the launch
+             command instead).
+          5. Clear run.fault — recovered.
+
+        Requires run.state RUNNING and run.fault set (else ValueError → 409); unknown run → KeyError
+        → 404. A replay whose shifted off-air would overlap another active run on the channel is
+        refused (the operator can resync instead)."""
+        # Validate + read the faulted task under a short lock.
+        async with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise KeyError(f"Unknown run: '{run_id}'")
+            if run.state != SequenceState.RUNNING:
+                raise ValueError(
+                    f"cannot restart a run in state '{run.state}' (it is not running)")
+            if not (run.fault and run.fault_task):
+                raise ValueError("this run has no RF fault to restart from")
+            task = run.fault_task
+            mode = (req.mode or "resync").strip().lower()
+            if mode not in ("resync", "replay"):
+                raise ValueError(f"unknown restart mode '{req.mode}' (use 'resync' or 'replay')")
+            now = _parse(req.restart_at) if req.restart_at else _utcnow_dt()
+            fault_at = _parse(run.fault_at) if run.fault_at else now
+            downtime = max(0.0, (now - fault_at).total_seconds())
+
+        # Ensure the faulted process is STOPPED before the synthetic relaunch — the Phase-1 watchdog
+        # auto-drops RF (proc.stop) around the fault, but the exit path or a race could leave it up,
+        # and start() refuses an already-running proc. Idempotent + best-effort, outside the lock.
+        try:
+            await self._manager.stop(task, source="sequence")
+        except Exception as exc:                     # noqa: BLE001 — already stopped is fine
+            logger.debug("restart: pre-stop of '%s' failed (already stopped?): %s", task, exc)
+
+        async with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise KeyError(f"Unknown run: '{run_id}'")
+            l_now = self._reconstruct_level(run, task, now)
+
+            # (2) Neutralize any past-due un-fired fire (the faulted task's elapsed up-ramp is
+            # already 'skipped'; this is the belt-and-suspenders general rule from §7.3 step 3).
+            for s in run.steps:
+                if s.fired_actual is None and _parse(s.fire_at) <= now:
+                    s.fired_actual = "skipped"
+
+            # (3) Re-instate the faulted task's FUTURE fires the fault skipped so the ramp remainder
+            # and the STOP run again. resync keeps their fire_at; replay shifts them later.
+            shift = timedelta(seconds=downtime) if mode == "replay" else timedelta(0)
+            for s in run.steps:
+                if s.task_name != task or s.fired_actual != "skipped":
+                    continue
+                ft = _parse(s.fire_at)
+                if ft > now:
+                    s.fired_actual = None
+                    if shift:
+                        s.fire_at = (ft + shift).isoformat()
+
+            # replay also floats off-air later; refuse if the shifted window collides with a peer.
+            if mode == "replay" and shift and run.on_air_end:
+                new_end = _parse(run.on_air_end) + shift
+                self._guard_replay_channel(run, now, new_end)
+                run.on_air_end = new_end.isoformat()
+                self._off_air_marked.discard(run.id)   # let the off-air marker fire at the new end
+
+            # (4) The synthetic relaunch: born at L_now, RF on.
+            relaunch = self._relaunch_start_fire(run, task, l_now, now)
+            run.steps = list(run.steps) + [relaunch]
+            run.steps.sort(key=lambda f: _parse(f.fire_at))
+
+            # (5) Recovered.
+            run.fault = ""
+            run.fault_task = ""
+            run.fault_at = ""
+            self._persist_runs()
+
+        lvl = f"{l_now:g} dBm" if l_now is not None else "its launch level"
+        rl = self._run_logs.get(run.id)
+        if rl is not None:
+            rl.annotate(f"RESTART ({mode}) — relaunch {task} at {lvl}, RF on"
+                        + (f"; off-air shifted +{downtime:.0f}s" if mode == "replay" and downtime
+                           else ""))
+        await self._fire(run, "sequence_restart", detail=f"{task} recovered ({mode})")
+        logger.info("Run %s RESTART (%s): relaunched '%s' at %s", run.id, mode, task, lvl)
+        return run
+
+    def _reconstruct_level(self, run: SequenceRun, task: str,
+                           now: datetime) -> Optional[float]:
+        """L_now — the --power the faulted task was transmitting at `now`: the value of its last
+        FIRED (not 'skipped', not pending) power-carrying step with fire_at <= now — a ramp point's
+        tune `params['power']`, or the launch --power. None when the task set no power (uncalibrated
+        / no swept level), so the relaunch keeps its original launch power."""
+        best_t: Optional[datetime] = None
+        level: Optional[float] = None
+        for s in run.steps:
+            if s.task_name != task or not s.fired_actual or s.fired_actual == "skipped":
+                continue
+            ft = _parse(s.fire_at)
+            if ft > now:
+                continue
+            if s.action == "tune" and s.params and "power" in s.params:
+                p = s.params.get("power")
+            elif s.action in ("start", "run"):
+                p = self._power_of_args(s.args)
+            else:
+                continue
+            if p is None:
+                continue
+            try:
+                pf = float(p)
+            except (TypeError, ValueError):
+                continue
+            if best_t is None or ft >= best_t:
+                best_t, level = ft, pf
+        return level
+
+    @staticmethod
+    def _power_of_args(args: Optional[list]) -> Optional[float]:
+        """The last --power/-Power value on a launch's args, as a float (None if absent/unparseable)."""
+        a = list(args or [])
+        val = None
+        for i, x in enumerate(a):
+            if str(x) in _POWER_FLAGS and i + 1 < len(a):
+                val = a[i + 1]
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _set_arg_value(args: list, flags, value, canonical: Optional[str] = None) -> list:
+        """Set/replace the value following any flag in `flags` (last occurrence wins), appending
+        `canonical value` when the flag is absent. Returns a new list."""
+        flagset = {str(f) for f in flags}
+        out = list(args or [])
+        found = False
+        i = 0
+        while i < len(out):
+            if str(out[i]) in flagset and i + 1 < len(out):
+                out[i + 1] = str(value)
+                found = True
+                i += 2
+                continue
+            i += 1
+        if not found:
+            can = canonical or (sorted(flagset)[0] if flagset else None)
+            if can is not None:
+                out += [can, str(value)]
+        return out
+
+    def _relaunch_start_fire(self, run: SequenceRun, task: str, l_now: Optional[float],
+                             now: datetime) -> StepFire:
+        """A synthetic `start` StepFire that relaunches `task` at `now`: the task's original launch
+        args with --power overridden to L_now and the RF gate forced ON, replace_args=True. Carrying
+        --power makes it _step_sets_power (co-time rank 0) and, since it is inserted first, it
+        stable-sorts ahead of any equal-rank fire at the same instant."""
+        orig = next((s for s in run.steps
+                     if s.task_name == task and s.action in ("start", "run")
+                     and s.fired_actual and s.fired_actual != "skipped"), None)
+        try:
+            base = self._post_script_args(list(self._manager.get_config(task).command))
+        except Exception:                            # noqa: BLE001 — best effort
+            base = []
+        if orig is not None and orig.replace_args and orig.args:
+            args = list(orig.args)
+        else:
+            args = list(base) + list(orig.args if orig else [])
+        if l_now is not None:
+            # A calibrated task always launched with --power, so this replaces in place.
+            args = self._set_arg_value(args, _POWER_FLAGS, f"{l_now:g}", canonical="--power")
+        # Force the RF gate ON so it transmits from launch. No gate ⇒ gateless (always on) ⇒ nothing.
+        gate = None
+        try:
+            gate = self._manager._rf_gate(task)
+        except Exception:                            # noqa: BLE001
+            gate = None
+        if gate:
+            flags = [str(f) for f in (gate.get("flags") or [])]
+            if flags:
+                args = self._set_arg_value(args, flags, "on", canonical=flags[0])
+        return StepFire(anchor="start", offset_s=0.0, action="start", task_name=task,
+                        fire_at=now.isoformat(), fired_actual=None,
+                        args=args, replace_args=True)
+
+    def _guard_replay_channel(self, run: SequenceRun, start: datetime, new_end: datetime) -> None:
+        """Refuse a replay whose shifted window [start, new_end] would overlap another ACTIVE run's
+        channel span (its warm-up lead-in … stop tail — see _active_span). The operator can resync
+        instead (which never moves off-air). A self-comparison is excluded."""
+        for other in self._runs.values():
+            if other.id == run.id or other.state not in _ACTIVE_STATES:
+                continue
+            o_start, o_end = self._active_span(other)
+            # Overlap iff start < o_end and o_start < new_end (an open end = +inf).
+            if (o_end is None or start < o_end) and o_start < new_end:
+                raise ValueError(
+                    f"replay would shift off-air to {new_end.isoformat()}, overlapping run "
+                    f"{other.id} on the channel; restart with resync (off-air unchanged) instead")
 
     async def cancel_or_abort(self, run_id: str) -> SequenceRun:
         """

@@ -54,6 +54,7 @@ PATCH  /sequence-runs/{id}            → move on-air stop     body: PatchSequen
 DELETE /sequence-runs/{id}            → cancel (armed) or abort (running/holding)
 POST   /sequence-runs/{id}/proceed    → resume a HOLDING run body: ProceedRequest
 POST   /sequence-runs/{id}/hold-now    → fast-forward a RUNNING run to its Hold
+POST   /sequence-runs/{id}/restart     → recover a faulted run   body: RestartRequest
 
 POST   /panic                         → emergency stop everything → PanicResult
 """
@@ -84,7 +85,8 @@ from .models import (
     AgentInfo, AgentRelease, ArmSequenceRequest, CreateEventRequest, CreateSequenceRequest,
     DeployLibraryRequest, DeployLibraryResult, ExitRecord, Library, LibraryScript,
     PanicResult, PatchEventRequest, PatchSequenceRunRequest, Plan,
-    ProceedRequest, ProcessStatus, PutPlansRequest, PutScheduleRequest, ScheduledEvent,
+    ProceedRequest, ProcessStatus, PutPlansRequest, PutScheduleRequest, RestartRequest,
+    ScheduledEvent,
     ScheduledPlan, SdrStatus, Sequence, SequenceRun,
     SetParamsRequest, SetTimeRequest, SetTimeResult, StartRequest, SystemHealth,
     TaskConfig, UpdateResult,
@@ -1740,6 +1742,26 @@ async def hold_now_sequence_run(run_id: str, runner: SequenceRunner = Depends(ge
     §5.4)."""
     try:
         return await runner.hold_now(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.post("/sequence-runs/{run_id}/restart", response_model=SequenceRun, tags=["sequence-runs"],
+          dependencies=[Depends(verify_key)])
+async def restart_sequence_run(
+    run_id: str,
+    req: RestartRequest,
+    runner: SequenceRunner = Depends(get_runner),
+):
+    """RF-fault RECOVERY (Phase 2): recover a RUNNING run whose task was detected dead-but-alive
+    (Phase 1 stamped run.fault). Relaunch the faulted task at its crash-time level (RF on) and
+    re-instate the ramp remainder + STOP — on the original schedule (mode 'resync', default) or
+    shifted later by the downtime (mode 'replay'). 404 unknown run; 409 if the run is not RUNNING
+    with a fault, or a replay collides with a peer on the channel (docs/rf-fault-recovery.md §7)."""
+    try:
+        return await runner.restart_run(run_id, req)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
