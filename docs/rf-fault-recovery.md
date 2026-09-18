@@ -116,8 +116,11 @@ at that instant. Phase 1 below makes the **next** occurrence self-diagnosing.
    not just a precaution: before launching a transmit task, and after a hard kill, remove staged
    shared-memory artifacts whose owning PID is dead (`/dev/shm/gal_*`/`gr-*`, and if `sysv_shm` is in
    use, `ipcs`/`ipcrm` orphans). This breaks the hang→SIGKILL→orphan→startup-failure ratchet.
-4. **Pin a known-good buffer backend** if the captured error implicates one:
-   `~/.gnuradio/prefs/vmcircbuf_default_factory` (e.g. `mmap_shm_open` vs `mmap_tmpfile`).
+4. **Pin a known-good buffer backend** if the captured error implicates one — but note the scripts
+   set `GR_DONT_LOAD_PREFS=1` (§3.6), so a `~/.gnuradio/prefs/…` pin is **ignored**. Pin it in the
+   task **launch env** instead — the GNU Radio config-override env var for `[vmcircbuf]
+   default_factory` (`GR_CONF_VMCIRCBUF_DEFAULT_FACTORY` in current GR; verify against the deployed
+   version) — or drop `GR_DONT_LOAD_PREFS` and seed the prefs file (`mmap_shm_open` vs `mmap_tmpfile`).
 5. **For this fault class, auto-restart is highly effective.** An *intermittent startup* failure
    almost always clears on the first retry, so the default policy (§7) recovers it with little
    operator involvement.
@@ -164,13 +167,14 @@ segments, cross-session pressure — all cleared by the power-cycle) and points 
 Radio buffer-allocation failure at flowgraph construction on a clean system**. Contributing factors
 found in the code/deploy config:
 
-- **GR's buffer backend is not pinned, and the Pi service does not set `HOME`.** GNU Radio picks its
-  `vmcircbuf` backend by *probing* on first use (allocating test buffers) and caching the choice in
-  `~/.gnuradio/prefs/vmcircbuf_default_factory`. The X410 unit sets `HOME=/root`
-  (`deploy/x410/install.sh`); the **Pi service (`deploy/sdr-agent.service`) sets neither `HOME` nor a
-  backend pin**, and no seeded prefs exist in the repo — so GR's selection and the startup probe are
-  left to defaults. The probe and the first real allocation both run **at startup**, matching the
-  signature.
+- **The scripts disable GR prefs, the backend is not pinned, and the Pi service sets no `HOME`.**
+  Every transmit script sets `GR_DONT_LOAD_PREFS=1` (a repo-wide `os.environ.setdefault`, to skip a
+  slow pref scan), so GNU Radio **never reads `~/.gnuradio/prefs/`** — it selects its `vmcircbuf`
+  backend from its compiled default on every launch, and a prefs-file pin would be ignored. The X410
+  unit sets `HOME=/root` (`deploy/x410/install.sh`); the **Pi service (`deploy/sdr-agent.service`)
+  sets no `HOME`**, so a launched task's `~` is undefined/varies (and if any code still touches
+  `~/.gnuradio`, that path is unstable). The default backend's first real allocation runs **at
+  startup**, matching the signature; nothing forces a known-good backend, and nothing is pinned per-env.
 - **Large, high-rate buffers are more exposed.** fm_chirp runs at **61.38 Msps**, sizing its GR
   buffers larger than a low-rate signal's; a bigger double-mapped allocation is a bit more prone to an
   occasional transient failure. Consistent with the fault appearing on the sweep.
@@ -178,33 +182,49 @@ found in the code/deploy config:
   engineered away; hence the primary cure is **detect-as-crash + auto-restart within the warm-up
   lead-in** (§7.0), which makes it a non-event regardless of mechanism.
 
-**Fixes (Phase 0):** pin the backend explicitly in the task launch env
-(`GR_VMCIRCBUF_DEFAULT_FACTORY`, or seed the prefs file) so no probe runs at startup; set a stable,
-writable `HOME`/`GR_PREFS_PATH` for launched tasks (as X410 does); raise the ceilings (§3.4). The
-Phase-1 resource+backend snapshot (§6.3) will confirm the exact mechanism on the next occurrence.
+**Fixes (Phase 0):** pin the backend explicitly in the task **launch env** — because
+`GR_DONT_LOAD_PREFS=1` is set, this must be the GNU Radio config-override env var
+(`GR_CONF_VMCIRCBUF_DEFAULT_FACTORY` in current GR; verify against the deployed version), **not** a
+`~/.gnuradio/prefs` file (which is not read); or drop `GR_DONT_LOAD_PREFS` and seed the prefs file.
+Set a stable, writable `HOME` for launched tasks (as X410 does). Raise the ceilings (§3.4). The
+Phase-1 resource+backend snapshot (§6.3) confirms the effective backend + mechanism on the next
+occurrence — including whether `GR_DONT_LOAD_PREFS` left GR on a different default than we assume.
 
-### 3.7 Related first-launch cost: the FPGA image load (and a "started after on-air" miss)
+### 3.7 A *separate* first-launch cost: the FPGA image load (and a "started after on-air" miss)
 
-Owner-reported, and likely the **same first-launch window**: the first SDR-driving task after a
-power-cycle spends a long, variable time on **UHD loading the FPGA bitstream/firmware onto the USRP**
-("installing image"). Only the first open after power-on pays it (later tasks reuse the loaded image
-until the next power-cycle); over USB on a Pi it is slow and variable, and it has once made a signal
-**start after its on-air time**.
+Owner-reported, and a **distinct** first-launch cost — *not* the same failure as §3.6: the first
+SDR-driving task after a power-cycle spends a long, variable time on **UHD loading the FPGA
+bitstream/firmware onto the USRP** ("installing image"). Only the first open after power-on pays it
+(later tasks reuse the loaded image until the next power-cycle); over USB on a Pi it is slow and
+variable, and it has once made a signal **start after its on-air time**.
 
+- **This incident's log showed only `vmcircbuf`, no image line — but the absence proves nothing.**
+  Every script sets `UHD_LOG_CONSOLE_LEVEL=off` (a repo-wide `os.environ.setdefault`), which
+  **suppresses UHD's console output entirely**, the "installing image" line included. So its absence
+  does **not** tell us whether the FPGA image loaded during the incident — we simply couldn't see it.
+  That suppression is itself a **diagnostic blind spot** (fix below).
+- **Treat the two as independent, merely co-located.** The FPGA image load and a `vmcircbuf`
+  allocation failure both fall in the **first flowgraph construction after boot**, so they share a
+  time window — but the incident evidence does not link them, and they are different failure modes:
+  the image load is a *slow-but-succeeds* warm-up cost, the `vmcircbuf` is a *hard allocation
+  failure*. Each is fixed on its own merits; neither fix depends on the other having been the cause.
+  (Pre-imaging does lighten that first construction, which can only help §3.6, but we do **not** claim
+  the image load caused the buffer failure.)
 - **Nothing pre-images the device today.** `GET /sdr` shells `uhd_find_devices`, which only
   *enumerates* — it does **not** load the image (`system._probe_sdr`). The image loads inside the
   first transmit task's flowgraph construction.
-- **Shared window with §3.6.** The first flowgraph after boot does enumerate → **load the FPGA
-  image** → init UHD → **allocate GR `vmcircbuf`s**, all at once — the heaviest, most contended
-  construction of the session and the most likely moment for a transient buffer-allocation failure.
-  Two distinct failures (slow-but-succeeds vs. a hard allocation failure) sharing one trigger window;
-  the image load plausibly aggravates the buffer allocation.
 
 **Fix (Phase 0): pre-image the SDR early.** Run a lightweight device *open* (`uhd_usrp_probe`, which
 opens the device and loads the image — not `uhd_find_devices` — or a tiny no-op flowgraph) **at boot
 and/or when a plan is armed**, while no task holds the device (respect the device-busy collision
 noted for `/sdr`). Then the real task warms up fast and predictably (fixes the "started after
-on-air" miss) and its flowgraph construction is lighter (de-risks §3.6).
+on-air" miss) and its flowgraph construction carries less concurrent work.
+
+**Fix (Phase 0/1): stop flying blind on UHD.** Keep the console quiet but route UHD's log to a **file**
+at a useful level for launched tasks (`UHD_LOG_FILE` + a non-`off` `UHD_LOG_FILE_LEVEL`), so the image
+load, UHD init warnings, and any device error are **captured on disk** even though
+`UHD_LOG_CONSOLE_LEVEL` stays `off`. The Phase-1 fault snapshot (§6.3) attaches that UHD log next to
+the resource state, so the next event shows both the GR buffer state *and* what UHD was doing.
 
 **Design implications** (also §7.0): warm-up budgeting must treat the **first task after boot** as
 special (pre-imaging removes the special case; otherwise pad its lead-in), and the **on-air-miss
@@ -314,9 +334,13 @@ restart.
 
 ### 6.3 Resource snapshot (the durable diagnostic)
 At fault detection, the agent captures and attaches to the fault record: `df /dev/shm` (used/total),
-the process's `map_count` vs `vm.max_map_count`, RSS, `ulimit -n`, the selected `vmcircbuf` backend,
-and (if `sysv_shm`) an `ipcs -m` summary. **This is what makes the next `vmcircbuf` self-diagnosing**
-and turns "I hope that was the last time" into a measurable outcome.
+the process's `map_count` vs `vm.max_map_count`, RSS, `ulimit -n`, the **effective `vmcircbuf`
+backend** (the launch env's `GR_CONF_VMCIRCBUF_DEFAULT_FACTORY` and — since `GR_DONT_LOAD_PREFS=1`
+means GR reads no prefs file — whatever compiled default GR actually used, via a one-shot
+`gnuradio-config-info --prefs`), the task's `HOME`, and (if `sysv_shm`) an `ipcs -m` summary. It also
+attaches the **UHD log file** (§3.7 fix) so a device error suppressed on the console is on record.
+**This is what makes the next `vmcircbuf` self-diagnosing** and turns "I hope that was the last time"
+into a measurable outcome.
 
 ---
 
@@ -451,7 +475,11 @@ widening the warm-up gap that makes resync imperfect. Add a **per-signal IQ-buff
 - `config.py`: capabilities `task-rf-health`, `sequence-restart` (+ any policy cap); bump
   `AGENT_VERSION` from `1.27.3`; assert in `tests/test_meta_endpoint.py`.
 - **Deploy/ops:** raise `vm.max_map_count` / verify `/dev/shm` size / `ulimit -n` in the unit image;
-  optional GR-prefs backend pin.
+  set a stable `HOME` in the Pi service (`deploy/sdr-agent.service`, as X410 already does); pin the GR
+  buffer backend in the launch env via `GR_CONF_VMCIRCBUF_DEFAULT_FACTORY` (**not** the prefs file —
+  `GR_DONT_LOAD_PREFS=1` is set in the scripts); pre-image the SDR at boot/arm (§3.7); route UHD logs
+  to a file (`UHD_LOG_FILE`, non-`off` file level) so device errors are captured despite
+  `UHD_LOG_CONSOLE_LEVEL=off`.
 
 **`sdr-client`**
 - `api/models.py`: mirror health fields + `TaskHealthEvent` + `SequenceRun.fault`.
@@ -483,8 +511,10 @@ widening the warm-up gap that makes resync imperfect. Add a **per-signal IQ-buff
 ## 11. Phasing / rollout
 
 - **Phase 0 — prevention & ops (cheap, parallel).** Raise ceilings; **pin the GR `vmcircbuf`
-  backend + set a stable `HOME`/`GR_PREFS_PATH`** for launched tasks (§3.6); **pre-image the SDR at
-  boot/arm** (§3.7); agent `/dev/shm`/IPC hygiene + graceful shutdown (§3.5). Directly attacks the
+  backend via `GR_CONF_VMCIRCBUF_DEFAULT_FACTORY` in the launch env** (not the prefs file —
+  `GR_DONT_LOAD_PREFS=1`) **+ set a stable `HOME`** for launched tasks (§3.6); **pre-image the SDR at
+  boot/arm** (§3.7); **route UHD logs to a file** so the console-off blind spot doesn't hide device
+  errors (§3.7); agent `/dev/shm`/IPC hygiene + graceful shutdown (§3.5). Directly attacks the
   incident's fresh-boot cause and the "started after on-air" warm-up overrun.
 - **Phase 1 — recognize + alarm + safe-stop + keep-logs + snapshot.** Script done-watcher; agent
   watchdog + health field/event + run coupling; client loud alert + fault pill + "View fault log".
@@ -528,12 +558,21 @@ Each phase is independently useful and capability-gated.
 - **Underflow rule:** fault on **sustained** pile-up, not incidental blips.
 - **Root cause:** startup-time GR `vmcircbuf` allocation failure (GR's own `/dev/shm` buffers, not
   staged IQ); mechanism to be confirmed from the captured error; prevented by §3.4 regardless.
+- **Env correction (found in the scripts):** every transmit script sets `GR_DONT_LOAD_PREFS=1` and
+  `UHD_LOG_CONSOLE_LEVEL=off` (repo-wide `os.environ.setdefault`). So (a) the backend pin must be a
+  launch-env `GR_CONF_*` override, **not** a prefs file (which GR never reads); and (b) the FPGA
+  "installing image" line is suppressed, so its **absence in this incident's log is not evidence** the
+  image didn't load — hence UHD logs get routed to a file (§3.7) and the FPGA cost is treated as
+  independent of the `vmcircbuf` (§3.7), not its cause.
 
 ## 14. Open items
 
 - Retrieve the archived `run_<ts>.log` from the affected unit + `df /dev/shm` /
   `cat /proc/sys/vm/max_map_count` / `ipcs -m` / the GR backend → **confirm the exact mechanism** and
   finalize §3.3.
+- Confirm the deployed GNU Radio version's exact `vmcircbuf` factory override name
+  (`GR_CONF_VMCIRCBUF_DEFAULT_FACTORY` vs. an older form) with `gnuradio-config-info --prefs`, and
+  which compiled default it falls to under `GR_DONT_LOAD_PREFS=1`.
 - Confirm the Pi 5 image's current `/dev/shm` size, `vm.max_map_count`, and `ulimit -n`.
 - Decide `SequenceState.FAULTED` (terminal) vs. an `rf_fault` field on a still-`RUNNING` run.
 - Multi-unit per-item `run_id` resolution for plan-level restart.
