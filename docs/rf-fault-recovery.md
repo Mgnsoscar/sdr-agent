@@ -150,6 +150,12 @@ ran between boot and the test**, so there were no orphans to accumulate. This le
 real bug worth fixing for kill-heavy sessions, but **not** the cause of *this* fresh-boot failure —
 see §3.6.
 
+**Fixes (Phase 0):** (a) an agent `/dev/shm` sweep in `_cleanup()` **and** at boot **and** before each
+launch, removing staged dirs whose owning PID is dead; (b) a SIGTERM handler in the scripts that also
+`rmtree`s the staging dir (belt-and-suspenders on the graceful path); (c) longer term, move the
+remaining `file_source` stagers off `/dev/shm` to in-RAM `vector_source_c` (as GPS/fm_chirp already
+did) or a swept, size-capped location.
+
 ### 3.6 Fresh-boot, first-launch signature — the remaining explanation
 
 The reported incident was a **power-cycle → arm → (2 h idle) → first task launch → startup
@@ -177,11 +183,33 @@ found in the code/deploy config:
 writable `HOME`/`GR_PREFS_PATH` for launched tasks (as X410 does); raise the ceilings (§3.4). The
 Phase-1 resource+backend snapshot (§6.3) will confirm the exact mechanism on the next occurrence.
 
-**Fixes (Phase 0):** (a) an agent `/dev/shm` sweep in `_cleanup()` **and** at boot **and** before each
-launch, removing staged dirs whose owning PID is dead; (b) a SIGTERM handler in the scripts that also
-`rmtree`s the staging dir (belt-and-suspenders on the graceful path); (c) longer term, move the
-remaining `file_source` stagers off `/dev/shm` to in-RAM `vector_source_c` (as GPS/fm_chirp already
-did) or a swept, size-capped location.
+### 3.7 Related first-launch cost: the FPGA image load (and a "started after on-air" miss)
+
+Owner-reported, and likely the **same first-launch window**: the first SDR-driving task after a
+power-cycle spends a long, variable time on **UHD loading the FPGA bitstream/firmware onto the USRP**
+("installing image"). Only the first open after power-on pays it (later tasks reuse the loaded image
+until the next power-cycle); over USB on a Pi it is slow and variable, and it has once made a signal
+**start after its on-air time**.
+
+- **Nothing pre-images the device today.** `GET /sdr` shells `uhd_find_devices`, which only
+  *enumerates* — it does **not** load the image (`system._probe_sdr`). The image loads inside the
+  first transmit task's flowgraph construction.
+- **Shared window with §3.6.** The first flowgraph after boot does enumerate → **load the FPGA
+  image** → init UHD → **allocate GR `vmcircbuf`s**, all at once — the heaviest, most contended
+  construction of the session and the most likely moment for a transient buffer-allocation failure.
+  Two distinct failures (slow-but-succeeds vs. a hard allocation failure) sharing one trigger window;
+  the image load plausibly aggravates the buffer allocation.
+
+**Fix (Phase 0): pre-image the SDR early.** Run a lightweight device *open* (`uhd_usrp_probe`, which
+opens the device and loads the image — not `uhd_find_devices` — or a tiny no-op flowgraph) **at boot
+and/or when a plan is armed**, while no task holds the device (respect the device-busy collision
+noted for `/sdr`). Then the real task warms up fast and predictably (fixes the "started after
+on-air" miss) and its flowgraph construction is lighter (de-risks §3.6).
+
+**Design implications** (also §7.0): warm-up budgeting must treat the **first task after boot** as
+special (pre-imaging removes the special case; otherwise pad its lead-in), and the **on-air-miss
+backstop must cover a warm-up overrun**, not only a crash — so a too-slow first warm-up is a
+detected, alarmed event.
 
 ---
 
@@ -309,7 +337,8 @@ The right recovery — and how invisible it can be — depends on where in the r
   - if `now + restart + warm-up ≤ RF-on` → **RF comes on-air on schedule; a benign notice, not an
     alarm** (the operator need not act — the fault is masked);
   - else → **loud alarm** (on-air will be missed/late; the retry can't warm up in time).
-  As a backstop, if RF-on fires and the task is not confirmed radiating, alarm. The **fast-warm IQ
+  As a backstop, if RF-on fires and the task is not confirmed radiating — whether from a crash **or a
+  warm-up overrun** (e.g. a first-boot FPGA image load, §3.7) — alarm. The **fast-warm IQ
   cache (§8)** shrinks the warm-up, widening the set of faults that recover silently — decisive for
   the slow-warming L1C/L2C; for fm_chirp (near-instant build) a restart fits any normal lead-in.
   **This case is fully covered by Phase 1 detection + a task-level auto-restart — the mid-run resync
@@ -453,8 +482,10 @@ widening the warm-up gap that makes resync imperfect. Add a **per-signal IQ-buff
 
 ## 11. Phasing / rollout
 
-- **Phase 0 — prevention & ops (cheap, parallel).** Raise ceilings; agent `/dev/shm`/IPC hygiene;
-  graceful shutdown; (optional) backend pin. Directly attacks the incident's cause.
+- **Phase 0 — prevention & ops (cheap, parallel).** Raise ceilings; **pin the GR `vmcircbuf`
+  backend + set a stable `HOME`/`GR_PREFS_PATH`** for launched tasks (§3.6); **pre-image the SDR at
+  boot/arm** (§3.7); agent `/dev/shm`/IPC hygiene + graceful shutdown (§3.5). Directly attacks the
+  incident's fresh-boot cause and the "started after on-air" warm-up overrun.
 - **Phase 1 — recognize + alarm + safe-stop + keep-logs + snapshot.** Script done-watcher; agent
   watchdog + health field/event + run coupling; client loud alert + fault pill + "View fault log".
   *Independently solves "recognize it" and makes the next fault self-diagnosing.*
