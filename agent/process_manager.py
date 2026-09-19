@@ -401,6 +401,10 @@ class ManagedProcess:
         # the watcher aborts instead of relaunching (lets you stop a crash-looping
         # task). Cleared on an intentional start.
         self._stop_requested = False
+        # Set ONLY by an operator/external stop (not the internal RF auto-drop), so a standalone
+        # auto-restart-on-fault relaunch honours an operator stopping the faulted task, while the
+        # auto-drop stop() that frees the channel does NOT abort its own recovery. Cleared on start.
+        self._operator_stop_requested = False
         # Timestamps (monotonic) of recent auto-restarts, for the crash-loop
         # circuit breaker.
         self._restart_times: Deque[float] = deque(maxlen=50)
@@ -429,6 +433,33 @@ class ManagedProcess:
         # detected fault can reach the SequenceRunner (stamp run.fault, stop tuning the dead task).
         self._fault_hook = None
 
+        # ── STANDALONE auto-restart-on-fault (Phase 3b, §7.1/§14e) ────────────────
+        # Owned-query () -> set[task_name]: task names currently owned by an ACTIVE run, so a
+        # run-owned fault is left to the run policy (never also relaunched here → no double-transmit).
+        # Set by the ProcessManager (from the SequenceRunner) via set_owned_query.
+        self._owned_query = None
+        # Launch hook (name, request) -> awaitable — the FULL manager launch path (positions the
+        # attenuator via _gate_precommand + carries the launch carrier), so an auto-restart relaunch
+        # is a faithful reproduction, not a bare ManagedProcess.start that skips those. Set by the
+        # ProcessManager; None in isolation → fall back to a direct self.start.
+        self._launch_hook = None
+        # The last StartRequest this task was launched with, so a standalone auto-restart reproduces
+        # the EXACT parameters it faulted with (the Run… form may launch with custom args). None = a
+        # bare start (the task's configured command). Its per-launch auto_restart_on_fault override
+        # (None = fall back to the TaskConfig default) is captured on each start.
+        self._last_request: Optional[StartRequest] = None
+        self._auto_restart_override: Optional[bool] = None
+        # Monotonic timestamps of recent standalone fault-restarts, for the rolling budget breaker.
+        self._fault_restart_times: Deque[float] = deque(maxlen=50)
+        # True once the fault-restart budget has tripped (surfaced for the UI / logs).
+        self.fault_restart_giving_up = False
+        # Guards a standalone relaunch in flight (delay window), so the two detection paths (the
+        # non-intentional EXIT in _watch and the watchdog stop() in _scan_task_health) can never both
+        # relaunch one fault. Cleared once the attempt finishes (a genuinely new fault re-arms it).
+        self._fault_restart_inflight = False
+        # Holds the detached wedge-path relaunch task (Layer 2) so it isn't garbage-collected mid-flight.
+        self._relaunch_task: Optional[asyncio.Task] = None
+
     # ── Public interface ──────────────────────────────────────────────────────
 
     async def start(self, request: Optional[StartRequest] = None) -> None:
@@ -437,7 +468,9 @@ class ManagedProcess:
 
         # An explicit start clears any prior stop request and breaker trip.
         self._stop_requested = False
+        self._operator_stop_requested = False
         self.restart_giving_up = False
+        self.fault_restart_giving_up = False   # a fresh start re-arms the standalone auto-restart breaker
         # A fresh run re-arms fault detection: clear health + the alarm latch, and reset the
         # log-scan cursor (start() rotates current.log below, so the new run reads from a new inode).
         self.health = TaskHealth.OK.value
@@ -448,6 +481,10 @@ class ManagedProcess:
         self._log_inode = None
         self.state = ProcessState.STARTING
         req = request or StartRequest()
+        # Remember this launch so a standalone auto-restart-on-fault can reproduce it exactly, and
+        # capture its per-launch override of the auto-restart flag (None = use the TaskConfig default).
+        self._last_request = request
+        self._auto_restart_override = req.auto_restart_on_fault
 
         cmd = _build_command(self.config.command, req.args, req.replace_args)
         # RF-fault prevention pins sit ABOVE ambient os.environ but BELOW the task's own cfg.env /
@@ -515,11 +552,15 @@ class ManagedProcess:
             self._watch(), name=f"watch-{self.config.name}"
         )
 
-    async def stop(self, timeout: float = 10.0) -> None:
+    async def stop(self, timeout: float = 10.0, *, operator: bool = True) -> None:
         # Always record the stop request first — this breaks an in-progress
         # restart-delay in the watcher (the crash-loop case), even if there's no
         # live process to signal right now.
         self._stop_requested = True
+        # An operator/external stop also blocks a standalone auto-restart-on-fault relaunch; the
+        # internal RF auto-drop passes operator=False so it doesn't cancel its own recovery.
+        if operator:
+            self._operator_stop_requested = True
 
         if self.state not in (ProcessState.RUNNING, ProcessState.STARTING):
             # Task isn't running. It may be mid-crash-loop (state CRASHED, watcher
@@ -632,9 +673,14 @@ class ManagedProcess:
                 # owned by the run's recovery policy (SequenceRunner.restart_run / the Phase-3 unattended
                 # trigger), which reconstructs the crash-time level and re-instates the schedule. Letting
                 # the raw supervisor ALSO relaunch here (config.restart_on_crash) would put two processes
-                # on the single TX channel at the wrong level — a double-transmit. A standalone task's
-                # own "Auto-restart on fault" (Phase 3b) will relaunch here instead; until then a
-                # bare rf-fault relaunch is suppressed (matches "notify, don't auto-restart").
+                # on the single TX channel at the wrong level — a double-transmit. A STANDALONE task
+                # (not owned by any run) with its own "Auto-restart on fault" set relaunches here
+                # instead; otherwise this stands down and the fault is left for the operator/run policy.
+                # Only a NATURAL exit (the done-watcher forced it) relaunches from here; a WEDGE the
+                # watchdog auto-dropped set _stop_requested, and _scan_task_health owns that relaunch
+                # (so the two paths can't both fire — one exit, one relaunch).
+                if not self._stop_requested:
+                    await self._maybe_auto_restart_standalone()
                 return
             else:
                 await self._fire_crash_event(code)
@@ -758,6 +804,104 @@ class ManagedProcess:
             except Exception as exc:   # noqa: BLE001 — coupling failure never blocks the alarm
                 logger.warning("fault hook failed for '%s': %s", self.config.name, exc)
 
+    async def _maybe_auto_restart_standalone(self) -> None:
+        """STANDALONE auto-restart-on-fault (Phase 3b, docs/rf-fault-recovery.md §7.1/§14e).
+
+        Relaunch a task that RF-faulted with the SAME parameters it had — but ONLY when it is the
+        task's OWN business: `auto_restart_on_fault` is set, the master kill-switch is on, and the
+        task is NOT owned by an active sequence/plan run (a run-owned fault is recovered by the run
+        policy — the unattended trigger or an operator Restart; relaunching here too would put two
+        processes on the single TX channel = a double-transmit). Budget-limited (max_fault_restarts
+        within restart_window_s), then it stands down and leaves the task faulted for a manual start.
+
+        Called from BOTH detection paths once the process is DEAD: the non-intentional EXIT branch of
+        _watch (the done-watcher forced a non-zero exit) and _scan_task_health after its auto-drop
+        stop() (the true-wedge case). An in-flight latch makes the two mutually exclusive per fault."""
+        # A per-launch override (Run… form) wins over the stored TaskConfig default.
+        enabled = (self._auto_restart_override if self._auto_restart_override is not None
+                   else self.config.auto_restart_on_fault)
+        if not enabled:
+            return
+        if not _agentcfg.AUTO_RESTART_ENABLED:
+            return
+        # A run owns this task → the run's recovery policy handles it (never double-relaunch).
+        if self._owned_query is not None:
+            try:
+                if self.config.name in self._owned_query():
+                    return
+            except Exception as exc:   # noqa: BLE001 — a query failure must not relaunch blindly
+                logger.warning("owned-query failed for '%s' — skipping auto-restart: %s",
+                               self.config.name, exc)
+                return
+        # Only one attempt in flight (the EXIT path and the watchdog-stop path can race for one fault).
+        if self._fault_restart_inflight:
+            return
+        # Rolling-window budget: give up on a fast fault loop (a permanently broken task), keep
+        # recovering an intermittent startup fault (old attempts age out of the window).
+        now = _monotonic()
+        window = self.config.restart_window_s
+        recent = [t for t in self._fault_restart_times if now - t <= window]
+        budget = self.config.max_fault_restarts
+        if budget and len(recent) >= budget:
+            if not self.fault_restart_giving_up:
+                self.fault_restart_giving_up = True
+                logger.error(
+                    "Task '%s' RF-faulted %d time(s) within %.0fs — giving up auto-restart "
+                    "(manual start required)", self.config.name, len(recent), window)
+            return
+        self._fault_restart_inflight = True
+        try:
+            # Let the OLD watcher fully settle before relaunching, so its exit handling (state/history/
+            # _cleanup of the old run's log fh + control socket) can't run concurrently with — and
+            # corrupt — the new run start() creates. In the EXIT path we ARE the watcher (awaiting self
+            # would deadlock), so skip; in the wedge path this is the health loop, so the old _watch is
+            # a different task we wait out.
+            watcher = self._watcher_task
+            if (watcher is not None and not watcher.done()
+                    and watcher is not asyncio.current_task()):
+                try:
+                    await watcher
+                except Exception:      # noqa: BLE001 — the watcher's own errors are its business
+                    pass
+            # Wait out a settle delay (also lets the /dev/shm sweep in _cleanup finish). Abort if a
+            # stop is requested meanwhile (an operator stopping the faulted task must not be overridden).
+            try:
+                await asyncio.sleep(self.config.restart_delay_s)
+            except asyncio.CancelledError:
+                logger.info("Task '%s' auto-restart aborted (cancelled)", self.config.name)
+                raise
+            if self._operator_stop_requested:
+                logger.info("Task '%s' auto-restart aborted (operator stop)", self.config.name)
+                return
+            # Re-check ownership after the delay — a run may have (re-)armed this task in the interim.
+            if self._owned_query is not None:
+                try:
+                    if self.config.name in self._owned_query():
+                        return
+                except Exception:      # noqa: BLE001
+                    return
+            # Ground-truth safety gate: never relaunch over a process that has not actually exited
+            # (the single-TX-channel double-transmit invariant), nor over one already (re)started.
+            if self.state in (ProcessState.RUNNING, ProcessState.STARTING):
+                return
+            if self._proc is not None and self._proc.returncode is None:
+                logger.warning("Task '%s' still alive — deferring auto-restart", self.config.name)
+                return
+            self._fault_restart_times.append(now)
+            self.restart_count += 1
+            logger.info("Auto-restarting faulted task '%s' (attempt #%d) ...",
+                        self.config.name, len(self._fault_restart_times))
+            # Relaunch with the SAME request it faulted under (custom args / env / the override) so the
+            # recovered task transmits at the exact parameters. Through the manager launch hook when set
+            # (the full path: repositions the attenuator via _gate_precommand, carries the carrier), else
+            # a bare direct start (isolation / tests).
+            if self._launch_hook is not None:
+                await self._launch_hook(self.config.name, self._last_request)
+            else:
+                await self.start(self._last_request)
+        finally:
+            self._fault_restart_inflight = False
+
     async def _is_rf_fault_exit(self) -> bool:
         """True if this task's exit is (or corroborates) an RF fault: health already flagged, or the
         log tail carries a fault signature (the Layer-1 done-watcher marker / a GR buffer error)."""
@@ -826,12 +970,20 @@ class ProcessManager:
         # (and the exit path) invoke on a confirmed fault (set by the SequenceRunner via lifespan).
         self._health_task: Optional[asyncio.Task] = None
         self._fault_hook = None
+        # STANDALONE auto-restart-on-fault (Phase 3b): the owned-query the SequenceRunner supplies so a
+        # run-owned fault is never also relaunched by the task's own policy (see _maybe_auto_restart_standalone).
+        self._owned_query = None
+        # The launch hook every proc uses for a standalone auto-restart relaunch (the full manager
+        # launch path, so the attenuator is repositioned). Wired to self.relaunch in main.py lifespan.
+        self._launch_hook = None
 
     def _make_proc(self, cfg: TaskConfig) -> ManagedProcess:
         proc = ManagedProcess(
             cfg, LogManager(self._log_root, cfg.name), self._dispatcher, self._unit_id
         )
         proc._fault_hook = self._fault_hook
+        proc._owned_query = self._owned_query
+        proc._launch_hook = self._launch_hook
         return proc
 
     def set_fault_hook(self, hook) -> None:
@@ -840,6 +992,29 @@ class ProcessManager:
         self._fault_hook = hook
         for proc in self._procs.values():
             proc._fault_hook = hook
+
+    def set_owned_query(self, query) -> None:
+        """Register the owned-query () -> set[task_name] (from the SequenceRunner) naming the tasks
+        currently owned by an ACTIVE run. A standalone task's Auto-restart-on-fault consults it so a
+        run-owned fault is left to the run's recovery policy — never double-relaunched here (which
+        would double-transmit on the single TX channel). Applied to every current + future proc."""
+        self._owned_query = query
+        for proc in self._procs.values():
+            proc._owned_query = query
+
+    def set_launch_hook(self, hook) -> None:
+        """Register the launch callback (name, request) -> awaitable a standalone auto-restart uses to
+        relaunch a faulted task through the FULL manager path (attenuator positioning + launch carrier),
+        rather than a bare ManagedProcess.start. Applied to every current + future proc. Wired to
+        self.relaunch."""
+        self._launch_hook = hook
+        for proc in self._procs.values():
+            proc._launch_hook = hook
+
+    async def relaunch(self, name: str, request: Optional[StartRequest] = None) -> None:
+        """Relaunch a task through the full launch path (used by a standalone auto-restart-on-fault).
+        source='auto-restart' so it is not mistaken for an operator start (no task_started event)."""
+        await self.start(name, request, source="auto-restart")
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -859,6 +1034,12 @@ class ProcessManager:
         if self._health_task is not None:
             self._health_task.cancel()
             self._health_task = None
+        # Cancel any in-flight standalone auto-restart (a faulted task waiting out its settle delay),
+        # so a relaunch can't launch a fresh process while the agent is tearing down.
+        for proc in self._procs.values():
+            t = proc._relaunch_task
+            if t is not None and not t.done():
+                t.cancel()
         running = [p for p in self._procs.values() if p.state == ProcessState.RUNNING]
         if running:
             logger.info("Stopping %d task(s) on shutdown ...", len(running))
@@ -900,10 +1081,20 @@ class ProcessManager:
         await proc._flag_rf_fault(f"log signature: {hit}")
         # Auto-drop RF: free the single TX channel (SIGTERM→grace→SIGKILL — a halted flowgraph may
         # not honour SIGTERM). Idempotent, so it can't collide with a concurrent abort/deadman.
+        # operator=False: this is the internal auto-drop, so it must NOT block the task's own
+        # standalone auto-restart recovery below (only an operator/API stop does).
         try:
-            await proc.stop()
+            await proc.stop(operator=False)
         except Exception as exc:   # noqa: BLE001
             logger.warning("auto-drop-RF stop failed for '%s': %s", proc.config.name, exc)
+            return
+        # True-wedge path: the process is now DEAD (stop() awaited its exit). A standalone
+        # auto-restart-on-fault task relaunches — DETACHED, so the ~restart_delay_s settle can't stall
+        # the watchdog from scanning other tasks. _maybe_auto_restart_standalone awaits the old watcher
+        # first, so start() can't race the exit-path cleanup. The EXIT-path _watch does NOT relaunch a
+        # wedge (its _stop_requested is set by the auto-drop), so this is the sole wedge relaunch.
+        proc._relaunch_task = asyncio.create_task(
+            proc._maybe_auto_restart_standalone(), name=f"relaunch-{proc.config.name}")
 
     # ── Event stream (SSE) ────────────────────────────────────────────────────
 

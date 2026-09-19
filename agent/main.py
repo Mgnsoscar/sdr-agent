@@ -142,6 +142,24 @@ async def lifespan(app: FastAPI):
 
     tasks = cfg.load_tasks()
     _manager = ProcessManager(tasks, cfg.LOG_DIR, cfg.UNIT_ID)
+
+    # The runner is constructed (side-effect-free) BEFORE _manager.startup() so the fault-coupling +
+    # owned-query + relaunch hooks are wired before autostart tasks + the health watchdog run — a task
+    # that faults in the boot window then still consults a real query (empty until _runner.startup()
+    # reconciles runs, which is correct: no active run owns anything yet). _runner.startup() (which
+    # aborts any in-flight run) still runs after the manager is up.
+    _runner = SequenceRunner(
+        _manager, cfg.UNIT_ID, cfg.SEQUENCES_FILE, cfg.SEQUENCE_RUNS_FILE, cfg.LOG_DIR
+    )
+    # RF-fault DETECTION (Phase 1): when the health watchdog confirms a task fault, couple it into
+    # the owning run (stamp run.fault, stop tuning the dead task, emit sequence_rf_fault).
+    _manager.set_fault_hook(_runner.on_task_fault)
+    # RF-fault RECOVERY (Phase 3b): the owned-query lets a standalone task's Auto-restart-on-fault skip
+    # a task a run currently owns or is about to launch (that fault is the run policy's to recover — no
+    # double-transmit); the launch hook relaunches through the full path (repositions the attenuator).
+    _manager.set_owned_query(_runner.tasks_claimed_by_active_runs)
+    _manager.set_launch_hook(_manager.relaunch)
+
     await _manager.startup()
 
     # Pre-image the SDR (load its FPGA image) so the first task warms up fast — DETACHED from this
@@ -155,14 +173,7 @@ async def lifespan(app: FastAPI):
     _scheduler = Scheduler(_manager, cfg.UNIT_ID, cfg.EVENTS_FILE)
     await _scheduler.startup()
 
-    _runner = SequenceRunner(
-        _manager, cfg.UNIT_ID, cfg.SEQUENCES_FILE, cfg.SEQUENCE_RUNS_FILE, cfg.LOG_DIR
-    )
     await _runner.startup()
-
-    # RF-fault DETECTION (Phase 1): when the health watchdog confirms a task fault, couple it into
-    # the owning run (stamp run.fault, stop tuning the dead task, emit sequence_rf_fault).
-    _manager.set_fault_hook(_runner.on_task_fault)
 
     # The unit's replica of the PC's plans + schedule (stored, never executed here).
     _client_state = ClientStateStore(cfg.PLANS_FILE, cfg.SCHEDULE_FILE)
@@ -1120,6 +1131,13 @@ def _spec_to_entry(spec: TaskConfig) -> dict:
         "env": _yaml_env(spec.env),
         "autostart": spec.autostart,
         "restart_on_crash": spec.restart_on_crash,
+        # RF-fault RECOVERY (Phase 3b): persist the standalone Auto-restart-on-fault flag so it
+        # survives the tasks.yaml round-trip / reload (else the client's saved checkbox reverts and
+        # the task never auto-restarts). Its budget is emitted only when customised (default 2), to
+        # keep the common entry clean — matching the types tag.
+        "auto_restart_on_fault": spec.auto_restart_on_fault,
+        **({"max_fault_restarts": spec.max_fault_restarts}
+           if spec.max_fault_restarts != TaskConfig.model_fields["max_fault_restarts"].default else {}),
         # Round-trip the client's library-scope tag; omit when shared (empty) to
         # keep tasks.yaml clean for the common case.
         **({"types": [sq(str(t)) for t in spec.types]} if spec.types else {}),

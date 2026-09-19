@@ -497,6 +497,25 @@ class SequenceRunner:
                 owned |= self._live_tasks_of(run)
         return owned
 
+    def tasks_claimed_by_active_runs(self) -> set:
+        """Owned-query for the ProcessManager's standalone auto-restart (Phase 3b): every task an
+        ACTIVE run is currently driving OR is still going to launch. Broader than
+        _tasks_owned_by_active_runs (which is 'launched-and-not-stopped', for the arm overlap guard):
+        it ALSO counts a task an ARMED run will bring up on a start/run step that has NOT fired yet —
+        so a standalone task's Auto-restart-on-fault never relaunches during its settle delay a task a
+        run is about to put on the single TX channel (a double-transmit). A step the run already fired
+        and stopped is NOT claimed (its start/run steps are fired, no un-fired one remains), so a
+        genuinely standalone task that merely shares a name with a completed step still auto-restarts.
+        Synchronous, no-await — safe to call outside the runner lock from the ProcessManager."""
+        claimed: set = self._tasks_owned_by_active_runs()
+        for run in self._runs.values():
+            if run.state not in _ACTIVE_STATES:
+                continue
+            for s in run.steps:
+                if s.action in ("start", "run") and s.fired_actual is None:
+                    claimed.add(s.task_name)   # an un-fired launch the run will still perform
+        return claimed
+
     async def on_task_fault(self, task_name: str, detail: str) -> None:
         """RF-fault run coupling (docs/rf-fault-recovery.md §5.3). The ProcessManager health
         watchdog (or the exit path) calls this when a task is confirmed dead-but-alive. Stamp the

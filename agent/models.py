@@ -43,6 +43,18 @@ class TaskConfig(BaseModel):
     max_restarts: int = 5
     restart_window_s: float = 60.0
 
+    # RF-fault RECOVERY (Phase 3b, docs/rf-fault-recovery.md §7.1/§14e). A STANDALONE task's own
+    # "Auto-restart on fault" — governs ONLY a task run on its own, independent of any sequence/plan
+    # recovery policy. When True and the task RF-faults (a dead-but-alive flowgraph the health layer
+    # detects, §5), the agent relaunches it with the SAME parameters it had when it faulted — but ONLY
+    # when the task is NOT owned by an active run (a run-owned fault is recovered via the run policy;
+    # letting both act would double-transmit on the single TX channel). Budget max_fault_restarts within
+    # restart_window_s (rolling), then it stops and leaves the task faulted for a manual start. The
+    # pre-relaunch delay reuses restart_delay_s. Defaulted so a pre-Phase-3b client / reloaded task never
+    # gains autonomy; gated by the master kill-switch config.AUTO_RESTART_ENABLED.
+    auto_restart_on_fault: bool = False
+    max_fault_restarts: int = 2        # fault-restart budget within restart_window_s (0 = unlimited)
+
     # Resume support — for time-deterministic tasks like an attenuator ramp.
     # When a sequence is resumed, the agent injects the elapsed-seconds offset
     # so the script can pick up where it (or its peers) currently are.
@@ -89,6 +101,11 @@ class StartRequest(BaseModel):
     # becomes [interpreter, script, *args] — so a sequence step can fully specify
     # a launch (from a parameter form) without duplicating the task's defaults.
     replace_args: bool = False
+    # RF-fault RECOVERY (Phase 3b): a PER-LAUNCH override of TaskConfig.auto_restart_on_fault, so the
+    # Run… form can turn Auto-restart-on-fault on/off for just this run (with the exact parameters it
+    # is launched with) without editing the stored task. None = use the task's configured default. The
+    # override + the launch request are remembered so an auto-restart reproduces this exact launch.
+    auto_restart_on_fault: Optional[bool] = None
 
 
 class SetParamsRequest(BaseModel):

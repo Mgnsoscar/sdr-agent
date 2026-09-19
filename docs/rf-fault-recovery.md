@@ -971,6 +971,127 @@ like "confirm"). **Deferred (Phase 3b)**: the standalone-task "Auto-restart on f
 `TaskConfig.auto_restart_on_fault` + an owned-query so `process_manager` relaunches a task that ISN'T
 owned by a run) and the fast-warm IQ cache (§8).
 
+## 14e. Phase 3b — STANDALONE task auto-restart — BUILT (`AGENT_VERSION 1.31.0`, capability `task-auto-restart`; branch `claude/system-familiarization-f5mezz`)
+
+The **task-level** half of §7.1's Knob A: a task run **on its own** (not inside a sequence/plan) that
+RF-faults is relaunched by the agent **with the exact parameters it faulted under**, no operator present.
+This is orthogonal to the Phase-3 run policy — it governs only a standalone task — and the two are kept
+strictly apart by an **owned-query** so a run-owned fault is never recovered twice (a double-transmit).
+The fast-warm IQ cache (§8) stays deferred. `argspec`/`ramp` untouched (drift guard intact).
+
+**`sdr-agent`.**
+- **`models.py`** — `TaskConfig.auto_restart_on_fault` (bool, default False) + `max_fault_restarts` (int,
+  default 2 — the rolling budget within `restart_window_s`, 0 = unlimited; the pre-relaunch delay reuses
+  `restart_delay_s`). `StartRequest.auto_restart_on_fault` (`Optional[bool]`, default None) — a PER-LAUNCH
+  override so the Run… form can flip it for one run without editing the stored task. All defaulted (a
+  pre-Phase-3b client / reloaded task never gains autonomy).
+- **`process_manager.ManagedProcess._maybe_auto_restart_standalone()`** — the decision + relaunch. Stands
+  down unless: the effective flag is on (`_auto_restart_override` if the launch set one, else
+  `config.auto_restart_on_fault`); the master kill-switch `config.AUTO_RESTART_ENABLED` is on; and the
+  **owned-query says no active run owns this task** (checked BEFORE and AFTER the settle delay — a run may
+  (re-)arm the task meanwhile). Then a rolling-window budget (`max_fault_restarts` within
+  `restart_window_s`) — give up on a fast fault loop, keep recovering an intermittent one (old attempts
+  age out). Ground-truth safety gates before `start()`: never over a `RUNNING`/`STARTING` task, never over
+  a process whose `returncode is None` (still alive). Relaunches with the **remembered `_last_request`**
+  (`start()` stamps it) so the recovered task transmits at the exact parameters, not the bare config
+  default.
+- **Two detection paths, exactly one relaunch.** Layer 1 — a **natural non-zero EXIT** (the done-watcher
+  forced it): `_watch`'s rf-fault branch relaunches, but **only when `not _stop_requested`** (a wedge the
+  watchdog auto-dropped has `_stop_requested` set, so `_watch` defers). Layer 2 — the **true wedge** (no
+  exit): `_scan_task_health` auto-drops RF via `stop(operator=False)` then fires the relaunch **detached**
+  (so the ~`restart_delay_s` settle can't stall the watchdog scanning other tasks). The relaunch **awaits
+  the old `_watch` task first**, so `start()` can never race the old exit handling (`_cleanup` of the old
+  run's log fh + control socket) and corrupt the new run. An in-flight latch (`_fault_restart_inflight`)
+  is the belt-and-suspenders backstop.
+- **Operator vs. auto-drop.** `stop()` gained `*, operator=True`; the internal auto-drop passes
+  `operator=False`. Only an operator/API stop sets the new **`_operator_stop_requested`** flag, which
+  aborts a pending relaunch — so an operator stopping the faulted task wins, while the auto-drop that
+  frees the channel does NOT cancel its own recovery.
+- **Owned-query wiring.** `ProcessManager.set_owned_query(query)` (applied to every current + future proc,
+  mirroring `set_fault_hook`); `main.py` lifespan wires it to `SequenceRunner.owned_task_names` (a public,
+  no-await accessor over `_tasks_owned_by_active_runs`). `shutdown()` cancels any pending relaunch so a
+  faulted task can't launch a fresh process mid-teardown.
+- **Persistence.** `_spec_to_entry` now emits `auto_restart_on_fault` (and `max_fault_restarts` when
+  non-default) so the flag survives the `tasks.yaml` write → `load_tasks()` reload — the primary authoring
+  path (a review HIGH: without it the client's saved checkbox reverted and the task never auto-restarted).
+- **`config.py`** — capability `task-auto-restart`, `AGENT_VERSION 1.30.0 → 1.31.0`; the master
+  kill-switch reuses `AUTO_RESTART_ENABLED` (`SDR_AUTO_RESTART=0` disables BOTH the run-level trigger and
+  this).
+
+**`sdr-client`** (client-only): `api/models.py` mirrors `TaskConfig.auto_restart_on_fault`/
+`max_fault_restarts` + `StartRequest.auto_restart_on_fault` (all defaulted, skew-safe).
+`ui/timeline_model.py` — `TASK_AUTO_RESTART_CAPABILITY` + `task_auto_restart_supported(client)`.
+`ui/task_editor.py` — an **"Auto-restart on fault"** checkbox: the offline library always offers it (a
+stored definition; the agent is the deploy-time backstop), a live unit gates it on the capability
+(`/info`), seeds it from the stored task, and `_on_save` writes it **only when the box is enabled**, so
+editing an unrelated field on an unsupported / unreachable unit preserves a flag set for capable units
+(a review MEDIUM). `ui/run_task_dialog.py` — the same checkbox in the Run… footer, shown only when the
+unit advertises the capability, seeded from the stored task, sending the per-launch override on
+`StartRequest`.
+
+**Tests**: `sdr-agent` 599 → 626 (`test_task_auto_restart.py`, 27 — the decision matrix (off / kill-switch
+/ claimed-by-a-run / owned-query failure); the per-launch override both ways; both detection paths relaunch
+and don't double-fire; the operator-stop vs. auto-drop distinction; the rolling budget (give-up + re-arm +
+`budget=0` unlimited); the in-flight latch; the relaunch awaits the old watcher; the relaunch routes
+through the launch hook; the `tasks.yaml` persistence round-trip + default-budget omission; `start()`
+re-arms the breaker flag; the claimed-query counts live AND pending launches) + `test_meta_endpoint`.
+`sdr-client` 1151 → 1166 (`test_task_auto_restart_ui.py`, 15 — the model mirror + StartRequest override;
+the capability constant + gate; the task-editor checkbox (library / supported / unsupported / edit-seed /
+edit-on-old-unit / save round-trip / preserve-on-unsupported / preserve-when-info-fails); the Run-form
+checkbox (hidden / shown+seeded / sends the override / None when unsupported)).
+
+> **Adversarial review outcome** (two independent find→verify passes — RF-safety / double-transmit,
+> concurrency/deadlock, the two detection paths, the budget/breaker logic, capability gating, model skew,
+> and persistence). Confirmed defects, all fixed + pinned:
+> - **HIGH (persistence, feature-defeating).** `main.py::_spec_to_entry` dropped `auto_restart_on_fault`
+>   on every structured `tasks.yaml` write (create / update / library deploy), so the client's saved
+>   checkbox reverted on reload and the standalone task never auto-restarted. Fix: `_spec_to_entry`
+>   persists it (+ `max_fault_restarts` when non-default); a round-trip test (`_spec_to_entry` →
+>   `tasks.yaml` → `load_tasks`) pins it.
+> - **HIGH (concurrency / RF-safety).** In the wedge path, relaunching from `_scan_task_health` while the
+>   old `_watch` was still settling could let `start()`'s new run race the old exit's `_cleanup` (closing
+>   the new run's log fh / unlinking its control socket) or let the old `_watch` take its CRASHED branch
+>   against the NEW process. Fix: `_watch` relaunches only a natural exit (`not _stop_requested`); the
+>   wedge relaunch is the sole one there, is DETACHED (so it can't stall the watchdog), and **awaits the
+>   old watcher** before `start()`; the in-flight latch backstops the race.
+> - **MEDIUM (double-transmit).** The owned-query counted only a run's FIRED launches, so a run ARMED
+>   during the standalone's settle delay (its start not yet fired) was invisible → the standalone
+>   relaunched the task, then the run's own launch collided (a dropped run launch at the wrong level, or
+>   a genuine second one-shot on the channel). Fix: the gate is now `tasks_claimed_by_active_runs` — any
+>   task an active run is driving OR is still going to launch (an un-fired start/run step) — re-checked
+>   after the delay; a task the run already stopped is not claimed, so a genuinely standalone task still
+>   recovers.
+> - **MEDIUM (client clobber).** Editing an unrelated field on an unsupported unit — or one whose `/info`
+>   never arrived — coerced the disabled checkbox's False into the saved spec, stripping an auto-restart
+>   set for capable units. Fix: `_on_save` writes the flag only when the box is enabled (supported +
+>   confirmed), else `_orig_entry` preserves the stored value.
+> - **LOW/MED (RF level).** The relaunch called `ManagedProcess.start` directly, skipping the manager's
+>   `_gate_precommand` — so if the attenuator moved between fault and relaunch (an intervening tune /
+>   another calibrated task) the recovered task could deliver the wrong (possibly over-) power. Fix: a
+>   launch hook routes the relaunch through `ProcessManager.start` (positions the attenuator + carries
+>   the carrier) — a faithful reproduction; a bare start remains the isolation/test fallback.
+> - **LOW (observability).** `fault_restart_giving_up` was never cleared, so after one breaker trip the
+>   give-up ERROR was suppressed and a UI reading the flag misreported a recovered task. Fix: `start()`
+>   re-arms it (alongside its crash-loop twin).
+> - **Hardening (boot window).** The fault/owned/launch hooks are now wired BEFORE `_manager.startup()`
+>   (the runner is constructed first — side-effect-free), so a task faulting during autostart consults a
+>   real (empty) query instead of the None-skip path; `_runner.startup()` (abort in-flight runs) still
+>   runs after the manager is up.
+>
+> RF-emission invariants otherwise VERIFIED clear: a run-owned fault is never also relaunched here (the
+> claimed-query, re-checked after the delay, and `_flag_rf_fault` awaits the run-coupling hook first); the
+> relaunch never runs over a live process (the `returncode` gate); an operator stop always wins (the auto-
+> drop uses `operator=False`); the two detection paths fire exactly one relaunch (the `_stop_requested`
+> split + the in-flight latch, no `await` between the latch check and set); the budget breaker gives
+> exactly `max_fault_restarts` relaunches then trips; a pending relaunch is cancelled on shutdown. One
+> documented limitation: the standalone relaunch does not gate on an operator MANUALLY starting a
+> *different* transmit task during the fault window (a shared-channel coordination gap that predates this
+> feature and applies to any direct start); the run-collision case above IS gated.
+
+**Rollout:** OTA-push 1.31.0; no re-provision (agent code only), rebuild the client bundle from 1.31.0.
+`SDR_AUTO_RESTART=0` disables it alongside the run-level trigger. **Deferred (Phase 3b, other half)**: the
+fast-warm IQ cache (§8).
+
 ## 14. Open items
 
 - Retrieve the archived `run_<ts>.log` from the affected unit + `df /dev/shm` /

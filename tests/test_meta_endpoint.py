@@ -37,6 +37,7 @@ def test_capabilities_advertised_and_stable():
     assert "task-rf-health" in cfg.AGENT_CAPABILITIES                      # RF-fault detection (Phase 1)
     assert "sequence-restart" in cfg.AGENT_CAPABILITIES                    # RF-fault recovery (Phase 2)
     assert "sequence-auto-restart" in cfg.AGENT_CAPABILITIES               # unattended auto-restart (Phase 3)
+    assert "task-auto-restart" in cfg.AGENT_CAPABILITIES                   # standalone task auto-restart (Phase 3b)
 
 
 def test_agent_info_carries_capabilities():

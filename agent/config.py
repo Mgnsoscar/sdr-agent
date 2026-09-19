@@ -423,7 +423,14 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # the crash-restart supervisor (that would double-transmit against restart_run). Adds capability
 # `sequence-auto-restart` (the client gates its policy control + pill on it); behaviour is opt-in per
 # run (default policy "manual" = today's behaviour).
-AGENT_VERSION = "1.30.0"
+# 1.31.0: RF-fault RECOVERY (Phase 3b — STANDALONE task auto-restart, docs/rf-fault-recovery.md §7.1/§14e).
+# A TaskConfig may set `auto_restart_on_fault`: when the task RF-faults AND is NOT owned by an active
+# run, the agent relaunches it with the same parameters (budget max_fault_restarts within
+# restart_window_s), no operator present. A run-owned fault is left to the run policy (Phase 3) so the
+# two never double-transmit on the single TX channel (an owned-query gates it). Gated by the master
+# kill-switch AUTO_RESTART_ENABLED. Adds capability `task-auto-restart` (the client gates its
+# "Auto-restart on fault" checkbox on it); opt-in per task (default False = today's behaviour).
+AGENT_VERSION = "1.31.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -571,6 +578,11 @@ AGENT_CAPABILITIES = [
                                          # loud alarm re-fires and the run is left for manual Restart.
                                          # The client gates its recovery-policy control + the
                                          # "auto-restarting (n/N)" pill on this string.
+    "task-auto-restart",                 # RF-fault RECOVERY (Phase 3b — STANDALONE task): a TaskConfig
+                                         # with auto_restart_on_fault set is relaunched by the agent when
+                                         # it RF-faults, IF the task is not owned by an active run (a
+                                         # run-owned fault stays the run policy's job). Budget-limited.
+                                         # The client gates its "Auto-restart on fault" checkbox on it.
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
