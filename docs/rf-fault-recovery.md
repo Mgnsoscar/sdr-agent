@@ -458,6 +458,21 @@ widening the warm-up gap that makes resync imperfect. Add a **per-signal IQ-buff
 - **Speeds recovery; does not prevent the fault** (the `vmcircbuf` is GR's buffer, not the IQ vector).
   Prevention is §3.4.
 
+> **BUILT — as an IN-PLACE speed-up, not a disk cache (measurement-driven pivot, owner-approved).**
+> This §8 assumed "L1C/L2C ~30 s IQ generation"; measured on the dev box, the current numpy-vectorized
+> generators are fast — **L1C ~0.5 s, L2C `--loop cm` ~0.3 s** — so a cache there is pointless. Only
+> **L2C `--loop full`** (the default: the bit-exact 1.5 s CL loop) is slow: **~14 s** (build 7 + filter 7),
+> a **736 MB** buffer, ~30-60 s on a Pi. A per-shape 736 MB disk cache was rejected (the SD footprint, and
+> a 736 MB SD read ≈ the build it saves); instead L2C's generation itself was sped up, which helps EVERY
+> launch with no disk cost and lower peak RAM. **`sdr-scripts` `gps_l2c_tx.py`:** `build_l2c_buffer` returns
+> the base as REAL float32 (it IS real BPSK ±1, Q=0 — complex64 doubled the memory traffic for nothing;
+> 6.9→3.2 s), and `_circular_convolve` gained a real-FFT (`rfft`/`irfft`) overlap-add that accumulates
+> straight into the real slots of the complex64 output (`out.real`; imag stays 0 — no separate accumulator,
+> no float→complex copy; ~6.8→~2-3 s). Net **~13.6 s → ~5.9 s (~2.3×)**, output numerically IDENTICAL
+> (max|diff| 1.2e-7 ≈ −138 dB across shapes incl. the 92 M loop; `filt.imag` exactly 0; `--self-test`
+> unchanged). No agent/client change; `argspec`/`ramp` untouched. Test: `sdr-scripts`
+> `tests/test_l2c_fast_filter.py`. Record: `sdr-scripts/CLAUDE.md`.
+
 ---
 
 ## 9. Cross-repo changes (by repo)
@@ -1089,8 +1104,11 @@ checkbox (hidden / shown+seeded / sends the override / None when unsupported)).
 > feature and applies to any direct start); the run-collision case above IS gated.
 
 **Rollout:** OTA-push 1.31.0; no re-provision (agent code only), rebuild the client bundle from 1.31.0.
-`SDR_AUTO_RESTART=0` disables it alongside the run-level trigger. **Deferred (Phase 3b, other half)**: the
-fast-warm IQ cache (§8).
+`SDR_AUTO_RESTART=0` disables it alongside the run-level trigger. **Phase 3b, other half — DONE (revised
+by measurement):** the "fast-warm" §8 shipped as an IN-PLACE ~2.3× speed-up of the one genuinely-slow
+generator (`sdr-scripts` `gps_l2c_tx.py` `--loop full`), not a disk cache — L1C / L2C-cm measured ~0.3-0.5 s,
+so a cache was pointless; see §8's BUILT note. **Phase 3b (and the RF-fault recovery arc P0–P3b) is now
+complete.**
 
 ## 14. Open items
 

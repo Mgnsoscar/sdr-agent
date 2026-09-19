@@ -136,7 +136,11 @@ when `/info` failed → write only when the box is enabled; **LOW/MED** the rela
 (attenuator) → routes through the launch hook; **LOW** `fault_restart_giving_up` never reset → `start()`
 re-arms it. RF-emission invariants otherwise VERIFIED clear. One documented limitation: the relaunch
 doesn't gate on an operator manually starting a DIFFERENT transmit task mid-fault (a pre-existing shared-
-channel gap). **NEXT — Phase 3b other half**: the fast-warm IQ cache (§8). **Rollout:** OTA-push 1.31.0;
+channel gap). **Phase 3b other half — DONE (measurement-driven pivot):** the "fast-warm" §8 shipped as an
+IN-PLACE ~2.3× speed-up of the one genuinely-slow generator (`sdr-scripts` `gps_l2c_tx.py` `--loop full`,
+~14→6 s), not a disk cache — L1C / L2C-cm measured ~0.3-0.5 s so a cache was pointless (see
+`docs/rf-fault-recovery.md` §8 BUILT + `sdr-scripts/CLAUDE.md`). RF-fault recovery P0–P3b is COMPLETE.
+**Rollout:** OTA-push 1.31.0;
 `SDR_AUTO_RESTART=0` disables it alongside the run-level trigger; rebuild the client bundle from 1.31.0.
 
 ## Current state — RF-fault RECOVERY (Phase 3 — UNATTENDED auto-restart): COMPLETE (1.30.0, capability `sequence-auto-restart`) (branch `claude/system-familiarization-f5mezz`, cross-repo)
