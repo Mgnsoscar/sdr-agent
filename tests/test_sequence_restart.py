@@ -240,6 +240,23 @@ while True:
     time.sleep(0.01)
 '''
 
+# A task whose tune/ramp swept a NON-power/non-gain bridge param (--bw), for the bridge-param
+# reconstruction regression: --bw has no _LEVEL_FALLBACK_FLAGS entry, so it is reconstructed ONLY
+# through _dest_flag_map(spec) (the argspec path) — pinning finding B's generalisation.
+BW_SCRIPT = '''\
+import time
+from paramkit import Script
+s = (Script("tx")
+     .number("--bw", min=1, max=40, default=10, live=True)
+     .choice("--rf", options=["on", "off"], default="off", live=True, is_rf=True))
+args = s.parse()
+ctrl = s.live_control(args)
+while True:
+    for ch in ctrl.drain():
+        pass
+    time.sleep(0.01)
+'''
+
 
 def _faulted_multi(runner, now, *, rid="rm"):
     """A faulted run whose --power ramp fired up to -70 (the crash level at fault_at=now-5s),
@@ -613,6 +630,79 @@ def test_restart_cool_down_tail_relaunches_muted(tmp_path, monkeypatch):
         assert relaunch.args[ri + 1] == "off"                   # the schedule holds RF off at now
         stop = [s for s in out.steps if s.action == "stop"][0]
         assert stop.fired_actual is None                        # the future STOP still fires
+
+    asyncio.run(scenario())
+
+
+def test_restart_reconstructs_a_bridge_param_via_the_argspec(tmp_path, monkeypatch):
+    """Re-review coverage (finding B generalisation): a swept NON-power/non-gain bridge param (--bw)
+    has no _LEVEL_FALLBACK_FLAGS entry, so it is reconstructed ONLY via _dest_flag_map(spec). A --bw
+    sweep must be baked onto the relaunch, not left at the launch default (calibration folds --power
+    at the live bandwidth, so a wrong bw is an over-power/spectrum hazard)."""
+    async def scenario():
+        monkeypatch.setattr(pm._agentcfg, "CTRL_DIR", tmp_path / "ctl")
+        script = tmp_path / "btx.py"
+        script.write_text(BW_SCRIPT)
+        tasks = {"tx": TaskConfig(name="tx", command=["python3", str(script), "--bw", "10",
+                                                      "--rf", "off"],
+                                  working_dir=str(tmp_path), env={"PYTHONPATH": REPO_ROOT})}
+        mgr = ProcessManager(tasks, tmp_path, "unit-a")
+        runner = SequenceRunner(mgr, "unit-a", tmp_path / "seq.json",
+                                tmp_path / "runs.json", tmp_path)
+        now = datetime.now(timezone.utc)
+        T0 = now - timedelta(seconds=6)
+        steps = [
+            _fire("start", 0.0, T0, fired=_iso(T0), args=["--bw", "10", "--rf", "off"], replace=True),
+            _fire("tune", 1.0, T0 + timedelta(seconds=1), fired=_iso(T0 + timedelta(seconds=1)),
+                  params={"rf": "on"}),
+            _fire("tune", 2.0, now - timedelta(seconds=2), fired=_iso(now - timedelta(seconds=2)),
+                  params={"bw": 25}),                             # last bridge value swept
+            _fire("stop", 0.0, now + timedelta(seconds=10), fired="skipped"),
+        ]
+        run = SequenceRun(id="rb", sequence_id="s", sequence_name="bwsweep",
+                          state=SequenceState.RUNNING, on_air_at=_iso(T0),
+                          on_air_end=_iso(now + timedelta(seconds=10)), steps=steps,
+                          fault="tx: halt", fault_task="tx", fault_at=_iso(now - timedelta(seconds=1)))
+        runner._runs["rb"] = run
+        out = await runner.restart_run("rb", RestartRequest(mode="resync", restart_at=_iso(now)))
+        relaunch = [s for s in out.steps if s.action == "start" and s.fired_actual is None][0]
+        bi = relaunch.args.index("--bw")
+        assert float(relaunch.args[bi + 1]) == 25.0            # reconstructed via the argspec, not 10
+        assert relaunch.args[relaunch.args.index("--rf") + 1] == "on"
+
+    asyncio.run(scenario())
+
+
+def test_faulted_multi_task_run_does_not_auto_complete_when_a_peer_finishes(tmp_path, monkeypatch):
+    """Re-review finding (recovery-robustness): a faulted task's un-fired steps are 'skipped' (which
+    counts as fired_actual-not-None). In a MULTI-task run, when the HEALTHY peer finishes, the
+    completion check would flip the run COMPLETED with the fault unrecovered — and restart_run refuses
+    a non-RUNNING run. The `not run.fault` guard keeps a faulted run RUNNING (restartable)."""
+    async def scenario():
+        mgr, runner = _mk(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        T0 = now - timedelta(seconds=10)
+        peer_stop = _fire("stop", 0.0, now + timedelta(seconds=1), fired=None, task="tx2")
+        steps = [
+            _fire("start", 0.0, T0, fired=_iso(T0), args=["--power", "-60", "--rf", "on"],
+                  replace=True),                                  # faulted task tx
+            _fire("tune", 5.0, now - timedelta(seconds=5), fired="skipped", params={"power": -50}),
+            _fire("stop", 0.0, now + timedelta(seconds=10), fired="skipped"),   # tx STOP (skipped)
+            _fire("start", 0.0, T0, fired=_iso(T0), args=["--power", "-40", "--rf", "on"],
+                  replace=True, task="tx2"),                      # healthy peer tx2
+            peer_stop,                                            # tx2 STOP (pending)
+        ]
+        run = SequenceRun(id="rmt", sequence_id="s", sequence_name="two", state=SequenceState.RUNNING,
+                          on_air_at=_iso(T0), on_air_end=_iso(now + timedelta(seconds=10)), steps=steps,
+                          fault="tx: vmcircbuf", fault_task="tx",
+                          fault_at=_iso(now - timedelta(seconds=3)))
+        runner._runs["rmt"] = run
+        # Fire the peer's final step → every step is now fired-or-skipped; the completion check runs.
+        await runner._fire_step(run, peer_stop)
+        assert run.state == SequenceState.RUNNING and run.fault == "tx: vmcircbuf"   # NOT auto-completed
+        # And the faulted task is still recoverable.
+        out = await runner.restart_run("rmt", RestartRequest(restart_at=_iso(now)))
+        assert out.fault == "" and out.state == SequenceState.RUNNING
 
     asyncio.run(scenario())
 

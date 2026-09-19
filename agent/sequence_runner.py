@@ -1882,8 +1882,14 @@ class SequenceRunner:
             await self._fire(run, "sequence_started", detail="")
 
         # If every step has fired, the run is complete — UNLESS it's open-ended,
-        # which has only start-anchored steps and must stay on-air until aborted.
-        if not run.open_ended and all(s.fired_actual is not None for s in run.steps):
+        # which has only start-anchored steps and must stay on-air until aborted, OR it
+        # carries an RF fault: a faulted task's un-fired steps are 'skipped' (which counts
+        # as fired_actual-not-None), so a MULTI-task run whose healthy peer finishes would
+        # otherwise flip to COMPLETED with the fault unrecovered — and restart_run refuses a
+        # non-RUNNING run. A faulted run stays RUNNING (restartable) until restart clears the
+        # fault or the operator aborts; Phase-1 already dropped its RF, so there is no hazard.
+        all_fired = all(s.fired_actual is not None for s in run.steps)
+        if all_fired and not run.open_ended and not run.fault:
             async with self._lock:
                 run.state = SequenceState.COMPLETED
                 run.stopped_actual = _utcnow_iso()
@@ -1891,7 +1897,7 @@ class SequenceRunner:
             self._close_run_log(run.id, "completed")
             await self._fire(run, "sequence_stopped", detail="all steps complete")
             logger.info("Run %s completed", run.id)
-        elif run.open_ended and all(s.fired_actual is not None for s in run.steps):
+        elif all_fired and run.open_ended:
             logger.info("Run %s now fully on-air (open-ended; awaiting abort)", run.id)
 
     # ── Abort ──────────────────────────────────────────────────────────────────

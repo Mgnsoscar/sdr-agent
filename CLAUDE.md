@@ -93,7 +93,7 @@ representative frequency for scalar read-outs and publishes the full artifact fo
 ## Current state — RF-fault RECOVERY (Phase 2): COMPLETE (1.29.0, capability `sequence-restart`) (branch `claude/system-familiarization-f5mezz`, cross-repo)
 Operator-driven recovery: one "Restart" click brings a faulted run back on air at the level it should
 be at, with a resync/replay choice. Design + full record: `docs/rf-fault-recovery.md` §7 + §14c. The
-UNATTENDED auto-restart trigger + fast-warm cache stay **Phase 3** (§11). Suite 554 → 571. `argspec`/
+UNATTENDED auto-restart trigger + fast-warm cache stay **Phase 3** (§11). Suite 554 → 573. `argspec`/
 `ramp` untouched (drift guard intact).
 - **`sequence_runner.restart_run(run_id, RestartRequest)`** (adjacent to `proceed`/`hold_now`). A run
   whose task faulted is still RUNNING with `run.fault`/`fault_task` stamped + that task's un-fired steps
@@ -135,10 +135,19 @@ UNATTENDED auto-restart trigger + fast-warm cache stay **Phase 3** (§11). Suite
   `_channel_end`; H second-lock re-validation). A **re-review of the rewrite** confirmed **2 more**, both
   fixed: (1, LOW) a transient `spec=None` reverted the relaunch to the launch `--power` (hot over-power) →
   spec-independent power/gain bake; (2, MED) the relaunch FORCED RF on → the gate is now RECONSTRUCTED from
-  the schedule (muted pre-roll/cool-down stays muted).
-Tests: `tests/test_sequence_restart.py` (17: reconstruction incl. launch-level fallback; resync/replay
+  the schedule (muted pre-roll/cool-down stays muted). A **re-verification round** (the re-review's verify
+  pass had partially aborted on a session limit; re-run in full against the fixed code) closed its 12
+  un-adjudicated findings: 2 ALREADY-FIXED (the gate pair), 8 REFUTED (HOLDING-fault cleanly refused;
+  multi-fault coupling is a Phase-1 `on_task_fault` limit; run-mode ramps aren't RF transmitters; rest
+  covered), **2 CONFIRMED + fixed** — (i) a bridge-param (`--bw`) reconstruction test (the `_dest_flag_map`
+  path had no discriminating test); (ii, correctness) the `_fire_step` completion check lacked a
+  `run.fault` guard, so a MULTI-task run whose HEALTHY peer finished flipped to COMPLETED with the fault
+  unrecovered (restart refuses a non-RUNNING run) → the check now also requires `not run.fault`, keeping a
+  faulted run RUNNING/restartable (Phase-1 already dropped its RF).
+Tests: `tests/test_sequence_restart.py` (19: reconstruction incl. launch-level fallback; resync/replay
 shapes; the collision refusal; 404/409 guards; a **LIVE** end-to-end faulting a real ramp at −70 →
-restart → completion; + a regression per review finding A–H and both re-review findings) +
+restart → completion; + a regression per review finding A–H, both re-review findings, and both re-verify
+findings — `--bw` bridge reconstruction + a faulted multi-task run not auto-completing) +
 `test_meta_endpoint`. **NEXT — Phase 3**: the task Auto-restart-on-fault checkbox + sequence/plan
 auto-restart policy (unattended, budget 2) + the fast-warm IQ cache. **Rollout:** OTA-push 1.29.0.
 

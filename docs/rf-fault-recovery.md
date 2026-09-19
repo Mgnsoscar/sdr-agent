@@ -797,6 +797,18 @@ snapshot, release the lock to STOP the faulted process, then re-validate + plan 
 > spec-independently via `_LEVEL_FALLBACK_FLAGS`; (2, MED) the relaunch unconditionally FORCED the RF gate
 > ON, so a fault in the muted pre-roll or the cool-down tail un-muted early → the gate is now RECONSTRUCTED
 > from the schedule (muted stays muted; the re-instated RF-on tune / the STOP drives it).
+>
+> **Re-verification round** (the re-review's own verify pass had partially aborted on an API session limit;
+> re-run in full against the fixed code): of its 12 un-adjudicated findings, 2 came back ALREADY-FIXED (the
+> gate-forcing pair above), 8 REFUTED (a HOLDING-time fault is cleanly refused by `_check_restartable`; a
+> second concurrent fault is a Phase-1 `on_task_fault`-coupling limitation, not restart's; run-mode ramps
+> aren't persistent RF transmitters; the rest already covered), and **2 CONFIRMED** and fixed: (i, LOW) the
+> `_dest_flag_map` (bridge-param) reconstruction path had no test that discriminates it from the level
+> fallback → a `--bw`-sweep regression added; (ii, LOW correctness) the `_fire_step` completion check had no
+> `run.fault` guard, so a MULTI-task run whose HEALTHY peer finished flipped to COMPLETED with the fault
+> unrecovered (and restart refuses a non-RUNNING run) → the check now also requires `not run.fault`, keeping
+> a faulted run RUNNING (restartable) until restart clears the fault or the operator aborts (Phase-1 already
+> dropped its RF, so no hazard).
 
 Endpoint `POST /sequence-runs/{id}/restart` (`RestartRequest{mode, restart_at}`; 404 unknown / 409
 not-RUNNING | no-fault | no-STOP-to-recover-into | replay-collision | fault-changed-under-us). `config.py`:
@@ -811,7 +823,7 @@ fault must be detectable) AND `sequence-restart`; `_on_restart` poses the resync
 the restart. Multi-unit plan restart recovers the first faulted unit's run (single-unit exact) — the
 per-unit fan-out is the known TODO, mirroring the plan-export run-id TODO.
 
-**Tests**: `sdr-agent` 554 → 571 (`test_sequence_restart.py`, 17 — level reconstruction incl. launch-level
+**Tests**: `sdr-agent` 554 → 573 (`test_sequence_restart.py`, 19 — level reconstruction incl. launch-level
 fallback; resync re-instates future fires + the relaunch shape; replay shifts fires + off-air; replay
 collision refusal; the 404/409 guards; a **LIVE** end-to-end that faults a real ramping task at −70,
 restarts it, and drives it to completion on schedule; PLUS the review regressions — resync uses the
@@ -819,7 +831,9 @@ schedule level at now (D), replay resumes from the crash level + re-instates the
 the swept param is baked not just power (B), a healthy peer step is not skipped (C), resync past off-air
 is refused but replay recovers (A), an open-ended run recovers without a STOP, the replay collision uses
 the stop tail and is atomic (F+G), the second-lock re-validation (H), the level survives an unreadable
-argspec (re-review 1), and the pre-roll / cool-down relaunch stays muted (re-review 2)) +
+argspec (re-review 1), the pre-roll / cool-down relaunch stays muted (re-review 2), a bridge param (--bw)
+is reconstructed via the argspec (re-verify i), and a faulted multi-task run does not auto-complete when
+its healthy peer finishes (re-verify ii)) +
 `test_meta_endpoint`. `sdr-client` 1129 → 1136 (`test_restart_ui.py` — model + wrapper post; the gate;
 the Restart button visibility on both rows; the resync/replay/cancel routing; the plan fault pill +
 `_fault_run_for`).
