@@ -908,19 +908,62 @@ the resolved policy: `sequences_panel._arm_at` (from the sequence), `plans_tab._
 override else inherit the stored sequence) wired into `_arm_plan`, and `timeline_tab._arm_scheduled`
 (the schedule — the PRIMARY unattended surface). `ui/theme.py` — an amber `auto_restart` status.
 
-**Tests**: `sdr-agent` 573 → 584 (`test_sequence_auto_restart.py`, 11 — auto-restart fires + recovers;
-budget exhaustion trips loudly once; a restart refusal trips, not a retry loop; a HOLDING fault is not
-auto-restarted; confirm/manual/globally-disabled are left alone; the healthy-settle reset zeroes the
-budget; the settle marker restarts if the task is unhealthy; arm stamps the policy (default manual); the
-process-manager suppression — an rf-fault exit with `restart_on_crash=True` does NOT raw-relaunch; an
-ordinary crash still restarts) + `test_meta_endpoint`. `sdr-client` 1136 → 1149 (`test_auto_restart_ui.py`,
-13 — model defaults + round-trip; the capability gate; the auto→manual downgrade; the fault/recovery pill
-decision; `_arm_at` / `_item_recovery` / the plan + schedule arm paths carry the resolved policy; the
-sequence-editor combo load/save + save gate; the row pills).
+**Tests**: `sdr-agent` 573 → 599 (`test_sequence_auto_restart.py`, 26 — auto-restart fires + recovers
+(quiet, no loud alarm); budget exhaustion trips loudly once; a restart refusal trips durably (count→
+budget), not a retry loop; a HOLDING fault is not auto-restarted; confirm/manual/globally-disabled are
+left alone; the healthy-settle reset zeroes + persists the budget; the settle window floor; the marker
+restarts if the task is unhealthy; `reset_s=0` lifetime cap; the budget middle rung + flap→trip;
+`budget=0` unlimited; replay-mode through the auto path; the peer-fault per-run budget; the concurrency
+guard (`_RestartInProgress`) + the recovered / in-progress quiet stand-down; the RF-safety defer while
+the process is alive + `restart_run`'s live-process refusal; a manual restart resets the breaker; the
+agent Sequence policy round-trip; arm stamps the policy; the real `_task_healthy`; the process-manager
+suppression asserts the fault is FLAGGED then the raw relaunch is suppressed; an ordinary crash still
+restarts) + `test_meta_endpoint`. `sdr-client` 1136 → 1151 (`test_auto_restart_ui.py`, 15 — model
+defaults + round-trip; the capability gate; the auto→manual downgrade; the fault/recovery pill decision;
+`_arm_at` / `_item_recovery` / the plan + schedule arm paths carry the resolved policy; the LibraryClient
+policy round-trip; the sequence-editor combo load/save + `_on_save` copies the policy + save gate; the
+row pills).
 
-> **Adversarial review outcome** (find→verify, all dimensions — RF-safety, concurrency/deadlock, the
-> breaker/reset logic, cross-repo wire consistency, and test adequacy): _PENDING — filled in after the
-> review completes and any confirmed findings are fixed._
+> **Adversarial review outcome** (two find→verify passes, all dimensions — RF-safety, concurrency/
+> deadlock, the breaker/reset logic, cross-repo wire consistency, and test adequacy). Confirmed defects,
+> all fixed + pinned:
+> - **HIGH (concurrency).** A manual `POST /restart` racing the auto trigger could BOTH pre-stop +
+>   relaunch the same run (the loser's stop could kill the winner's fresh process), and the auto path
+>   misread the loser's refusal as a breaker trip → a spurious LOUD alarm on a just-recovered run. Fix:
+>   a per-run **`_restart_inflight`** guard held across `restart_run`'s released-lock window (a second
+>   caller refuses cleanly with `_RestartInProgress`), and the auto except-handler now stands down
+>   QUIETLY on `_RestartInProgress` or a run whose fault was already cleared / is no longer RUNNING —
+>   only a still-RUNNING-and-faulted run is a genuine refusal that trips.
+> - **HIGH (RF-safety, cross).** For the true-wedge fault, the Phase-1 watchdog's auto-drop `stop()`
+>   takes ~10 s to SIGKILL a SIGTERM-ignoring flowgraph (state STOPPING, so `is_running()` is already
+>   False); the auto trigger could relaunch a SECOND process onto the channel during that window — the
+>   exact double-transmit the suppression prevents. Fix: a ground-truth **`ProcessManager.is_process_
+>   alive`** (`returncode is None`); the auto path DEFERS selection while the faulted process is still
+>   alive, and `restart_run` refuses a relaunch over a live process (backstop for a manual Restart).
+> - **MEDIUM (cross, feature-defeating).** The authored `recovery_policy` never survived the round-trip —
+>   the agent's `Sequence`/`CreateSequenceRequest` AND the client's `LibraryClient` both DROPPED it — so
+>   every armed run (and every plan/schedule INHERIT) silently resolved to "manual". Fix: all three now
+>   persist + round-trip `recovery_policy`/`recovery_mode`.
+> - **MEDIUM (breaker state).** A manual Restart now RESETS the breaker (fresh budget + clears the
+>   give-up latch — a tripped run isn't left permanently un-auto-restartable after one operator touch;
+>   the auto trigger passes `reset_budget=False`, it is consuming the budget). A refusal give-up is made
+>   DURABLE (`auto_restart_count → budget`) so a doomed restart isn't re-selected every tick. The
+>   healthy-settle reset now PERSISTS + clears the latch, and its window is FLOORED to `3·HEALTH_POLL_S`
+>   so a `reset_s` below the fault-detection latency can't defeat the breaker.
+> - **Test coverage** (both suites): the suppression asserts the fault is still FLAGGED before the raw
+>   relaunch is suppressed; the real `_task_healthy`; the budget middle rung + the full flap→trip
+>   staircase; `budget=0` unlimited; `reset_s=0` lifetime cap; replay-mode through the auto path; the
+>   peer-fault per-run budget; the happy-path quiet-only (no loud alarm); the concurrency guard + the
+>   recovered / in-progress stand-down; the RF-safety defer + refusal; the agent + LibraryClient policy
+>   round-trip; the editor save copies the policy.
+>
+> Otherwise the RF-emission invariants were VERIFIED clear (no other double-transmit path; a HOLDING /
+> confirm / manual policy is never auto-transmitted; no path leaves RF on with nothing to stop it; the
+> breaker always trips under default config; a reload aborts a RUNNING faulted run, so the in-memory
+> latches can't resurrect an exhausted run). One LOW is documented-not-fixed: in a multi-task run, if the
+> auto-restarted task's on-air window ends before the healthy-settle window elapses, the per-run counter
+> doesn't reset — a conservative deviation (fewer unattended restarts, earlier operator hand-off), no
+> RF-safety consequence.
 
 **Rollout:** OTA-push 1.30.0; the client bundle rebuilt from 1.30.0. `SDR_AUTO_RESTART=0` on a unit
 disables the unattended trigger fleet-wide (a faulted "auto" run then waits for a manual Restart, exactly

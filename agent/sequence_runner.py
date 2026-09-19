@@ -118,6 +118,13 @@ def _fmt_ramp_value(value: float, integer: bool) -> str:
     return str(int(value)) if float(value).is_integer() else str(value)
 
 
+class _RestartInProgress(ValueError):
+    """A restart_run call refused because THIS run already has a restart in flight (a manual
+    POST /restart racing the Phase-3 auto trigger). A ValueError subclass so the HTTP endpoint's
+    existing ValueError→409 mapping covers it; _service_auto_restart catches it specifically to
+    stand down QUIETLY (the other caller is recovering the run) rather than trip the breaker."""
+
+
 class SequenceRunner:
     def __init__(
         self,
@@ -155,6 +162,11 @@ class SequenceRunner:
         # long await). _auto_gaveup = run ids whose breaker has tripped, so the loud alarm fires ONCE.
         self._auto_inflight: set[str] = set()
         self._auto_gaveup: set[str] = set()
+        # Serializes restart_run across its released-lock pre-stop window, so a manual POST /restart
+        # and the Phase-3 auto trigger can't BOTH pre-stop + relaunch the same run (the loser's stop
+        # could kill the winner's fresh process, and the loser's refusal would false-alarm). Held by
+        # restart_run itself under its first lock and released in a finally.
+        self._restart_inflight: set[str] = set()
 
     # ── Run logging ────────────────────────────────────────────────────────────
 
@@ -335,7 +347,10 @@ class SequenceRunner:
     async def create_sequence(self, req: CreateSequenceRequest) -> Sequence:
         self._validate_steps(req.steps)
         seq = Sequence(
-            id=_seq_id(), name=req.name, description=req.description, steps=req.steps
+            id=_seq_id(), name=req.name, description=req.description, steps=req.steps,
+            types=list(req.types),
+            recovery_policy=(req.recovery_policy or "manual"),
+            recovery_mode=(req.recovery_mode or "resync"),
         )
         async with self._lock:
             self._sequences[seq.id] = seq
@@ -348,7 +363,10 @@ class SequenceRunner:
             raise KeyError(f"Unknown sequence: '{seq_id}'")
         self._validate_steps(req.steps)
         seq = Sequence(
-            id=seq_id, name=req.name, description=req.description, steps=req.steps
+            id=seq_id, name=req.name, description=req.description, steps=req.steps,
+            types=list(req.types),
+            recovery_policy=(req.recovery_policy or "manual"),
+            recovery_mode=(req.recovery_mode or "resync"),
         )
         async with self._lock:
             self._sequences[seq_id] = seq
@@ -1185,7 +1203,8 @@ class SequenceRunner:
         logger.info("Run %s HOLDING (fast-forwarded; %d window-A step(s) skipped)", run.id, skipped)
         return run
 
-    async def restart_run(self, run_id: str, req: RestartRequest) -> SequenceRun:
+    async def restart_run(self, run_id: str, req: RestartRequest,
+                          *, reset_budget: bool = True) -> SequenceRun:
         """RF-fault RECOVERY (docs/rf-fault-recovery.md §7). Recover a RUNNING run whose task was
         detected dead-but-alive — Phase-1 `on_task_fault` stamped run.fault/fault_task and marked
         THAT task's un-fired steps 'skipped' (so the tick stopped tuning a dead task), while KEEPING
@@ -1232,96 +1251,126 @@ class SequenceRunner:
             now = _parse(req.restart_at) if req.restart_at else _utcnow_dt()
             fault_at = _parse(run.fault_at) if run.fault_at else now
             downtime = max(0.0, (now - fault_at).total_seconds())
+            # Claim this run for the pre-stop→relaunch window (validation has passed). A concurrent
+            # caller (a manual POST /restart racing the auto trigger) that reaches this point refuses
+            # cleanly instead of issuing its own pre-stop — so only ONE caller ever stops+relaunches
+            # this run. Added LAST so a validation raise above never leaks the marker.
+            if run_id in self._restart_inflight:
+                raise _RestartInProgress(f"a restart of run '{run_id}' is already in progress")
+            self._restart_inflight.add(run_id)
 
-        # Ensure the faulted process is STOPPED before the synthetic relaunch — the Phase-1 watchdog
-        # auto-drops RF (proc.stop) around the fault, but the exit path or a race could leave it up,
-        # and start() refuses an already-running proc. Idempotent + best-effort, outside the lock.
         try:
-            await self._manager.stop(task, source="sequence")
-        except Exception as exc:                     # noqa: BLE001 — already stopped is fine
-            logger.debug("restart: pre-stop of '%s' failed (already stopped?): %s", task, exc)
-
-        async with self._lock:
-            run = self._runs.get(run_id)
-            if run is None:
-                raise KeyError(f"Unknown run: '{run_id}'")
-            # Re-validate: while the lock was released for the pre-stop the run could have been
-            # aborted/recovered, or re-faulted on a DIFFERENT task. Refuse rather than mutate stale.
-            self._check_restartable(run)
-            if run.fault_task != task or run.fault != fault0:
-                raise ValueError("the run's fault changed during restart; retry")
-
+            # Ensure the faulted process is STOPPED before the synthetic relaunch — the Phase-1 watchdog
+            # auto-drops RF (proc.stop) around the fault, but the exit path or a race could leave it up.
+            # Idempotent + best-effort, outside the lock.
             try:
-                spec, _artifact = self._manager.tune_log_context(task)
-            except Exception:                            # noqa: BLE001 — best effort
-                spec = None
+                await self._manager.stop(task, source="sequence")
+            except Exception as exc:                     # noqa: BLE001 — already stopped is fine
+                logger.debug("restart: pre-stop of '%s' failed (already stopped?): %s", task, exc)
 
-            # ── PLAN the re-instated fires WITHOUT mutating (so a refusal below is atomic) ──
-            shift = timedelta(seconds=downtime) if mode == "replay" else timedelta(0)
-            plan: List[Tuple[StepFire, datetime]] = []   # (skipped step, its new fire_at)
-            for s in run.steps:
-                if s.task_name != task or s.fired_actual != "skipped":
-                    continue
-                ft = _parse(s.fire_at)
-                if mode == "resync":
-                    if ft > now:                         # rejoin the schedule; missed points stay missed
-                        plan.append((s, ft))
-                else:                                    # replay: the whole remainder, shifted later
-                    plan.append((s, ft + shift))
+            # RF-safety backstop: refuse to relaunch while the OS process is STILL ALIVE. Our own stop
+            # above no-ops when the watchdog's auto-drop is already mid-flight (state STOPPING, up to
+            # ~10 s to SIGKILL a wedged flowgraph), so committing the relaunch now would double-transmit
+            # on the channel. Refuse (the auto trigger retries next tick once the process is dead; a
+            # manual Restart returns "still stopping"). The auto path already defers on is_process_alive,
+            # so this only bites a manual restart racing the auto-drop.
+            if self._manager.is_process_alive(task):
+                raise ValueError(
+                    f"'{task}' is still stopping (its RF was just auto-dropped); retry the restart "
+                    f"in a few seconds once it has fully stopped")
 
-            # A non-open-ended run MUST end with a future STOP for the relaunched task, else its RF
-            # would stay on forever (the completion check would mark the run COMPLETED with RF up).
-            # resync past off-air can't satisfy this — refuse and point at replay.
-            if not run.open_ended:
-                has_future_stop = any(s.action == "stop" and nf > now for s, nf in plan)
-                if not has_future_stop:
-                    raise ValueError(
-                        "resync cannot recover this run — its on-air window has already ended, so "
-                        "there is no remaining STOP to rejoin (relaunching would leave RF on); "
-                        "restart with replay to deliver the remaining profile shifted later"
-                        if mode == "resync" else
-                        "cannot recover this run — it has no remaining STOP to relaunch into")
+            async with self._lock:
+                run = self._runs.get(run_id)
+                if run is None:
+                    raise KeyError(f"Unknown run: '{run_id}'")
+                # Re-validate: while the lock was released for the pre-stop the run could have been
+                # aborted/recovered, or re-faulted on a DIFFERENT task. Refuse rather than mutate stale.
+                self._check_restartable(run)
+                if run.fault_task != task or run.fault != fault0:
+                    raise ValueError("the run's fault changed during restart; retry")
 
-            # replay floats off-air (and its stop tail) later; refuse BEFORE mutating if the shifted
-            # channel span collides with another active run. The channel end is the LATEST prospective
-            # fire (the shifted STOP tail lands after off-air — see _channel_end), not off-air itself.
-            new_on_air_end: Optional[datetime] = None
-            if mode == "replay" and shift and run.on_air_end:
-                new_on_air_end = _parse(run.on_air_end) + shift
-                shifted = {id(s): nf for s, nf in plan}
-                fires = [shifted.get(id(s), _parse(s.fire_at))
-                         for s in run.steps if getattr(s, "fire_at", None)]
-                channel_end = max([new_on_air_end, now] + fires)
-                self._guard_replay_channel(run, now, channel_end)
+                try:
+                    spec, _artifact = self._manager.tune_log_context(task)
+                except Exception:                            # noqa: BLE001 — best effort
+                    spec = None
 
-            # ── Reconstruct the relaunch (born at the recovered level, RF on) ──
-            relaunch = self._relaunch_start_fire(
-                run, task, now, spec, include_skipped=(mode == "resync"))
-            l_now = self._power_of_args(relaunch.args)
+                # ── PLAN the re-instated fires WITHOUT mutating (so a refusal below is atomic) ──
+                shift = timedelta(seconds=downtime) if mode == "replay" else timedelta(0)
+                plan: List[Tuple[StepFire, datetime]] = []   # (skipped step, its new fire_at)
+                for s in run.steps:
+                    if s.task_name != task or s.fired_actual != "skipped":
+                        continue
+                    ft = _parse(s.fire_at)
+                    if mode == "resync":
+                        if ft > now:                         # rejoin the schedule; missed points stay missed
+                            plan.append((s, ft))
+                    else:                                    # replay: the whole remainder, shifted later
+                        plan.append((s, ft + shift))
 
-            # ── COMMIT: apply the plan, float off-air (replay), add the relaunch, clear the fault ──
-            for s, nf in plan:
-                s.fired_actual = None
-                s.fire_at = nf.isoformat()
-            if new_on_air_end is not None:
-                run.on_air_end = new_on_air_end.isoformat()
-                self._off_air_marked.discard(run.id)     # let the off-air marker fire at the new end
-            run.steps = list(run.steps) + [relaunch]
-            run.steps.sort(key=lambda f: _parse(f.fire_at))
-            run.fault = ""
-            run.fault_task = ""
-            run.fault_at = ""
-            self._persist_runs()
+                # A non-open-ended run MUST end with a future STOP for the relaunched task, else its RF
+                # would stay on forever (the completion check would mark the run COMPLETED with RF up).
+                # resync past off-air can't satisfy this — refuse and point at replay.
+                if not run.open_ended:
+                    has_future_stop = any(s.action == "stop" and nf > now for s, nf in plan)
+                    if not has_future_stop:
+                        raise ValueError(
+                            "resync cannot recover this run — its on-air window has already ended, so "
+                            "there is no remaining STOP to rejoin (relaunching would leave RF on); "
+                            "restart with replay to deliver the remaining profile shifted later"
+                            if mode == "resync" else
+                            "cannot recover this run — it has no remaining STOP to relaunch into")
 
-        lvl = f"{l_now:g} dBm" if l_now is not None else "its launch level"
-        rl = self._run_logs.get(run.id)
-        if rl is not None:
-            rl.annotate(f"RESTART ({mode}) — relaunch {task} at {lvl}, RF on"
-                        + (f"; off-air shifted +{downtime:.0f}s" if mode == "replay" and downtime
-                           else ""))
-        await self._fire(run, "sequence_restart", detail=f"{task} recovered ({mode})")
-        logger.info("Run %s RESTART (%s): relaunched '%s' at %s", run.id, mode, task, lvl)
-        return run
+                # replay floats off-air (and its stop tail) later; refuse BEFORE mutating if the shifted
+                # channel span collides with another active run. The channel end is the LATEST prospective
+                # fire (the shifted STOP tail lands after off-air — see _channel_end), not off-air itself.
+                new_on_air_end: Optional[datetime] = None
+                if mode == "replay" and shift and run.on_air_end:
+                    new_on_air_end = _parse(run.on_air_end) + shift
+                    shifted = {id(s): nf for s, nf in plan}
+                    fires = [shifted.get(id(s), _parse(s.fire_at))
+                             for s in run.steps if getattr(s, "fire_at", None)]
+                    channel_end = max([new_on_air_end, now] + fires)
+                    self._guard_replay_channel(run, now, channel_end)
+
+                # ── Reconstruct the relaunch (born at the recovered level, RF on) ──
+                relaunch = self._relaunch_start_fire(
+                    run, task, now, spec, include_skipped=(mode == "resync"))
+                l_now = self._power_of_args(relaunch.args)
+
+                # ── COMMIT: apply the plan, float off-air (replay), add the relaunch, clear the fault ──
+                for s, nf in plan:
+                    s.fired_actual = None
+                    s.fire_at = nf.isoformat()
+                if new_on_air_end is not None:
+                    run.on_air_end = new_on_air_end.isoformat()
+                    self._off_air_marked.discard(run.id)     # let the off-air marker fire at the new end
+                run.steps = list(run.steps) + [relaunch]
+                run.steps.sort(key=lambda f: _parse(f.fire_at))
+                run.fault = ""
+                run.fault_task = ""
+                run.fault_at = ""
+                # A MANUAL (operator) restart is a FULL recovery — hand the run a fresh unattended
+                # budget and clear any give-up latch, so a tripped run isn't left permanently
+                # un-auto-restartable after one operator touch. The AUTO trigger passes reset_budget=
+                # False (it is CONSUMING the budget; it bumps auto_restart_count itself right after).
+                if reset_budget:
+                    run.auto_restart_count = 0
+                    run.auto_restart_task = ""
+                    run.auto_restart_healthy_since = ""
+                    self._auto_gaveup.discard(run.id)
+                self._persist_runs()
+
+            lvl = f"{l_now:g} dBm" if l_now is not None else "its launch level"
+            rl = self._run_logs.get(run.id)
+            if rl is not None:
+                rl.annotate(f"RESTART ({mode}) — relaunch {task} at {lvl}, RF on"
+                            + (f"; off-air shifted +{downtime:.0f}s" if mode == "replay" and downtime
+                               else ""))
+            await self._fire(run, "sequence_restart", detail=f"{task} recovered ({mode})")
+            logger.info("Run %s RESTART (%s): relaunched '%s' at %s", run.id, mode, task, lvl)
+            return run
+        finally:
+            self._restart_inflight.discard(run_id)
 
     @staticmethod
     def _check_restartable(run: SequenceRun) -> None:
@@ -1682,6 +1731,13 @@ class SequenceRunner:
             return
         budget = _agentcfg.AUTO_RESTART_BUDGET
         reset_s = _agentcfg.AUTO_RESTART_HEALTHY_RESET_S
+        # A freshly-relaunched flowgraph reads health OK until the watchdog re-detects a silent halt
+        # (~HEALTH_POLL_S later). If the settle window were shorter than that detection latency, the
+        # breaker counter would reset BEFORE the imminent re-fault and never accumulate — defeating
+        # the breaker. Floor the effective window to a few poll intervals so a flapper is always
+        # re-flagged before it can reset (0 stays 0 = never reset / lifetime cap).
+        if reset_s:
+            reset_s = max(reset_s, 3.0 * _agentcfg.HEALTH_POLL_S)
         to_restart: List[Tuple[str, str, str]] = []   # (run_id, mode, task)
         to_trip: List[str] = []                        # run_id — breaker trip (alarm once)
         async with self._lock:
@@ -1700,6 +1756,8 @@ class SequenceRunner:
                             run.auto_restart_count = 0
                             run.auto_restart_task = ""
                             run.auto_restart_healthy_since = ""
+                            self._auto_gaveup.discard(run.id)   # a fresh budget clears any stale latch
+                            self._persist_runs()                # persist the reset (survives a reload)
                     else:
                         run.auto_restart_healthy_since = ""   # not healthy → restart the settle timer
                     continue
@@ -1709,6 +1767,14 @@ class SequenceRunner:
                 if run.state != SequenceState.RUNNING or not (run.fault and run.fault_task):
                     continue
                 if run.restart_policy != "auto" or run.id in self._auto_inflight:
+                    continue
+                # RF-safety: never relaunch OVER a not-yet-dead process. For the true-wedge fault
+                # this feature targets, the Phase-1 watchdog's auto-drop stop takes up to ~10 s to
+                # SIGKILL a SIGTERM-ignoring flowgraph; during that window the process is still ALIVE
+                # (state STOPPING, so is_running() is already False). Relaunching now would put a
+                # SECOND process on the single TX channel — the exact double-transmit the crash-restart
+                # suppression prevents. Defer to a later tick until the auto-drop has actually killed it.
+                if self._manager.is_process_alive(run.fault_task):
                     continue
                 if not budget or run.auto_restart_count < budget:
                     self._auto_inflight.add(run.id)
@@ -1721,18 +1787,31 @@ class SequenceRunner:
         for run_id, mode, task in to_restart:
             trip_run: Optional[SequenceRun] = None
             try:
-                await self.restart_run(run_id, RestartRequest(mode=mode, restart_at=now.isoformat()))
-            except Exception as exc:                     # noqa: BLE001 — a refusal IS a breaker trip
+                await self.restart_run(run_id, RestartRequest(mode=mode, restart_at=now.isoformat()),
+                                       reset_budget=False)   # the auto trigger CONSUMES the budget
+            except _RestartInProgress:
+                # A manual Restart (or another caller) is already recovering this run — stand down
+                # quietly; it will clear the fault. NOT a breaker condition, so no trip / no alarm.
+                async with self._lock:
+                    self._auto_inflight.discard(run_id)
+                continue
+            except Exception as exc:                     # noqa: BLE001 — a GENUINE refusal is a trip
                 async with self._lock:
                     self._auto_inflight.discard(run_id)
                     run = self._runs.get(run_id)
-                    if run is not None and run.id not in self._auto_gaveup:
+                    # Only a run that is STILL RUNNING-and-faulted was genuinely refused (past off-air /
+                    # a replay collision / a real error) — trip it. A run whose fault was already
+                    # CLEARED (recovered by a concurrent manual Restart) or that is no longer RUNNING
+                    # (aborted) must NOT trip the breaker or fire the loud give-up alarm on a healthy run.
+                    if (run is not None and run.state == SequenceState.RUNNING and run.fault
+                            and run.id not in self._auto_gaveup):
                         self._auto_gaveup.add(run.id)
                         trip_run = run
                 if trip_run is not None:
                     await self._auto_restart_gaveup(trip_run, f"auto-restart refused: {exc}")
                 else:
-                    logger.debug("auto-restart of run %s not retried (already tripped): %s", run_id, exc)
+                    logger.debug("auto-restart of run %s not tripped (recovered/already tripped): %s",
+                                 run_id, exc)
                 continue
             async with self._lock:
                 self._auto_inflight.discard(run_id)
@@ -1779,6 +1858,17 @@ class SequenceRunner:
         """Breaker trip: stop auto-restarting this run, re-fire the LOUD alarm (sequence_rf_fault — the
         event the client's fault alarm/pill already handle), and leave it RUNNING-faulted so the
         operator's manual Restart still works. Fired once per trip (guarded by self._auto_gaveup)."""
+        # Make the give-up DURABLE: bump the persisted counter to the budget so pass-1 selection can
+        # never re-select this run (a REFUSAL trip leaves the count below budget, which would otherwise
+        # re-select + re-refuse it every tick — a silent retry loop, and a reload that lost the
+        # in-memory _auto_gaveup latch could resurrect it). The counter is the durable breaker; a
+        # manual Restart later resets it (reset_budget) and hands a fresh budget.
+        budget = _agentcfg.AUTO_RESTART_BUDGET
+        if budget:
+            async with self._lock:
+                if run.auto_restart_count < budget:
+                    run.auto_restart_count = budget
+                    self._persist_runs()
         rl = self._run_logs.get(run.id)
         if rl is not None:
             rl.annotate(f"AUTO-RESTART GAVE UP — {reason}; awaiting operator")

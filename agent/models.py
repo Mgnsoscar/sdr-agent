@@ -423,12 +423,22 @@ class Sequence(BaseModel):
     # Unit types this sequence targets; empty = shared/all. Round-tripped for the
     # client's library scoping (the agent does not act on it).
     types: list[str] = []
+    # The authored UNATTENDED auto-restart policy (docs/rf-fault-recovery.md §7.1/§14d — Phase 3).
+    # The agent doesn't act on these directly, but it MUST persist + round-trip them: the client
+    # reads the stored sequence's policy back to resolve what to send at arm (a plan/schedule item
+    # INHERITS it). Dropping them here would silently degrade every armed run to "manual". Defaulted
+    # so a pre-Phase-3 client's create request (no fields) stores "manual".
+    recovery_policy: str = "manual"     # "auto" | "confirm" | "manual"
+    recovery_mode: str = "resync"       # "resync" | "replay"
 
 
 class CreateSequenceRequest(BaseModel):
     name: str
     description: str = ""
     steps: list[SequenceStep]
+    types: list[str] = []               # round-tripped for the client's library scoping
+    recovery_policy: str = "manual"     # the authored auto-restart policy (see Sequence)
+    recovery_mode: str = "resync"
 
 
 class SequenceState(str, Enum):

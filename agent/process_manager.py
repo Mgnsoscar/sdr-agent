@@ -918,6 +918,18 @@ class ProcessManager:
         proc = self._procs.get(name)
         return proc is not None and proc.state == ProcessState.RUNNING
 
+    def is_process_alive(self, name: str) -> bool:
+        """True if the named task's OS process exists and has NOT exited (returncode is None).
+
+        Ground truth for 'is it safe to relaunch over this task yet', independent of the state
+        field's asynchronous settling: a wedged flowgraph the watchdog is mid-stopping reads state
+        STOPPING (so is_running() is already False) yet its process is still ALIVE until SIGKILL, and
+        after a stop the state field only flips to STOPPED once the watcher task runs. returncode is
+        the reliable signal — set by asyncio exactly when the process has exited. False if unknown."""
+        proc = self._procs.get(name)
+        p = getattr(proc, "_proc", None) if proc is not None else None
+        return p is not None and p.returncode is None
+
     def has_task(self, name: str) -> bool:
         return name in self._procs
 

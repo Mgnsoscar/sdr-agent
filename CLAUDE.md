@@ -95,7 +95,7 @@ The trigger half of §7.1 on top of Phase-2 `restart_run`: a faulted run whose r
 is restarted by the agent's OWN tick, no operator/client present — a scheduled/overnight run recovers
 itself. Design + full record: `docs/rf-fault-recovery.md` §7.1 + §14d. Owner-locked: agent-side trigger;
 run-owned faults recovered ONLY via the run policy (never also the raw crash-restart supervisor →
-double-transmit); budget resets after a healthy interval (not a lifetime cap). Suite 573 → 584. The
+double-transmit); budget resets after a healthy interval (not a lifetime cap). Suite 573 → 599. The
 fast-warm IQ cache (§8) + the standalone-task checkbox stay **Phase 3b**. `argspec`/`ramp` untouched.
 - **`sequence_runner._service_auto_restart(now)`** — per `_tick` (~0.25 s) after `_service_holds`.
   COLLECTS under `self._lock`, ACTS after releasing (like `_service_holds` — `restart_run` re-takes the
@@ -119,22 +119,32 @@ fast-warm IQ cache (§8) + the standalone-task checkbox stay **Phase 3b**. `args
   the `return` only skips the raw relaunch. An ordinary crash keeps the crash-restart path.
 - **`models.py`** — `SequenceRun.restart_policy`/`restart_mode`/`auto_restart_count`/`auto_restart_task`/
   `auto_restart_healthy_since` (all defaulted, persisted); `ArmSequenceRequest.restart_policy`/
-  `restart_mode` (default `"manual"` — a pre-Phase-3 client / reloaded run never gains autonomy); the
-  `sequence_auto_restart` webhook type. `arm()` stamps the policy. **`config.py`** —
-  `AUTO_RESTART_ENABLED` (kill-switch), `AUTO_RESTART_BUDGET` (2), `AUTO_RESTART_HEALTHY_RESET_S` (60;
-  each 0 disables its limit), capability `sequence-auto-restart`, `AGENT_VERSION 1.29.0 → 1.30.0`.
-- **`sdr-client`** (client-only): `recovery_policy`/`recovery_mode` on Sequence/CreateSequenceRequest,
-  `restart_policy`/`restart_mode` on ArmSequenceRequest, the 5 runtime fields on SequenceRun, PlanItem
-  inherit-or-override; `timeline_model.resolve_arm_recovery` (auto→manual downgrade when unsupported) +
-  `fault_pill` + `sequence_auto_restart_supported`; a sequence-editor recovery combo + save gate; every
-  arm path (sequences/plan/**schedule** — the primary unattended surface) carries the resolved policy;
-  an amber `auto_restart` pill. See its CLAUDE.md.
-Tests: `tests/test_sequence_auto_restart.py` (11: fires+recovers; budget-exhaustion trips loudly once;
-a restart refusal trips (not a retry loop); HOLDING not auto-restarted; confirm/manual/globally-disabled
-left alone; healthy-settle reset; the settle marker restarts if unhealthy; arm stamps the policy; the
-process-manager suppression — rf-fault exit doesn't raw-relaunch; an ordinary crash still restarts) +
-`test_meta_endpoint`. **Adversarial review** (find→verify, all dims): _running; outcome + any fixes
-pinned after adjudication._ **NEXT — Phase 3b**: the standalone-task Auto-restart-on-fault checkbox
+  `restart_mode` (default `"manual"` — a pre-Phase-3 client / reloaded run never gains autonomy);
+  **`Sequence`/`CreateSequenceRequest.recovery_policy`/`recovery_mode`** (the agent MUST persist +
+  round-trip the authored policy — the client reads it back to resolve what to arm; a plan/schedule item
+  inherits it); the `sequence_auto_restart` webhook type. `arm()` stamps the run policy;
+  `create/update_sequence` carry the authored policy. **`config.py`** — `AUTO_RESTART_ENABLED`
+  (kill-switch), `AUTO_RESTART_BUDGET` (2), `AUTO_RESTART_HEALTHY_RESET_S` (60; each 0 disables its
+  limit), capability `sequence-auto-restart`, `AGENT_VERSION 1.29.0 → 1.30.0`.
+- **`sdr-client`** (client-only): `recovery_policy`/`recovery_mode` on Sequence/CreateSequenceRequest
+  (+ the `LibraryClient` round-trip), `restart_policy`/`restart_mode` on ArmSequenceRequest, the 5
+  runtime fields on SequenceRun, PlanItem inherit-or-override; `timeline_model.resolve_arm_recovery`
+  (auto→manual downgrade when unsupported) + `fault_pill` + `sequence_auto_restart_supported`; a
+  sequence-editor recovery combo + save gate; every arm path (sequences/plan/**schedule** — the primary
+  unattended surface) carries the resolved policy; an amber `auto_restart` pill. See its CLAUDE.md.
+Tests: `tests/test_sequence_auto_restart.py` (26) + `test_meta_endpoint`.
+**Adversarial review** (two find→verify passes, all dims): confirmed + fixed — **HIGH** a manual Restart
+racing the auto trigger (loser's pre-stop / misread refusal false-alarmed a recovered run) → a per-run
+`_restart_inflight` guard + the auto except stands down quietly on `_RestartInProgress` / a
+recovered-or-non-RUNNING run; **HIGH (RF-safety)** the pre-stop no-ops while the watchdog is mid-stop
+(STOPPING ~10 s to SIGKILL a wedged flowgraph) so the auto trigger could double-transmit → a ground-truth
+`ProcessManager.is_process_alive` + the auto path DEFERS while alive + `restart_run` refuses over a live
+proc; **MEDIUM** the authored policy was dropped on store (agent + `LibraryClient`) → all persist it now;
+**MEDIUM** a manual Restart resets the breaker (fresh budget, clears the latch; auto passes
+`reset_budget=False`); a refusal give-up made DURABLE (count→budget); the settle reset persists + is
+floored to `3·HEALTH_POLL_S`. RF-emission invariants otherwise VERIFIED clear. One LOW documented-not-
+fixed (a multi-task run's counter doesn't reset if the restarted task's window ends before the settle —
+conservative). **NEXT — Phase 3b**: the standalone-task Auto-restart-on-fault checkbox
 (`TaskConfig.auto_restart_on_fault` + an owned-query so `process_manager` relaunches a task NOT owned by
 a run) + the fast-warm IQ cache. **Rollout:** OTA-push 1.30.0; `SDR_AUTO_RESTART=0` disables the trigger
 fleet-wide (a faulted "auto" run then waits for a manual Restart, like "confirm").
