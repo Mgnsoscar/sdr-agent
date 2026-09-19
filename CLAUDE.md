@@ -93,36 +93,52 @@ representative frequency for scalar read-outs and publishes the full artifact fo
 ## Current state — RF-fault RECOVERY (Phase 2): COMPLETE (1.29.0, capability `sequence-restart`) (branch `claude/system-familiarization-f5mezz`, cross-repo)
 Operator-driven recovery: one "Restart" click brings a faulted run back on air at the level it should
 be at, with a resync/replay choice. Design + full record: `docs/rf-fault-recovery.md` §7 + §14c. The
-UNATTENDED auto-restart trigger + fast-warm cache stay **Phase 3** (§11). Suite 554 → 560. `argspec`/
+UNATTENDED auto-restart trigger + fast-warm cache stay **Phase 3** (§11). Suite 554 → 571. `argspec`/
 `ramp` untouched (drift guard intact).
 - **`sequence_runner.restart_run(run_id, RestartRequest)`** (adjacent to `proceed`/`hold_now`). A run
   whose task faulted is still RUNNING with `run.fault`/`fault_task` stamped + that task's un-fired steps
   `'skipped'` (Phase-1 `on_task_fault`). restart_run recovers **IN PLACE** (no re-arm, no channel-guard
-  re-run, run log stays open): (1) reconstruct **L_now** (`_reconstruct_level`) = the last FIRED
-  power-carrying step of the faulted task `fire_at<=now` (a ramp is a staircase → the last-passed level
-  is exactly the peer level, no interpolation); (2) skip past-due un-fired fires; (3) **re-instate the
-  faulted task's FUTURE `'skipped'` fires** (its ramp remainder + STOP) on their original `fire_at`
-  (`resync`, default) or shifted by the downtime `now-fault_at` (`replay`, which floats `on_air_end` +
-  refuses a peer collision via `_guard_replay_channel`); (4) **relaunch** with ONE synthetic `start`
-  fire at `now` (`_relaunch_start_fire`): the original launch args with `--power`→L_now + the RF gate
-  forced ON, so the task is **born transmitting at L_now** — the attenuator is positioned at the carrier
-  BEFORE the process starts, no hot blip; (5) clear `run.fault`.
+  re-run, run log stays open), under two locks (validate+snapshot → release to STOP the faulted proc →
+  re-validate+plan+commit atomically): (1) **reconstruct the born-at state** (`_relaunch_start_fire`) —
+  walk the faulted task's fires ≤ now, rebuild the launch args, overlay every counted tune/ramp point;
+  generalised over WHATEVER it swept (power/gain/bridge), `--power` baked SPEC-INDEPENDENTLY
+  (`_LEVEL_FALLBACK_FLAGS`) so the level survives a transient `spec=None`. `resync` counts fired-OR-skipped
+  ≤ now (the SCHEDULE'S staircase level now, even across a down-time spanning ramp steps); `replay` counts
+  fired-only (the CRASH level). (2) **re-instate the faulted task's SKIPPED fires** (only that task, never
+  a peer): `resync` re-instates the FUTURE ones (`fire_at>now`) on their original `fire_at`; `replay`
+  re-instates the WHOLE remainder shifted by the downtime `now-fault_at`, floating `on_air_end`. (3)
+  **guards, BEFORE any mutation** (atomic refusal): a non-open-ended run with no future STOP is refused
+  (else RF stays on) — resync past off-air is pointed at replay; a `replay` whose shifted CHANNEL span
+  (off-air + its stop tail via `_channel_end`) overlaps another active run is refused (`_guard_replay_
+  channel`); the second lock re-checks state/fault/fault_task. (4) **relaunch** with ONE synthetic `start`
+  fire at `now`: the reconstructed command with the RF gate at its RECONSTRUCTED state (the schedule's
+  gate at now — on mid-transmission, MUTED in the pre-roll/cool-down), attenuator positioned at the
+  carrier BEFORE start, no blip; (5) clear `run.fault`.
 - **Two deliberate as-built deviations from the doc's §7.3** (from the understand-map's traps, both
   documented in §14c): (a) **in-place, not abort-and-re-arm** — Phase 1 chose a non-terminal `fault`
   FIELD on a still-RUNNING run precisely so Phase 2 recovers in place (the doc's "abort the predecessor"
-  assumed the older fault→terminal model); (b) **one launch-at-L_now fire, not the 3-fire
+  assumed the older fault→terminal model); (b) **one launch-at-level fire, not the 3-fire
   muted-then-gated dance** — a co-timed relaunch→tune→rf-on at `fire_at=now` is fragile (the
   `_co_time_rank` ordering trap + the control-socket-bind race silently drops the tune). Launching
-  directly at L_now RF-on carries the level on the launch command → same no-blip guarantee, no race.
-- **`main.py`** `POST /sequence-runs/{id}/restart` (404 unknown / 409 not-RUNNING|no-fault|collision).
-  **`models.py`** `RestartRequest{mode='resync'|'replay', restart_at}` + the `sequence_restart` webhook
-  type. **`config.py`** capability `sequence-restart`, `AGENT_VERSION 1.28.0 → 1.29.0`.
+  directly at the level carries it on the launch command → same no-blip guarantee, no race.
+- **`main.py`** `POST /sequence-runs/{id}/restart` (404 unknown / 409 not-RUNNING|no-fault|no-STOP|
+  collision|fault-changed). **`models.py`** `RestartRequest{mode='resync'|'replay', restart_at}` + the
+  `sequence_restart` webhook type. **`config.py`** capability `sequence-restart`, `AGENT_VERSION 1.28.0 →
+  1.29.0`.
 - **`sdr-client`** (client-only): `restart_sequence_run`, a "Restart" button on a FAULTED run row
   (sequence + plan; the plan row also gains the RF-FAULT pill), the resync/replay choice, gated on both
   `task-rf-health` + `sequence-restart`. See its CLAUDE.md.
-Tests: `tests/test_sequence_restart.py` (L_now incl. launch-level fallback; resync re-instates future +
-relaunch shape; replay shifts fires + off-air; replay collision refusal; 404/409 guards; a **LIVE**
-end-to-end that faults a real ramping task at −70, restarts, and completes on schedule) +
+- **Adversarial review** (find→verify, all dims): a review of the first build found **12 confirmed
+  defects (A–H)**, ALL fixed + pinned (A late-restart RF-left-on → the no-future-STOP guard; B swept param
+  not just power; C peer step wrongly skipped → task-scoped; D resync uses the schedule level at now; E
+  replay re-instates the whole remainder; F+G collision guard before mutation, using the stop-tail
+  `_channel_end`; H second-lock re-validation). A **re-review of the rewrite** confirmed **2 more**, both
+  fixed: (1, LOW) a transient `spec=None` reverted the relaunch to the launch `--power` (hot over-power) →
+  spec-independent power/gain bake; (2, MED) the relaunch FORCED RF on → the gate is now RECONSTRUCTED from
+  the schedule (muted pre-roll/cool-down stays muted).
+Tests: `tests/test_sequence_restart.py` (17: reconstruction incl. launch-level fallback; resync/replay
+shapes; the collision refusal; 404/409 guards; a **LIVE** end-to-end faulting a real ramp at −70 →
+restart → completion; + a regression per review finding A–H and both re-review findings) +
 `test_meta_endpoint`. **NEXT — Phase 3**: the task Auto-restart-on-fault checkbox + sequence/plan
 auto-restart policy (unattended, budget 2) + the fast-warm IQ cache. **Rollout:** OTA-push 1.29.0.
 

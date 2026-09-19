@@ -52,6 +52,12 @@ logger = logging.getLogger(__name__)
 
 _TICK_SECONDS = 0.25
 
+# Canonical flags for the two level parameters, used to bake a reconstructed level onto a
+# restart relaunch command when the argspec is momentarily unreadable (spec=None) so the
+# per-dest flag map is empty. Power is the over-power hazard, so it must never fall back to
+# the launch value; gain is the same class. These mirror every shipped script's convention.
+_LEVEL_FALLBACK_FLAGS = {"power": tuple(_POWER_FLAGS), "gain": ("--gain", "-Gain")}
+
 # States in which a run is LIVE — it occupies the single TX channel: armed (about to
 # fire), running, or parked at a Hold with RF on. Used by the active-run guards
 # (delete / arm-overlap / panic / abort-all). Note the tick loop's fire-eligibility is
@@ -1173,43 +1179,44 @@ class SequenceRunner:
     async def restart_run(self, run_id: str, req: RestartRequest) -> SequenceRun:
         """RF-fault RECOVERY (docs/rf-fault-recovery.md §7). Recover a RUNNING run whose task was
         detected dead-but-alive — Phase-1 `on_task_fault` stamped run.fault/fault_task and marked
-        that task's un-fired steps 'skipped' (so the tick stopped tuning a dead task), while KEEPING
+        THAT task's un-fired steps 'skipped' (so the tick stopped tuning a dead task), while KEEPING
         the run RUNNING (a fault is a FIELD, not a terminal state — §5.3). This recovers IN PLACE on
         that same run (no re-arm, no channel-guard re-run, the run log stays open):
 
-          1. Reconstruct L_now = the level the faulted task was transmitting at `now` — the value of
-             its last FIRED power-carrying step (a ramp point's tune, or the launch --power). A ramp
-             is a staircase of held levels, so the last-passed level is EXACTLY what a never-faulted
-             peer transmits now — no interpolation, no eyeballing.
-          2. Skip every past-due un-fired fire (the elapsed up-ramp of the faulted task is already
-             skipped; this catches any straggler), leaving future fires to run.
-          3. Re-instate the faulted task's FUTURE fires that the fault skipped (its ramp remainder +
-             its STOP), so the run continues + stops. resync (default): on their ORIGINAL fire_at, so
-             the signal rejoins the schedule. replay: shifted later by the downtime (now - fault_at),
-             with on_air_end shifted too, so the whole remaining profile is delivered.
-          4. Relaunch the faulted task with ONE synthetic `start` fire at `now`: its original launch
-             args with --power overridden to L_now and the RF gate forced ON. The task is born
-             transmitting at exactly L_now — the attenuator is positioned for L_now at the carrier
-             BEFORE the process starts (start → _gate_precommand(cmd=)), so there is no hot blip and
+          1. Reconstruct the level the faulted task must be born transmitting at — the value of its
+             last power-carrying step at the cutoff, generalised over WHATEVER it swept (power, gain,
+             a bridge param), by re-baking every changed live parameter onto the launch command.
+             resync uses the SCHEDULED staircase level at `now` (last fired-OR-skipped ramp point
+             ≤ now — the exact point a never-faulted peer holds now, even if the down-time spanned
+             several ramp steps); replay uses the CRASH level (last ACTUALLY-fired step ≤ now).
+          2. Re-instate the faulted task's fires the fault skipped so the run continues + STOPS.
+             resync (default): only the still-FUTURE fires (fire_at > now), on their ORIGINAL fire_at,
+             so the signal rejoins the schedule (missed points stay missed). replay: EVERY skipped
+             fire, shifted later by the down-time (now − fault_at), with on_air_end shifted too, so
+             the whole remaining profile is delivered. A peer task's steps are never touched.
+          3. Relaunch the faulted task with ONE synthetic `start` fire at `now`: its launch command
+             with every changed live parameter baked in and the RF gate at its RECONSTRUCTED state
+             (the schedule's gate at `now` — on mid-transmission, muted in the pre-roll / cool-down).
+             The task is born transmitting at exactly that level — the attenuator is positioned for
+             it at the carrier BEFORE the process starts (start → _gate_precommand(cmd=)), no blip and
              no control-socket race (we do NOT tune-after-launch, which would fire before the
              relaunched script binds its socket and be silently dropped — the level rides the launch
              command instead).
-          5. Clear run.fault — recovered.
+          4. Clear run.fault — recovered.
 
         Requires run.state RUNNING and run.fault set (else ValueError → 409); unknown run → KeyError
-        → 404. A replay whose shifted off-air would overlap another active run on the channel is
-        refused (the operator can resync instead)."""
-        # Validate + read the faulted task under a short lock.
+        → 404. A non-open-ended run with no remaining STOP to recover into is refused BEFORE any
+        mutation (relaunching would leave RF on) — resync past off-air is pointed at replay. A replay
+        whose shifted channel span (off-air + its stop tail) would overlap another active run on the
+        channel is likewise refused before mutating (the operator can resync instead)."""
+        # ── Validate + snapshot the fault under a short lock ──────────────────────────
         async with self._lock:
             run = self._runs.get(run_id)
             if run is None:
                 raise KeyError(f"Unknown run: '{run_id}'")
-            if run.state != SequenceState.RUNNING:
-                raise ValueError(
-                    f"cannot restart a run in state '{run.state}' (it is not running)")
-            if not (run.fault and run.fault_task):
-                raise ValueError("this run has no RF fault to restart from")
+            self._check_restartable(run)
             task = run.fault_task
+            fault0 = run.fault                           # snapshot for the second-lock re-check
             mode = (req.mode or "resync").strip().lower()
             if mode not in ("resync", "replay"):
                 raise ValueError(f"unknown restart mode '{req.mode}' (use 'resync' or 'replay')")
@@ -1229,39 +1236,69 @@ class SequenceRunner:
             run = self._runs.get(run_id)
             if run is None:
                 raise KeyError(f"Unknown run: '{run_id}'")
-            l_now = self._reconstruct_level(run, task, now)
+            # Re-validate: while the lock was released for the pre-stop the run could have been
+            # aborted/recovered, or re-faulted on a DIFFERENT task. Refuse rather than mutate stale.
+            self._check_restartable(run)
+            if run.fault_task != task or run.fault != fault0:
+                raise ValueError("the run's fault changed during restart; retry")
 
-            # (2) Neutralize any past-due un-fired fire (the faulted task's elapsed up-ramp is
-            # already 'skipped'; this is the belt-and-suspenders general rule from §7.3 step 3).
-            for s in run.steps:
-                if s.fired_actual is None and _parse(s.fire_at) <= now:
-                    s.fired_actual = "skipped"
+            try:
+                spec, _artifact = self._manager.tune_log_context(task)
+            except Exception:                            # noqa: BLE001 — best effort
+                spec = None
 
-            # (3) Re-instate the faulted task's FUTURE fires the fault skipped so the ramp remainder
-            # and the STOP run again. resync keeps their fire_at; replay shifts them later.
+            # ── PLAN the re-instated fires WITHOUT mutating (so a refusal below is atomic) ──
             shift = timedelta(seconds=downtime) if mode == "replay" else timedelta(0)
+            plan: List[Tuple[StepFire, datetime]] = []   # (skipped step, its new fire_at)
             for s in run.steps:
                 if s.task_name != task or s.fired_actual != "skipped":
                     continue
                 ft = _parse(s.fire_at)
-                if ft > now:
-                    s.fired_actual = None
-                    if shift:
-                        s.fire_at = (ft + shift).isoformat()
+                if mode == "resync":
+                    if ft > now:                         # rejoin the schedule; missed points stay missed
+                        plan.append((s, ft))
+                else:                                    # replay: the whole remainder, shifted later
+                    plan.append((s, ft + shift))
 
-            # replay also floats off-air later; refuse if the shifted window collides with a peer.
+            # A non-open-ended run MUST end with a future STOP for the relaunched task, else its RF
+            # would stay on forever (the completion check would mark the run COMPLETED with RF up).
+            # resync past off-air can't satisfy this — refuse and point at replay.
+            if not run.open_ended:
+                has_future_stop = any(s.action == "stop" and nf > now for s, nf in plan)
+                if not has_future_stop:
+                    raise ValueError(
+                        "resync cannot recover this run — its on-air window has already ended, so "
+                        "there is no remaining STOP to rejoin (relaunching would leave RF on); "
+                        "restart with replay to deliver the remaining profile shifted later"
+                        if mode == "resync" else
+                        "cannot recover this run — it has no remaining STOP to relaunch into")
+
+            # replay floats off-air (and its stop tail) later; refuse BEFORE mutating if the shifted
+            # channel span collides with another active run. The channel end is the LATEST prospective
+            # fire (the shifted STOP tail lands after off-air — see _channel_end), not off-air itself.
+            new_on_air_end: Optional[datetime] = None
             if mode == "replay" and shift and run.on_air_end:
-                new_end = _parse(run.on_air_end) + shift
-                self._guard_replay_channel(run, now, new_end)
-                run.on_air_end = new_end.isoformat()
-                self._off_air_marked.discard(run.id)   # let the off-air marker fire at the new end
+                new_on_air_end = _parse(run.on_air_end) + shift
+                shifted = {id(s): nf for s, nf in plan}
+                fires = [shifted.get(id(s), _parse(s.fire_at))
+                         for s in run.steps if getattr(s, "fire_at", None)]
+                channel_end = max([new_on_air_end, now] + fires)
+                self._guard_replay_channel(run, now, channel_end)
 
-            # (4) The synthetic relaunch: born at L_now, RF on.
-            relaunch = self._relaunch_start_fire(run, task, l_now, now)
+            # ── Reconstruct the relaunch (born at the recovered level, RF on) ──
+            relaunch = self._relaunch_start_fire(
+                run, task, now, spec, include_skipped=(mode == "resync"))
+            l_now = self._power_of_args(relaunch.args)
+
+            # ── COMMIT: apply the plan, float off-air (replay), add the relaunch, clear the fault ──
+            for s, nf in plan:
+                s.fired_actual = None
+                s.fire_at = nf.isoformat()
+            if new_on_air_end is not None:
+                run.on_air_end = new_on_air_end.isoformat()
+                self._off_air_marked.discard(run.id)     # let the off-air marker fire at the new end
             run.steps = list(run.steps) + [relaunch]
             run.steps.sort(key=lambda f: _parse(f.fire_at))
-
-            # (5) Recovered.
             run.fault = ""
             run.fault_task = ""
             run.fault_at = ""
@@ -1277,35 +1314,38 @@ class SequenceRunner:
         logger.info("Run %s RESTART (%s): relaunched '%s' at %s", run.id, mode, task, lvl)
         return run
 
-    def _reconstruct_level(self, run: SequenceRun, task: str,
-                           now: datetime) -> Optional[float]:
-        """L_now — the --power the faulted task was transmitting at `now`: the value of its last
-        FIRED (not 'skipped', not pending) power-carrying step with fire_at <= now — a ramp point's
-        tune `params['power']`, or the launch --power. None when the task set no power (uncalibrated
-        / no swept level), so the relaunch keeps its original launch power."""
-        best_t: Optional[datetime] = None
-        level: Optional[float] = None
-        for s in run.steps:
-            if s.task_name != task or not s.fired_actual or s.fired_actual == "skipped":
-                continue
-            ft = _parse(s.fire_at)
-            if ft > now:
-                continue
-            if s.action == "tune" and s.params and "power" in s.params:
-                p = s.params.get("power")
-            elif s.action in ("start", "run"):
-                p = self._power_of_args(s.args)
-            else:
-                continue
-            if p is None:
-                continue
-            try:
-                pf = float(p)
-            except (TypeError, ValueError):
-                continue
-            if best_t is None or ft >= best_t:
-                best_t, level = ft, pf
-        return level
+    @staticmethod
+    def _check_restartable(run: SequenceRun) -> None:
+        """A run is restartable only while RUNNING and carrying an RF fault (else ValueError → 409)."""
+        if run.state != SequenceState.RUNNING:
+            raise ValueError(
+                f"cannot restart a run in state '{run.state}' (it is not running)")
+        if not (run.fault and run.fault_task):
+            raise ValueError("this run has no RF fault to restart from")
+
+    @staticmethod
+    def _counts_at_cutoff(step: StepFire, cutoff: datetime, include_skipped: bool) -> bool:
+        """Whether ``step`` counts toward the level reconstruction at ``cutoff``: it must have a
+        fire time at/before the cutoff and have run — an actually-fired step always, a 'skipped'
+        (never-transmitted) fire only when include_skipped (resync reconstructs the SCHEDULE's
+        position; replay reconstructs what was ACTUALLY on air = fired only)."""
+        if not step.fired_actual:
+            return False                                 # never fired / re-instated / pending
+        if step.fired_actual == "skipped" and not include_skipped:
+            return False
+        return _parse(step.fire_at) <= cutoff
+
+    @staticmethod
+    def _dest_flag_map(spec: Optional[dict]) -> dict:
+        """{dest: [flags…]} from a script's argspec — the flag(s) that set each live parameter, so
+        a reconstructed live-param value can be baked back onto the relaunch command."""
+        out: dict = {}
+        for p in (spec or {}).get("params", []) or []:
+            dest = p.get("dest")
+            flags = [str(f) for f in (p.get("flags") or [])]
+            if dest and flags:
+                out[dest] = flags
+        return out
 
     @staticmethod
     def _power_of_args(args: Optional[list]) -> Optional[float]:
@@ -1343,36 +1383,75 @@ class SequenceRunner:
                 out += [can, str(value)]
         return out
 
-    def _relaunch_start_fire(self, run: SequenceRun, task: str, l_now: Optional[float],
-                             now: datetime) -> StepFire:
-        """A synthetic `start` StepFire that relaunches `task` at `now`: the task's original launch
-        args with --power overridden to L_now and the RF gate forced ON, replace_args=True. Carrying
-        --power makes it _step_sets_power (co-time rank 0) and, since it is inserted first, it
-        stable-sorts ahead of any equal-rank fire at the same instant."""
-        orig = next((s for s in run.steps
-                     if s.task_name == task and s.action in ("start", "run")
-                     and s.fired_actual and s.fired_actual != "skipped"), None)
+    def _relaunch_start_fire(self, run: SequenceRun, task: str, now: datetime,
+                             spec: Optional[dict], *, include_skipped: bool) -> StepFire:
+        """A synthetic `start` StepFire that relaunches `task` at `now`, born transmitting exactly
+        as a never-faulted peer holds now: the task's launch command with EVERY changed live
+        parameter (power, gain, or whatever it swept) baked in AND the RF gate at its RECONSTRUCTED
+        state (not forced on), replace_args=True. The attenuator is positioned for that level by the
+        launch precommand (_manager.start → _gate_precommand(cmd=)), so it is born there, no blip.
+
+        The state is reconstructed by walking the task's fires in time order up to the cutoff: the
+        LATEST launch-like fire (start/run) sets the base command args (a launch resets the
+        accumulated state), then every later tune/ramp-point overlays its live params. Which fires
+        COUNT is include_skipped (see _counts_at_cutoff): resync counts the skipped down-time ramp
+        points too (the SCHEDULE'S position now), replay counts only what actually fired (the CRASH
+        state).
+
+        --power is baked SPEC-INDEPENDENTLY (via _LEVEL_FALLBACK_FLAGS): `state` is accumulated from
+        tune/ramp params, so the crash/scheduled level survives even if the argspec is momentarily
+        unreadable (spec=None) — the relaunch never silently reverts to the launch --power (a hot
+        over-power blip if the launch level sat above the crash level). The RF gate is set to the
+        state the schedule holds at the cutoff — a fault in the muted pre-roll (launch --rf off, an
+        RF-on tune at T0) or the cool-down tail (an RF-off tune at off-air, STOP after) relaunches
+        MUTED so the re-instated RF-on tune / the STOP drives the gate, not an unconditional on."""
+        dest_flags = self._dest_flag_map(spec)
         try:
             base = self._post_script_args(list(self._manager.get_config(task).command))
         except Exception:                            # noqa: BLE001 — best effort
             base = []
-        if orig is not None and orig.replace_args and orig.args:
-            args = list(orig.args)
-        else:
-            args = list(base) + list(orig.args if orig else [])
-        if l_now is not None:
-            # A calibrated task always launched with --power, so this replaces in place.
-            args = self._set_arg_value(args, _POWER_FLAGS, f"{l_now:g}", canonical="--power")
-        # Force the RF gate ON so it transmits from launch. No gate ⇒ gateless (always on) ⇒ nothing.
+        # Walk the task's fires in time order: rebuild the launch args at its latest launch-like
+        # fire, then accumulate the live-param deltas of every counted tune/ramp point after it.
+        steps = sorted((s for s in run.steps if s.task_name == task),
+                       key=lambda s: _parse(s.fire_at))
+        launch_args = list(base)
+        state: dict = {}
+        for s in steps:
+            if not self._counts_at_cutoff(s, now, include_skipped):
+                continue
+            if s.action in ("start", "run"):
+                launch_args = list(s.args) if s.replace_args else list(base) + list(s.args or [])
+                state = {}                           # a (re)launch resets the accumulated live state
+            elif s.action == "tune" and s.params:
+                state.update(dict(s.params))
+        args = list(launch_args)
+
         gate = None
         try:
             gate = self._manager._rf_gate(task)
         except Exception:                            # noqa: BLE001
             gate = None
-        if gate:
-            flags = [str(f) for f in (gate.get("flags") or [])]
+        gate_dest = (gate.get("dest") or gate.get("name")) if gate else None
+
+        # Overlay each changed NUMERIC live param onto the launch command; a boolean/toggle live
+        # param keeps the launch default (only a swept level need be re-baked). --power/--gain fall
+        # back to their canonical flags when the argspec is unreadable, so the level is never lost.
+        for dest, value in state.items():
+            if dest == gate_dest or isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            flags = dest_flags.get(dest) or _LEVEL_FALLBACK_FLAGS.get(dest)
             if flags:
-                args = self._set_arg_value(args, flags, "on", canonical=flags[0])
+                args = self._set_arg_value(args, list(flags), f"{float(value):g}",
+                                           canonical=flags[0])
+
+        # Reconstruct the RF gate the schedule holds at the cutoff. If a counted tune drove the gate
+        # dest, apply that value; otherwise the launch args' own gate value is the effective state
+        # (launched-on ⇒ on; a muted pre-roll ⇒ off). No unconditional force-on.
+        if gate and gate_dest is not None and gate_dest in state:
+            gate_flags = [str(f) for f in (gate.get("flags") or [])]
+            if gate_flags:
+                args = self._set_arg_value(args, gate_flags, str(state[gate_dest]),
+                                           canonical=gate_flags[0])
         return StepFire(anchor="start", offset_s=0.0, action="start", task_name=task,
                         fire_at=now.isoformat(), fired_actual=None,
                         args=args, replace_args=True)

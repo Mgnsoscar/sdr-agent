@@ -223,6 +223,405 @@ def test_restart_guards(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+# ── Review-finding regressions (docs/rf-fault-recovery.md §14c) ───────────────────
+
+# A task whose ramp swept --gain (not --power), for the gain-reconstruction regression.
+GAIN_SCRIPT = '''\
+import time
+from paramkit import Script
+s = (Script("tx")
+     .number("--gain", min=0, max=90, default=30, live=True)
+     .choice("--rf", options=["on", "off"], default="on", live=True, is_rf=True))
+args = s.parse()
+ctrl = s.live_control(args)
+while True:
+    for ch in ctrl.drain():
+        pass
+    time.sleep(0.01)
+'''
+
+
+def _faulted_multi(runner, now, *, rid="rm"):
+    """A faulted run whose --power ramp fired up to -70 (the crash level at fault_at=now-5s),
+    then the down-time (5 s) SPANNED two more scheduled points -65 (now-4) and -60 (now-2), both
+    fault-skipped, before the future -50 (now+3) and the STOP (now+10). The SCHEDULE'S level at
+    `now` is -60, not the last-fired -70 — the resync/replay divergence."""
+    T0 = now - timedelta(seconds=20)
+    steps = [
+        _fire("start", 0.0, T0, fired=_iso(T0), args=["--power", "-90", "--rf", "off"], replace=True),
+        _fire("tune", 1.0, T0 + timedelta(seconds=1), fired=_iso(T0 + timedelta(seconds=1)),
+              params={"rf": "on"}),
+        _fire("tune", 1.0, T0 + timedelta(seconds=1), fired=_iso(T0 + timedelta(seconds=1)),
+              params={"power": -90}),
+        _fire("tune", 14.0, now - timedelta(seconds=6), fired=_iso(now - timedelta(seconds=6)),
+              params={"power": -70}),                       # last FIRED (crash level)
+        _fire("tune", 16.0, now - timedelta(seconds=4), fired="skipped",
+              params={"power": -65}),                       # skipped DURING down-time
+        _fire("tune", 18.0, now - timedelta(seconds=2), fired="skipped",
+              params={"power": -60}),                       # skipped DURING down-time → schedule-now
+        _fire("tune", 23.0, now + timedelta(seconds=3), fired="skipped",
+              params={"power": -50}),                       # future ramp point
+        _fire("stop", 0.0, now + timedelta(seconds=10), fired="skipped"),
+    ]
+    run = SequenceRun(id=rid, sequence_id="s1", sequence_name="sweep",
+                      state=SequenceState.RUNNING,
+                      on_air_at=_iso(T0), on_air_end=_iso(now + timedelta(seconds=10)),
+                      steps=steps, fault="tx: vmcircbuf", fault_task="tx",
+                      fault_at=_iso(now - timedelta(seconds=5)))
+    runner._runs[rid] = run
+    return run
+
+
+def test_restart_resync_uses_the_schedule_level_at_now_not_the_last_fired(tmp_path, monkeypatch):
+    """Finding D: resync must rejoin the SCHEDULE — born at the last SCHEDULED (fired-or-skipped)
+    point ≤ now (-60), not the last actually-fired point (-70) from before the down-time."""
+    async def scenario():
+        mgr, runner = _mk(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        _faulted_multi(runner, now)
+        out = await runner.restart_run("rm", RestartRequest(mode="resync", restart_at=_iso(now)))
+        relaunch = [s for s in out.steps if s.action == "start" and s.fired_actual is None][0]
+        pi = relaunch.args.index("--power")
+        assert float(relaunch.args[pi + 1]) == -60.0          # the schedule's level at now
+        # The two down-time points stay MISSED (resync doesn't replay the past); only the future
+        # -50 and the STOP are re-instated on their ORIGINAL clock.
+        by_pwr = {s.params.get("power"): s for s in out.steps if s.action == "tune"}
+        assert by_pwr[-65].fired_actual == "skipped" and by_pwr[-60].fired_actual == "skipped"
+        assert by_pwr[-50].fired_actual is None and by_pwr[-50].fire_at == _iso(now + timedelta(seconds=3))
+        stop = [s for s in out.steps if s.action == "stop"][0]
+        assert stop.fired_actual is None and stop.fire_at == _iso(now + timedelta(seconds=10))
+
+    asyncio.run(scenario())
+
+
+def test_restart_replay_from_crash_level_reinstates_the_whole_remainder(tmp_path, monkeypatch):
+    """Findings E + D: replay resumes from the CRASH level (-70, last actually-fired) and
+    re-instates EVERY fault-skipped point — including the ones scheduled DURING the down-time —
+    shifted later by the down-time, so the whole remaining profile plays (none are dropped)."""
+    async def scenario():
+        mgr, runner = _mk(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        _faulted_multi(runner, now)                          # fault_at now-5 → downtime 5 s
+        out = await runner.restart_run("rm", RestartRequest(mode="replay", restart_at=_iso(now)))
+        relaunch = [s for s in out.steps if s.action == "start" and s.fired_actual is None][0]
+        pi = relaunch.args.index("--power")
+        assert float(relaunch.args[pi + 1]) == -70.0          # the crash level, not the schedule
+        by_pwr = {s.params.get("power"): s for s in out.steps if s.action == "tune"}
+        # The down-time points are NOT dropped — re-instated, shifted +5 s into the future.
+        assert by_pwr[-65].fired_actual is None and by_pwr[-65].fire_at == _iso(now + timedelta(seconds=-4 + 5))
+        assert by_pwr[-60].fired_actual is None and by_pwr[-60].fire_at == _iso(now + timedelta(seconds=-2 + 5))
+        assert by_pwr[-50].fired_actual is None and by_pwr[-50].fire_at == _iso(now + timedelta(seconds=3 + 5))
+        stop = [s for s in out.steps if s.action == "stop"][0]
+        assert stop.fire_at == _iso(now + timedelta(seconds=10 + 5))
+        assert out.on_air_end == _iso(now + timedelta(seconds=10 + 5))
+
+    asyncio.run(scenario())
+
+
+def test_restart_bakes_the_swept_param_not_just_power(tmp_path, monkeypatch):
+    """Finding B: a task whose ramp swept --GAIN must relaunch at the reconstructed gain, not the
+    stale launch gain (an over-power hazard). The full changed live state rides the launch command."""
+    async def scenario():
+        monkeypatch.setattr(pm._agentcfg, "CTRL_DIR", tmp_path / "ctl")
+        script = tmp_path / "gtx.py"
+        script.write_text(GAIN_SCRIPT)
+        tasks = {"tx": TaskConfig(name="tx", command=["python3", str(script), "--gain", "20",
+                                                      "--rf", "off"],
+                                  working_dir=str(tmp_path), env={"PYTHONPATH": REPO_ROOT})}
+        mgr = ProcessManager(tasks, tmp_path, "unit-a")
+        runner = SequenceRunner(mgr, "unit-a", tmp_path / "seq.json",
+                                tmp_path / "runs.json", tmp_path)
+        now = datetime.now(timezone.utc)
+        T0 = now - timedelta(seconds=6)
+        steps = [
+            _fire("start", 0.0, T0, fired=_iso(T0), args=["--gain", "20", "--rf", "off"], replace=True),
+            _fire("tune", 1.0, T0 + timedelta(seconds=1), fired=_iso(T0 + timedelta(seconds=1)),
+                  params={"rf": "on"}),
+            _fire("tune", 2.0, now - timedelta(seconds=2), fired=_iso(now - timedelta(seconds=2)),
+                  params={"gain": 55}),                       # last gain level
+            _fire("stop", 0.0, now + timedelta(seconds=10), fired="skipped"),
+        ]
+        run = SequenceRun(id="rg", sequence_id="s", sequence_name="gramp",
+                          state=SequenceState.RUNNING, on_air_at=_iso(T0),
+                          on_air_end=_iso(now + timedelta(seconds=10)), steps=steps,
+                          fault="tx: halt", fault_task="tx", fault_at=_iso(now - timedelta(seconds=1)))
+        runner._runs["rg"] = run
+        out = await runner.restart_run("rg", RestartRequest(mode="resync", restart_at=_iso(now)))
+        relaunch = [s for s in out.steps if s.action == "start" and s.fired_actual is None][0]
+        gi = relaunch.args.index("--gain")
+        assert float(relaunch.args[gi + 1]) == 55.0           # reconstructed gain, not the launch 20
+        assert "--power" not in relaunch.args                 # never invents a --power the task lacks
+        ri = relaunch.args.index("--rf")
+        assert relaunch.args[ri + 1] == "on"
+
+    asyncio.run(scenario())
+
+
+def test_restart_does_not_skip_a_healthy_peer_task_step(tmp_path, monkeypatch):
+    """Finding C: the recovery must touch ONLY the faulted task. A healthy PEER task's past-due
+    un-fired step must stay pending (the tick fires it), not be swept to 'skipped'."""
+    async def scenario():
+        mgr, runner = _mk(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        T0 = now - timedelta(seconds=10)
+        steps = [
+            _fire("start", 0.0, T0, fired=_iso(T0), args=["--power", "-90", "--rf", "off"],
+                  replace=True),
+            _fire("tune", 1.0, T0 + timedelta(seconds=1), fired=_iso(T0 + timedelta(seconds=1)),
+                  params={"rf": "on"}),
+            _fire("tune", 5.0, now - timedelta(seconds=5), fired=_iso(now - timedelta(seconds=5)),
+                  params={"power": -70}),
+            _fire("stop", 0.0, now + timedelta(seconds=10), fired="skipped"),
+            # A HEALTHY peer task with a past-due un-fired tune (the tick just hasn't fired it yet).
+            _fire("tune", 9.0, now - timedelta(seconds=1), fired=None, task="tx2",
+                  params={"power": -40}),
+        ]
+        run = SequenceRun(id="rp", sequence_id="s", sequence_name="two", state=SequenceState.RUNNING,
+                          on_air_at=_iso(T0), on_air_end=_iso(now + timedelta(seconds=10)),
+                          steps=steps, fault="tx: vmcircbuf", fault_task="tx",
+                          fault_at=_iso(now - timedelta(seconds=3)))
+        runner._runs["rp"] = run
+        out = await runner.restart_run("rp", RestartRequest(restart_at=_iso(now)))
+        peer = [s for s in out.steps if s.task_name == "tx2"][0]
+        assert peer.fired_actual is None                      # still pending — NOT skipped
+
+    asyncio.run(scenario())
+
+
+def test_restart_resync_refuses_past_off_air_but_replay_recovers(tmp_path, monkeypatch):
+    """Finding A: resync must refuse a run whose on-air window has already ended — there is no
+    remaining STOP to rejoin, so relaunching would leave RF ON forever. replay (which shifts the
+    whole profile) still recovers it."""
+    async def scenario():
+        mgr, runner = _mk(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        T0 = now - timedelta(seconds=20)
+
+        def _late():
+            return [
+                _fire("start", 0.0, T0, fired=_iso(T0), args=["--power", "-50", "--rf", "off"],
+                      replace=True),
+                _fire("tune", 1.0, T0 + timedelta(seconds=1), fired=_iso(T0 + timedelta(seconds=1)),
+                      params={"rf": "on"}),
+                _fire("stop", 0.0, now - timedelta(seconds=2), fired="skipped"),   # STOP already past
+            ]
+        run = SequenceRun(id="rl", sequence_id="s", sequence_name="late", state=SequenceState.RUNNING,
+                          on_air_at=_iso(T0), on_air_end=_iso(now - timedelta(seconds=2)),
+                          steps=_late(), fault="tx: halt", fault_task="tx",
+                          fault_at=_iso(now - timedelta(seconds=8)))
+        runner._runs["rl"] = run
+        try:
+            await runner.restart_run("rl", RestartRequest(mode="resync", restart_at=_iso(now)))
+            assert False, "expected resync to refuse a window that has ended"
+        except ValueError as exc:
+            assert "already ended" in str(exc) and "replay" in str(exc)
+        # The refusal was atomic — nothing mutated.
+        assert run.fault == "tx: halt" and [s for s in run.steps if s.action == "stop"][0].fired_actual == "skipped"
+
+        # replay shifts the STOP into the future (down-time 8 s) → recoverable.
+        out = await runner.restart_run("rl", RestartRequest(mode="replay", restart_at=_iso(now)))
+        assert out.fault == ""
+        stop = [s for s in out.steps if s.action == "stop"][0]
+        assert stop.fired_actual is None and _parse_ok(stop.fire_at) > now
+
+    asyncio.run(scenario())
+
+
+def test_restart_open_ended_run_recovers_without_a_stop(tmp_path, monkeypatch):
+    """The no-future-STOP guard is skipped for an OPEN-ENDED run (it legitimately has no STOP —
+    it runs until aborted), so resync recovers it."""
+    async def scenario():
+        mgr, runner = _mk(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        T0 = now - timedelta(seconds=6)
+        steps = [
+            _fire("start", 0.0, T0, fired=_iso(T0), args=["--power", "-55", "--rf", "off"],
+                  replace=True),
+            _fire("tune", 1.0, T0 + timedelta(seconds=1), fired=_iso(T0 + timedelta(seconds=1)),
+                  params={"rf": "on"}),
+        ]
+        run = SequenceRun(id="ro", sequence_id="s", sequence_name="beacon",
+                          state=SequenceState.RUNNING, on_air_at=_iso(T0), on_air_end=None,
+                          open_ended=True, steps=steps, fault="tx: halt", fault_task="tx",
+                          fault_at=_iso(now - timedelta(seconds=1)))
+        runner._runs["ro"] = run
+        out = await runner.restart_run("ro", RestartRequest(restart_at=_iso(now)))
+        assert out.fault == ""
+        relaunch = [s for s in out.steps if s.action == "start" and s.fired_actual is None][0]
+        assert relaunch.args[relaunch.args.index("--rf") + 1] == "on"
+
+    asyncio.run(scenario())
+
+
+def test_restart_replay_collision_uses_the_stop_tail_and_is_atomic(tmp_path, monkeypatch):
+    """Findings F + G: the replay collision guard uses the CHANNEL end (the stop tail after off-air),
+    not off-air alone — a peer starting AT the shifted off-air but before the shifted stop tail is
+    caught — and refuses BEFORE any mutation (the run is left untouched)."""
+    async def scenario():
+        mgr, runner = _mk(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        T0 = now - timedelta(seconds=10)
+        # on_air_end now+8, but the STOP tail lands at now+10 (off-air + 2 s). downtime 2 s.
+        steps = [
+            _fire("start", 0.0, T0, fired=_iso(T0), args=["--power", "-60", "--rf", "off"],
+                  replace=True),
+            _fire("tune", 1.0, T0 + timedelta(seconds=1), fired=_iso(T0 + timedelta(seconds=1)),
+                  params={"rf": "on"}),
+            _fire("stop", 0.0, now + timedelta(seconds=10), fired="skipped"),
+        ]
+        run = SequenceRun(id="rc", sequence_id="s", sequence_name="tail", state=SequenceState.RUNNING,
+                          on_air_at=_iso(T0), on_air_end=_iso(now + timedelta(seconds=8)),
+                          steps=steps, fault="tx: halt", fault_task="tx",
+                          fault_at=_iso(now - timedelta(seconds=2)))
+        runner._runs["rc"] = run
+        snapshot = [(s.fired_actual, s.fire_at) for s in run.steps]
+        # replay shifts off-air → now+10 and the STOP tail → now+12. A peer at [now+10, now+11]
+        # does NOT overlap off-air (now+10) but DOES overlap the stop tail (now+12).
+        peer = SequenceRun(id="peer", sequence_id="s2", sequence_name="next",
+                           state=SequenceState.ARMED,
+                           on_air_at=_iso(now + timedelta(seconds=10)),
+                           on_air_end=_iso(now + timedelta(seconds=11)),
+                           steps=[_fire("start", 0.0, now + timedelta(seconds=10), fired=None)])
+        runner._runs["peer"] = peer
+        try:
+            await runner.restart_run("rc", RestartRequest(mode="replay", restart_at=_iso(now)))
+            assert False, "expected the stop-tail collision to be refused"
+        except ValueError as exc:
+            assert "overlapping" in str(exc)
+        # Atomic: the run is byte-for-byte what it was — no re-instatement, off-air unchanged, fault kept.
+        assert [(s.fired_actual, s.fire_at) for s in run.steps] == snapshot
+        assert run.on_air_end == _iso(now + timedelta(seconds=8)) and run.fault == "tx: halt"
+
+    asyncio.run(scenario())
+
+
+def test_restart_revalidates_after_the_unlocked_pre_stop(tmp_path, monkeypatch):
+    """Finding H: the lock is released to stop the faulted process; if the run's fault CHANGES in
+    that gap (aborted, recovered, or re-faulted on another task), the restart must refuse rather
+    than mutate a stale plan."""
+    async def scenario():
+        mgr, runner = _mk(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        run = _faulted_run(runner, now)
+
+        real_stop = mgr.stop
+
+        async def racing_stop(name, source="manual"):
+            run.fault_task = "someone_else"               # a concurrent change during the await
+            return await real_stop(name, source=source)
+
+        monkeypatch.setattr(mgr, "stop", racing_stop)
+        try:
+            await runner.restart_run("r1", RestartRequest(restart_at=_iso(now)))
+            assert False, "expected a refusal after the fault changed under us"
+        except ValueError as exc:
+            assert "changed" in str(exc)
+        # Nothing recovered — the run keeps its (now-different) fault, un-mutated.
+        assert run.fault == "tx: vmcircbuf"
+
+    asyncio.run(scenario())
+
+
+def test_restart_preserves_the_level_when_the_argspec_is_unreadable(tmp_path, monkeypatch):
+    """Re-review finding 1: the level reconstruction must NOT revert to the launch --power when the
+    argspec is momentarily unreadable (spec=None → the per-dest flag map is empty). A task launched
+    at the ramp TOP (-50) that faulted mid-sweep at -70 must relaunch at -70, not the hot -50."""
+    async def scenario():
+        mgr, runner = _mk(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        T0 = now - timedelta(seconds=10)
+        steps = [
+            _fire("start", 0.0, T0, fired=_iso(T0), args=["--power", "-50", "--rf", "on"],
+                  replace=True),                                  # launched at the ramp TOP
+            _fire("tune", 5.0, now - timedelta(seconds=5), fired=_iso(now - timedelta(seconds=5)),
+                  params={"power": -70}),                         # a down-ramp; crash level -70
+            _fire("stop", 0.0, now + timedelta(seconds=10), fired="skipped"),
+        ]
+        run = SequenceRun(id="rn", sequence_id="s", sequence_name="down", state=SequenceState.RUNNING,
+                          on_air_at=_iso(T0), on_air_end=_iso(now + timedelta(seconds=10)),
+                          steps=steps, fault="tx: halt", fault_task="tx",
+                          fault_at=_iso(now - timedelta(seconds=3)))
+        runner._runs["rn"] = run
+        # The argspec is unreadable at restart (transient miss) → tune_log_context yields spec=None.
+        monkeypatch.setattr(mgr, "tune_log_context", lambda t: (None, None))
+        out = await runner.restart_run("rn", RestartRequest(restart_at=_iso(now)))
+        relaunch = [s for s in out.steps if s.action == "start" and s.fired_actual is None][0]
+        pi = relaunch.args.index("--power")
+        assert float(relaunch.args[pi + 1]) == -70.0            # the crash level, spec-independent
+
+    asyncio.run(scenario())
+
+
+def test_restart_muted_pre_roll_relaunches_muted_not_forced_on(tmp_path, monkeypatch):
+    """Re-review finding 2 (pre-roll): a fault during the muted pre-roll (launch --rf off, RF-on
+    tune at T0 still in the future) must relaunch MUTED — the re-instated RF-on tune drives the
+    gate at T0. Forcing RF on at relaunch would transmit before on-air (a hot pre-on-air blip)."""
+    async def scenario():
+        mgr, runner = _mk(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        T0 = now + timedelta(seconds=5)                          # on-air is in the FUTURE (pre-roll)
+        steps = [
+            _fire("start", -1.0, now - timedelta(seconds=1), fired=_iso(now - timedelta(seconds=1)),
+                  args=["--power", "-60", "--rf", "off"], replace=True),      # muted launch, fired
+            _fire("tune", 0.0, T0, fired="skipped", params={"rf": "on"}),     # RF-on at T0 (skipped)
+            _fire("tune", 0.0, T0, fired="skipped", params={"power": -90}),   # ramp start (skipped)
+            _fire("stop", 0.0, now + timedelta(seconds=20), fired="skipped"),
+        ]
+        run = SequenceRun(id="rpr", sequence_id="s", sequence_name="preroll",
+                          state=SequenceState.RUNNING, on_air_at=_iso(T0),
+                          on_air_end=_iso(now + timedelta(seconds=20)), steps=steps,
+                          fault="tx: halt", fault_task="tx", fault_at=_iso(now - timedelta(seconds=0.5)))
+        runner._runs["rpr"] = run
+        out = await runner.restart_run("rpr", RestartRequest(restart_at=_iso(now)))
+        relaunch = [s for s in out.steps if s.action == "start" and s.fired_actual is None][0]
+        ri = relaunch.args.index("--rf")
+        assert relaunch.args[ri + 1] == "off"                   # relaunched MUTED, not forced on
+        # The RF-on tune (future) is re-instated so it un-mutes at T0.
+        rf_on = [s for s in out.steps if s.action == "tune" and s.params.get("rf") == "on"][0]
+        assert rf_on.fired_actual is None
+
+    asyncio.run(scenario())
+
+
+def test_restart_cool_down_tail_relaunches_muted(tmp_path, monkeypatch):
+    """Re-review finding 2 (cool-down): a restart in the cool-down tail — past the off-air RF-off
+    tune but before the STOP — must relaunch MUTED (the schedule holds RF off there), then the
+    future STOP fires. Forcing RF on would re-transmit until the STOP."""
+    async def scenario():
+        mgr, runner = _mk(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        T0 = now - timedelta(seconds=20)
+        steps = [
+            _fire("start", 0.0, T0, fired=_iso(T0), args=["--power", "-60", "--rf", "off"],
+                  replace=True),
+            _fire("tune", 1.0, T0 + timedelta(seconds=1), fired=_iso(T0 + timedelta(seconds=1)),
+                  params={"rf": "on"}),
+            _fire("tune", 2.0, T0 + timedelta(seconds=2), fired=_iso(T0 + timedelta(seconds=2)),
+                  params={"power": -50}),
+            _fire("tune", 0.0, now - timedelta(seconds=1), fired="skipped",   # off-air RF-off (past)
+                  params={"rf": "off"}),
+            _fire("stop", 0.0, now + timedelta(seconds=2), fired="skipped"),  # STOP (future)
+        ]
+        run = SequenceRun(id="rcd", sequence_id="s", sequence_name="cooldown",
+                          state=SequenceState.RUNNING, on_air_at=_iso(T0),
+                          on_air_end=_iso(now - timedelta(seconds=1)), steps=steps,
+                          fault="tx: halt", fault_task="tx", fault_at=_iso(now - timedelta(seconds=5)))
+        runner._runs["rcd"] = run
+        out = await runner.restart_run("rcd", RestartRequest(restart_at=_iso(now)))
+        relaunch = [s for s in out.steps if s.action == "start" and s.fired_actual is None][0]
+        ri = relaunch.args.index("--rf")
+        assert relaunch.args[ri + 1] == "off"                   # the schedule holds RF off at now
+        stop = [s for s in out.steps if s.action == "stop"][0]
+        assert stop.fired_actual is None                        # the future STOP still fires
+
+    asyncio.run(scenario())
+
+
+def _parse_ok(iso):
+    from agent.sequence_runner import _parse
+    return _parse(iso)
+
+
 # ── Live end-to-end: fault a real ramping task mid-run, restart it back on schedule ──
 
 def test_restart_live_recovers_a_faulted_ramp(tmp_path, monkeypatch):
