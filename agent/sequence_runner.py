@@ -40,9 +40,10 @@ from .log_manager import LogManager
 from .models import (
     ArmSequenceRequest, CreateSequenceRequest, ProceedRequest, RestartRequest, Sequence,
     SequenceRun, SequenceState, SequenceStep, StepAction, StepFire, StepOverride,
-    SequenceWebhook,
+    SequenceWebhook, TaskHealth,
 )
 from .process_manager import ProcessManager, _POWER_FLAGS
+from . import config as _agentcfg
 from .sequence_log import RunLog
 from . import tune_log
 from . import run_table
@@ -148,6 +149,12 @@ class SequenceRunner:
         # Same, for the off-air (on_air_end / T_end) marker. Reset when a run's
         # on_air_end is moved (patch), so it re-fires at the new end.
         self._off_air_marked: set[str] = set()
+        # Phase-3 unattended auto-restart bookkeeping (in-memory; the persisted counter on the run is
+        # the durable breaker). _auto_inflight = run ids whose auto restart_run is currently awaiting,
+        # so a later tick doesn't re-fire it before it commits (each tick is 0.25 s; restart_run is a
+        # long await). _auto_gaveup = run ids whose breaker has tripped, so the loud alarm fires ONCE.
+        self._auto_inflight: set[str] = set()
+        self._auto_gaveup: set[str] = set()
 
     # ── Run logging ────────────────────────────────────────────────────────────
 
@@ -883,6 +890,8 @@ class SequenceRunner:
             hold_at_offset_s=hold_at_offset_s,
             window_b_steps=list(window_b_defs),
             paused_fires=paused,
+            restart_policy=(req.restart_policy or "manual"),
+            restart_mode=(req.restart_mode or "resync"),
         )
 
         async with self._lock:
@@ -1543,6 +1552,9 @@ class SequenceRunner:
         # Hold step: park a hold-aware run at its hold, and enforce the max-hold deadman.
         await self._service_holds(now)
 
+        # RF-fault RECOVERY (Phase 3): auto-restart a faulted "auto"-policy run, unattended.
+        await self._service_auto_restart(now)
+
     # ── On-air / off-air markers ──────────────────────────────────────────────────
 
     async def _emit_on_air(self, now: datetime) -> None:
@@ -1651,6 +1663,128 @@ class SequenceRunner:
                              detail=f"held longer than {run.max_hold_s:.0f}s")
             await self._abort_run(run, reason=f"max hold time ({run.max_hold_s:.0f}s) exceeded")
             logger.warning("Run %s hold timed out after %.0fs — aborted", run.id, run.max_hold_s)
+
+    # ── Unattended auto-restart (Phase 3) ─────────────────────────────────────────
+
+    async def _service_auto_restart(self, now: datetime) -> None:
+        """RF-fault RECOVERY (Phase 3, docs/rf-fault-recovery.md §7.1/§14d). Per tick, UNATTENDED:
+        auto-fire restart_run for a faulted run whose recovery policy is "auto", with NO operator
+        present — so a scheduled / overnight run recovers itself. A budget (config.AUTO_RESTART_BUDGET)
+        caps consecutive attempts and RESETS after the relaunched task transmits healthy for
+        AUTO_RESTART_HEALTHY_RESET_S; on breaker trip (budget exhausted, or restart_run refuses — e.g.
+        past off-air / a replay channel collision) the LOUD sequence_rf_fault alarm re-fires and the
+        run is left RUNNING-faulted for the operator's manual Restart.
+
+        COLLECT under self._lock, ACT after it — restart_run itself takes self._lock (and releases it
+        mid-call for a pre-stop), so it MUST be awaited with the lock released, exactly like
+        _service_holds. Calling it inside the lock would deadlock the whole tick loop."""
+        if not _agentcfg.AUTO_RESTART_ENABLED:
+            return
+        budget = _agentcfg.AUTO_RESTART_BUDGET
+        reset_s = _agentcfg.AUTO_RESTART_HEALTHY_RESET_S
+        to_restart: List[Tuple[str, str, str]] = []   # (run_id, mode, task)
+        to_trip: List[str] = []                        # run_id — breaker trip (alarm once)
+        async with self._lock:
+            live = set(self._runs)
+            self._auto_inflight &= live                # prune ids for runs that are gone
+            self._auto_gaveup &= live
+            for run in self._runs.values():
+                # Healthy-settle reset: a RECOVERED run (fault cleared) whose counter is nonzero — reset
+                # the budget once the relaunched task has read healthy for the settle window, so an
+                # independent fault later in a long run gets a fresh budget (not a lifetime cap).
+                if not run.fault and run.auto_restart_count > 0:
+                    if reset_s and self._task_healthy(run.auto_restart_task):
+                        if not run.auto_restart_healthy_since:
+                            run.auto_restart_healthy_since = now.isoformat()
+                        elif (now - _parse(run.auto_restart_healthy_since)).total_seconds() >= reset_s:
+                            run.auto_restart_count = 0
+                            run.auto_restart_task = ""
+                            run.auto_restart_healthy_since = ""
+                    else:
+                        run.auto_restart_healthy_since = ""   # not healthy → restart the settle timer
+                    continue
+                # A faulted RUNNING run under an "auto" policy: restart while budget remains, else trip.
+                # RUNNING only — a HOLDING fault is refused by restart_run (mirrors _check_restartable),
+                # so selecting it would raise every tick. "confirm"/"manual" are left for the operator.
+                if run.state != SequenceState.RUNNING or not (run.fault and run.fault_task):
+                    continue
+                if run.restart_policy != "auto" or run.id in self._auto_inflight:
+                    continue
+                if not budget or run.auto_restart_count < budget:
+                    self._auto_inflight.add(run.id)
+                    to_restart.append((run.id, run.restart_mode or "resync", run.fault_task))
+                elif run.id not in self._auto_gaveup:
+                    self._auto_gaveup.add(run.id)
+                    to_trip.append(run.id)
+
+        cap = str(budget) if budget else "∞"
+        for run_id, mode, task in to_restart:
+            trip_run: Optional[SequenceRun] = None
+            try:
+                await self.restart_run(run_id, RestartRequest(mode=mode, restart_at=now.isoformat()))
+            except Exception as exc:                     # noqa: BLE001 — a refusal IS a breaker trip
+                async with self._lock:
+                    self._auto_inflight.discard(run_id)
+                    run = self._runs.get(run_id)
+                    if run is not None and run.id not in self._auto_gaveup:
+                        self._auto_gaveup.add(run.id)
+                        trip_run = run
+                if trip_run is not None:
+                    await self._auto_restart_gaveup(trip_run, f"auto-restart refused: {exc}")
+                else:
+                    logger.debug("auto-restart of run %s not retried (already tripped): %s", run_id, exc)
+                continue
+            async with self._lock:
+                self._auto_inflight.discard(run_id)
+                run = self._runs.get(run_id)
+                attempt = 0
+                if run is not None:
+                    run.auto_restart_count += 1
+                    run.auto_restart_task = task
+                    run.auto_restart_healthy_since = ""
+                    self._auto_gaveup.discard(run.id)
+                    attempt = run.auto_restart_count
+                    self._persist_runs()
+            if run is not None:
+                rl = self._run_logs.get(run.id)
+                if rl is not None:
+                    rl.annotate(f"AUTO-RESTART ({mode}) — attempt {attempt}/{cap}")
+                await self._fire(run, "sequence_auto_restart",
+                                 detail=f"auto-restarted {task} ({mode}) — attempt {attempt}/{cap}")
+                logger.warning("Run %s AUTO-RESTART (%s) attempt %s/%s (task '%s')",
+                               run.id, mode, attempt, cap, task)
+
+        for run_id in to_trip:
+            async with self._lock:
+                run = self._runs.get(run_id)
+            if run is not None:
+                await self._auto_restart_gaveup(
+                    run, f"auto-restart budget ({budget}) exhausted — still faulted")
+
+    def _task_healthy(self, task: str) -> bool:
+        """The task is running AND its reported health is OK — the condition for the auto-restart
+        settle-window reset. Best-effort: any lookup gap reads as NOT healthy (keeps the budget
+        conservative, so a flapping/unknown task never resets its breaker)."""
+        if not task:
+            return False
+        try:
+            if not self._manager.is_running(task):
+                return False
+            st = self._manager.status(task)
+        except Exception:                                # noqa: BLE001
+            return False
+        return getattr(st, "health", None) == TaskHealth.OK
+
+    async def _auto_restart_gaveup(self, run: SequenceRun, reason: str) -> None:
+        """Breaker trip: stop auto-restarting this run, re-fire the LOUD alarm (sequence_rf_fault — the
+        event the client's fault alarm/pill already handle), and leave it RUNNING-faulted so the
+        operator's manual Restart still works. Fired once per trip (guarded by self._auto_gaveup)."""
+        rl = self._run_logs.get(run.id)
+        if rl is not None:
+            rl.annotate(f"AUTO-RESTART GAVE UP — {reason}; awaiting operator")
+        await self._fire(run, "sequence_rf_fault",
+                         detail=f"auto-restart gave up ({run.fault_task or 'task'}): {reason}")
+        logger.error("Run %s auto-restart gave up: %s", run.id, reason)
 
     # ── Step firing ──────────────────────────────────────────────────────────────
 

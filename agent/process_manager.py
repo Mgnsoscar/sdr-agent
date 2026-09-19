@@ -628,6 +628,14 @@ class ManagedProcess:
             # (no double-alarm). An ordinary crash keeps the existing CrashEvent path.
             if await self._is_rf_fault_exit():
                 await self._flag_rf_fault(self.health_detail or "flowgraph halted (non-zero exit)")
+                # An RF fault does NOT go through the generic crash-restart supervisor: recovery is
+                # owned by the run's recovery policy (SequenceRunner.restart_run / the Phase-3 unattended
+                # trigger), which reconstructs the crash-time level and re-instates the schedule. Letting
+                # the raw supervisor ALSO relaunch here (config.restart_on_crash) would put two processes
+                # on the single TX channel at the wrong level — a double-transmit. A standalone task's
+                # own "Auto-restart on fault" (Phase 3b) will relaunch here instead; until then a
+                # bare rf-fault relaunch is suppressed (matches "notify, don't auto-restart").
+                return
             else:
                 await self._fire_crash_event(code)
 

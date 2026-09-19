@@ -506,6 +506,17 @@ class SequenceRun(BaseModel):
     fault: str = ""                    # "" = healthy; else the faulted task + reason
     fault_task: str = ""               # the specific task name that faulted (a run may own several)
     fault_at: str = ""                 # ISO-8601 of detection
+    # Unattended auto-restart (docs/rf-fault-recovery.md §7.1/§14d — Phase 3). The recovery policy is
+    # resolved on the client (a plan overrides its sequences) and stamped here at arm; the agent's tick
+    # auto-fires restart_run when policy == "auto" and the budget (config.AUTO_RESTART_BUDGET) remains.
+    # All defaulted so pre-feature runs deserialize unchanged; persisted so the breaker survives a reload
+    # and never resurrects an exhausted run. The DEFAULT is conservative ("manual" = no unattended
+    # restart) — the auto+resync default is a client-editor default sent explicitly on the wire.
+    restart_policy: str = "manual"     # "auto" | "confirm" | "manual" — who triggers recovery
+    restart_mode: str = "resync"       # "resync" | "replay" — the mode the auto-trigger uses
+    auto_restart_count: int = 0        # auto-restart attempts consumed (the budget counter)
+    auto_restart_task: str = ""        # the task the auto-restart relaunched (watched for the health reset)
+    auto_restart_healthy_since: str = ""  # ISO of when that task was first observed healthy (settle marker)
 
 
 class StepOverride(BaseModel):
@@ -561,6 +572,12 @@ class ArmSequenceRequest(BaseModel):
     # runtime and the scheduled-surface rejection are Phase 1.)
     hold_aware: bool = False
     max_hold_s: float = 1800.0         # auto-abort deadman while HOLDING; 0 = unlimited
+    # Unattended auto-restart policy (docs/rf-fault-recovery.md §7.1 — Phase 3). The client resolves
+    # the effective policy (a plan overrides its sequences) and sends it here; the agent stamps it on
+    # the run. Default "manual" preserves today's behaviour exactly (no unattended restart), so a
+    # pre-Phase-3 client and the reloaded-run path never gain autonomy by surprise.
+    restart_policy: str = "manual"     # "auto" | "confirm" | "manual"
+    restart_mode: str = "resync"       # "resync" | "replay" — used only when policy == "auto"
 
 
 class PatchSequenceRunRequest(BaseModel):
@@ -596,7 +613,7 @@ class RestartRequest(BaseModel):
 
 class SequenceWebhook(BaseModel):
     """Event emitted on the SSE stream on sequence-run lifecycle transitions."""
-    type: str                          # sequence_started | sequence_on_air | sequence_step | sequence_off_air | sequence_stopped | sequence_aborted | sequence_modified | sequence_hold | sequence_proceed | sequence_hold_timeout | sequence_rf_fault | sequence_restart
+    type: str                          # sequence_started | sequence_on_air | sequence_step | sequence_off_air | sequence_stopped | sequence_aborted | sequence_modified | sequence_hold | sequence_proceed | sequence_hold_timeout | sequence_rf_fault | sequence_restart | sequence_auto_restart
     unit_id: str
     run_id: str
     sequence_name: str

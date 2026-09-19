@@ -413,7 +413,17 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # re-instate the ramp remainder + STOP that the fault had skipped — on the ORIGINAL schedule (resync,
 # the default) or shifted later by the downtime (replay). Adds capability `sequence-restart` (the
 # client gates its Restart button on it; an older agent 404s the endpoint).
-AGENT_VERSION = "1.29.0"
+# 1.30.0: RF-fault RECOVERY (Phase 3 — UNATTENDED auto-restart, docs/rf-fault-recovery.md §7.1/§14d).
+# When a run whose recovery policy is "auto" faults, the agent's own tick auto-fires restart_run
+# (mode from the run's policy) with no operator/client present — the box recovers a scheduled/overnight
+# run on its own. A budget (AUTO_RESTART_BUDGET, default 2) caps attempts and RESETS after the
+# relaunched task transmits healthy for AUTO_RESTART_HEALTHY_RESET_S; on breaker trip (budget exhausted
+# or restart_run refuses) it stops auto, re-fires the loud sequence_rf_fault alarm, and leaves the run
+# RUNNING-faulted for the operator's manual Restart. A run-owned rf-fault no longer raw-relaunches via
+# the crash-restart supervisor (that would double-transmit against restart_run). Adds capability
+# `sequence-auto-restart` (the client gates its policy control + pill on it); behaviour is opt-in per
+# run (default policy "manual" = today's behaviour).
+AGENT_VERSION = "1.30.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -554,6 +564,13 @@ AGENT_CAPABILITIES = [
                                          # the ramp remainder + STOP, on the original schedule
                                          # (resync) or shifted by the downtime (replay). The client
                                          # gates its Restart button on this string.
+    "sequence-auto-restart",             # RF-fault RECOVERY (Phase 3 — UNATTENDED): a run armed with
+                                         # restart_policy "auto" is auto-restarted by the agent's own
+                                         # tick when it faults (no operator present), budget
+                                         # AUTO_RESTART_BUDGET with a healthy-settle reset; on trip the
+                                         # loud alarm re-fires and the run is left for manual Restart.
+                                         # The client gates its recovery-policy control + the
+                                         # "auto-restarting (n/N)" pill on this string.
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
@@ -630,6 +647,16 @@ HEALTH_FAULT_PATTERNS = [
     "vmcircbuf",                # the GNU Radio circular-buffer subsystem error
     "boost::interprocess",      # the POSIX-shm allocation failure GR raises under the hood
 ]
+
+# ── RF-fault RECOVERY (Phase 3 — unattended auto-restart) ────────────────────────
+# When a run armed with restart_policy "auto" faults, the SequenceRunner tick auto-fires restart_run.
+# AUTO_RESTART_ENABLED is a global kill-switch (off ⇒ a faulted "auto" run is left for the operator,
+# exactly as "confirm"). AUTO_RESTART_BUDGET caps consecutive auto-restarts of one run; the counter
+# RESETS once the relaunched task has transmitted healthy for AUTO_RESTART_HEALTHY_RESET_S (so an
+# independent fault later in a long run gets its own budget). 0 disables the respective limit.
+AUTO_RESTART_ENABLED          = _env_flag("SDR_AUTO_RESTART", True)
+AUTO_RESTART_BUDGET           = int(os.environ.get("SDR_AUTO_RESTART_BUDGET", "2"))
+AUTO_RESTART_HEALTHY_RESET_S  = float(os.environ.get("SDR_AUTO_RESTART_HEALTHY_RESET_S", "60.0"))
 
 # ── Auth (optional shared secret) ────────────────────────────────────────────
 # Set SDR_API_KEY on both the Pi and your client. Leave empty to disable auth.
