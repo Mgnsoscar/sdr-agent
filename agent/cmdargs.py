@@ -28,9 +28,41 @@ def dest_flag_map(spec: Optional[dict]) -> dict:
     return out
 
 
+def dest_kind_map(spec: Optional[dict]) -> dict:
+    """{dest: kind} from a script's argspec ("number" / "integer" / "choice" / …)."""
+    return {p.get("dest"): p.get("kind") for p in (spec or {}).get("params", []) or [] if p.get("dest")}
+
+
+def num_text(value, kind: Optional[str] = None) -> str:
+    """The CLI text for a numeric value, EXACT: a whole number without a trailing .0 (an int-typed
+    param accepts it), else the shortest round-trip repr — never `%g`, which rounds to 6 significant
+    digits (a 1602.5625 MHz carrier became 1602.56, an integer 1234567 became 1.23457e+06 — refused
+    by an integer param). An integer-kind param gets a rounded whole number for any value."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if v != v or v in (float("inf"), float("-inf")):
+        return repr(v)
+    if kind == "integer" or v.is_integer():
+        return str(int(round(v)))
+    return repr(v)
+
+
+def _split_eq(tok, flagset):
+    """(flag, value) for a `--flag=value` token whose flag is in `flagset`, else None."""
+    t = str(tok)
+    if "=" in t:
+        f, v = t.split("=", 1)
+        if f in flagset:
+            return f, v
+    return None
+
+
 def set_arg_value(args: list, flags, value, canonical: Optional[str] = None) -> list:
-    """Set/replace the value following any flag in `flags` (last occurrence wins), appending
-    `canonical value` when the flag is absent. Returns a new list."""
+    """Set/replace the value following any flag in `flags` (last occurrence wins; a `--flag=value`
+    token is rewritten in place), appending `canonical value` when the flag is absent. Returns a
+    new list."""
     flagset = {str(f) for f in flags}
     out = list(args or [])
     found = False
@@ -41,6 +73,14 @@ def set_arg_value(args: list, flags, value, canonical: Optional[str] = None) -> 
             found = True
             i += 2
             continue
+        if str(out[i]) in flagset:                       # a dangling flag as the LAST token: give it
+            out.append(str(value))                       # its value instead of a second flag (R6)
+            found = True
+            break
+        eq = _split_eq(out[i], flagset)
+        if eq is not None:
+            out[i] = f"{eq[0]}={value}"
+            found = True
         i += 1
     if not found:
         can = canonical or (sorted(flagset)[0] if flagset else None)
@@ -62,6 +102,7 @@ def overlay_live_params(args: list, live: dict, spec: Optional[dict], gate: Opti
     the RF output gate via its own flags (a string on/off), every other dest with known flags by
     value (booleans are skipped — a store_true flag has no value to set). Returns a new list."""
     dest_flags = dest_flag_map(spec)
+    kinds = dest_kind_map(spec)
     gate_dest = (gate.get("dest") or gate.get("name")) if gate else None
     gate_flags = [str(f) for f in (gate.get("flags") or [])] if gate else []
     out = list(args or [])
@@ -75,7 +116,7 @@ def overlay_live_params(args: list, live: dict, spec: Optional[dict], gate: Opti
         flags = dest_flags.get(dest) or LEVEL_FALLBACK_FLAGS.get(dest)
         if not flags:
             continue
-        text = f"{float(value):g}" if isinstance(value, (int, float)) else str(value)
+        text = num_text(value, kinds.get(dest)) if isinstance(value, (int, float)) else str(value)
         out = set_arg_value(out, list(flags), text, canonical=flags[0])
     return out
 
@@ -100,6 +141,10 @@ def arg_value(args: list, flags, default=None):
     for i, a in enumerate(args or []):
         if str(a) in flagset and i + 1 < len(args):
             val = args[i + 1]
+            continue
+        eq = _split_eq(a, flagset)
+        if eq is not None:
+            val = eq[1]
     return val
 
 
@@ -117,10 +162,18 @@ def elapsed_of_args(args: list, param: dict) -> float:
 
 
 def bake_elapsed(args: list, param: dict, elapsed_s: float) -> list:
-    """Set the elapsed param on a launch's post-script args to `elapsed_s` seconds (clamped ≥ 0,
-    ms resolution) via its own flags — the relaunch of a time-dependent script resumes there."""
+    """Set the elapsed param on a launch's post-script args to `elapsed_s` seconds (clamped ≥ 0;
+    ms resolution for a number param, a rounded whole second for an integer(...) param — its
+    parser refuses a fraction) via its own flags — the relaunch of a time-dependent script resumes
+    there."""
     flags = [str(f) for f in (param.get("flags") or [])]
     if not flags:
         return list(args or [])
     val = max(0.0, float(elapsed_s))
-    return set_arg_value(args, flags, f"{val:.3f}".rstrip("0").rstrip("."), canonical=flags[0])
+    if val != val:
+        val = 0.0
+    if param.get("kind") == "integer" or str(param.get("type") or "") == "int":
+        text = str(int(round(val)))
+    else:
+        text = f"{val:.3f}".rstrip("0").rstrip(".")
+    return set_arg_value(args, flags, text, canonical=flags[0])

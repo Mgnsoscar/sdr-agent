@@ -271,6 +271,17 @@ class Scheduler:
             except Exception as exc:
                 logger.error("Event %s failed to start task '%s': %s",
                              event.id, event.task_name, exc)
+            else:
+                # The launch can park for seconds (the boot pre-image gate, the attenuator pre-command).
+                # If the event was cancelled meanwhile (a PANIC), the cancel found nothing to stop —
+                # stop what just came up instead of leaving it on air (re-review finding C3).
+                if event.state != EventState.RUNNING:
+                    logger.warning("Event %s: task '%s' launched after the event was %s — stopping it",
+                                   event.id, event.task_name, event.state)
+                    try:
+                        await self._manager.stop(event.task_name, source="scheduler")
+                    except Exception as exc:          # noqa: BLE001
+                        logger.error("Event %s: could not stop the late launch: %s", event.id, exc)
         else:
             logger.info(
                 "Event %s: task '%s' already running — scheduling stop only",

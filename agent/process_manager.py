@@ -235,8 +235,14 @@ def _pin_gr_vmcircbuf_pref(home: str, token: str) -> str:
         try:
             d.mkdir(parents=True, exist_ok=True)
             p = d / _agentcfg.GR_VMCIRCBUF_PREF_KEY
-            if not p.exists() or p.read_text(errors="replace").strip() != name:
-                p.write_text(name)
+            # GR 3.10 matches the file's bytes EXACTLY (a trailing newline = no match → it probes and
+            # persists sysv_shm), so compare bytes, and write atomically (tmp + replace) so a task
+            # allocating its first buffer never reads a truncated file (re-review findings O3/O4).
+            want = name.encode()
+            if not p.exists() or p.read_bytes() != want:
+                tmp = p.with_name(p.name + ".tmp")
+                tmp.write_bytes(want)
+                os.replace(tmp, p)
         except OSError as exc:
             logger.warning("could not pin the GR vmcircbuf backend at %s: %s", d, exc)
     return name
@@ -268,6 +274,11 @@ def _build_command(command: list, args: list, replace: bool) -> list:
         cmd = list(command) + list(args)
     return _resolve_script_path(_resolve_exe(cmd))
 
+
+# How long a stop() that lands during a launch waits for the spawn before giving up on it. A spawn
+# takes milliseconds; the bound only ever measures a launch stranded by an exception (finding C4,
+# now settled by start() itself), so it can be short.
+_STARTING_STOP_WAIT_S = 10.0
 
 # Absolute-power flags the fleet's transmit scripts use (mirror of the client's
 # ui.param_form._POWER_FLAGS); a launch/tune setting one drives the active components too.
@@ -514,12 +525,20 @@ class ManagedProcess:
         # auto-restart relaunches at the LIVE state (a muted / lowered task comes back muted / lowered),
         # not the launch request (review fix #2). Cleared on start.
         self._live_applied: dict = {}
+        self._live_applied_at: dict = {}      # {dest: ISO instant the value was applied}
 
     # ── Public interface ──────────────────────────────────────────────────────
 
     async def start(self, request: Optional[StartRequest] = None) -> None:
         if self.state in (ProcessState.RUNNING, ProcessState.STARTING):
             raise RuntimeError(f"Task '{self.config.name}' is already {self.state}")
+        # A slot whose previous process is STILL ALIVE (state STOPPING — a SIGTERM in its ≤10 s grace,
+        # or any not-yet-reaped process) must not take a second launch: the two would transmit at once
+        # and stop()'s continuation would then SIGKILL/clean up the WRONG one (re-review finding C1).
+        # The caller waits it out (ProcessManager.restart) or reports "still stopping".
+        if self.state == ProcessState.STOPPING or (
+                self._proc is not None and self._proc.returncode is None):
+            raise RuntimeError(f"Task '{self.config.name}' is still stopping — retry once it has stopped")
 
         # An explicit start clears any prior stop request and breaker trip.
         self._stop_requested = False
@@ -537,6 +556,7 @@ class ManagedProcess:
         self._spawned.clear()
         self.transmitting_at = None
         self._live_applied = {}
+        self._live_applied_at = {}
         self.state = ProcessState.STARTING
         req = request or StartRequest()
         # Remember this launch so a standalone auto-restart-on-fault can reproduce it exactly, and
@@ -544,6 +564,35 @@ class ManagedProcess:
         self._last_request = request
         self._auto_restart_override = req.auto_restart_on_fault
 
+        try:
+            await self._launch(req)
+        except BaseException:
+            # ANY failure/cancel inside the launch window (a missing cwd/interpreter, ENOMEM, a log
+            # OSError, a cancelled relaunch task mid-exec) used to leave the slot STARTING forever:
+            # every later stop() waited 30 s on _spawned, abort/PANIC/shutdown sweeps stalled on it and
+            # the task could never be started again (re-review finding C4). Settle it: kill a child
+            # that did get spawned, release the waiters, clean up, and re-raise.
+            await self._settle_failed_launch()
+            raise
+
+    async def _settle_failed_launch(self) -> None:
+        p = self._proc
+        if p is not None and p.returncode is None:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                await asyncio.wait_for(p.wait(), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):   # noqa: BLE001
+                pass
+        self._spawned.set()
+        try:
+            await self._cleanup()
+        except Exception:                          # noqa: BLE001
+            self.state = ProcessState.STOPPED
+
+    async def _launch(self, req: StartRequest) -> None:
         cmd = _build_command(self.config.command, req.args, req.replace_args)
         # RF-fault prevention pins sit ABOVE ambient os.environ but BELOW the task's own cfg.env /
         # request env_overrides — deterministic defaults the task can still override.
@@ -655,9 +704,13 @@ class ManagedProcess:
             # sees _stop_requested, so after the wait either the task is RUNNING (signal it below) or
             # start() already cleaned up / failed (nothing to do). Review fix #10.
             try:
-                await asyncio.wait_for(self._spawned.wait(), timeout=30.0)
+                await asyncio.wait_for(self._spawned.wait(), timeout=_STARTING_STOP_WAIT_S)
             except asyncio.TimeoutError:
-                logger.warning("Task '%s': launch did not spawn within 30 s of a stop", self.config.name)
+                logger.warning("Task '%s': launch did not spawn within %.0f s of a stop",
+                               self.config.name, _STARTING_STOP_WAIT_S)
+                if self.state == ProcessState.STARTING and (
+                        self._proc is None or self._proc.returncode is not None):
+                    self.state = ProcessState.STOPPED    # a stranded launch: settle it (finding C4)
             if self.state != ProcessState.RUNNING:
                 return
 
@@ -683,23 +736,38 @@ class ManagedProcess:
         self.state = ProcessState.STOPPING
         logger.info("Stopping task '%s' (pid=%s)", self.config.name, self.pid)
 
-        if self._proc and self._proc.returncode is None:
+        # Bind the process ONCE: the escalation + wait must act on the process this stop began on,
+        # never on one a later launch put in the slot (start() refuses a STOPPING slot, but this keeps
+        # the continuation honest even so — finding C1).
+        p = self._proc
+        if p and p.returncode is None:
             try:
-                os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
             except ProcessLookupError:
                 pass
 
             try:
-                await asyncio.wait_for(self._proc.wait(), timeout=timeout)
+                await asyncio.wait_for(p.wait(), timeout=timeout)
             except asyncio.TimeoutError:
                 logger.warning("Task '%s' did not stop; sending SIGKILL", self.config.name)
                 try:
-                    os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                await self._proc.wait()
+                await p.wait()
 
         await self._cleanup()
+
+    async def wait_stopped(self, timeout: float = 20.0) -> bool:
+        """Wait until this slot holds no live process (a stop in flight has finished). True when it
+        settled within `timeout`."""
+        deadline = _monotonic() + timeout
+        while _monotonic() < deadline:
+            alive = self._proc is not None and self._proc.returncode is None
+            if self.state not in (ProcessState.STOPPING, ProcessState.STARTING) and not alive:
+                return True
+            await asyncio.sleep(0.05)
+        return False
 
     def status(self) -> ProcessStatus:
         return ProcessStatus(
@@ -968,7 +1036,7 @@ class ManagedProcess:
             if (watcher is not None and not watcher.done()
                     and watcher is not asyncio.current_task()):
                 try:
-                    await watcher
+                    await asyncio.shield(watcher)   # a cancel of THIS task must not cancel the watcher
                 except Exception:      # noqa: BLE001 — the watcher's own errors are its business
                     pass
             # Wait out a settle delay (also lets the /dev/shm sweep in _cleanup finish). Abort if a
@@ -1016,6 +1084,14 @@ class ManagedProcess:
                 raise
             except Exception as exc:       # noqa: BLE001 — a failed relaunch is logged, never silent
                 logger.error("Auto-restart of '%s' failed: %s", self.config.name, exc)
+                # The task is DOWN and nothing will retry it (the budget was consumed): raise the loud
+                # alarm again so an operator learns the recovery failed (re-review finding W4).
+                self.health = TaskHealth.RF_FAULT.value
+                self.health_detail = f"auto-restart relaunch failed: {exc}"
+                try:
+                    await self._fire_health_event(self.health_detail, self._resource_snapshot)
+                except Exception:          # noqa: BLE001 — alarm is best effort
+                    pass
         finally:
             self._fault_restart_inflight = False
 
@@ -1160,6 +1236,10 @@ class ProcessManager:
         # CLEARED while the boot pre-image (uhd_usrp_probe) holds the SDR; a task launch waits on it
         # instead of colliding on the device (review fix #9). Set = device free (the default).
         self.device_free = asyncio.Event()
+        # Bumped by every PANIC/shutdown (cancel_pending_relaunches): a launch parked before its
+        # proc.start() — on the boot pre-image gate or the attenuator pre-command — compares it after
+        # the gates and abandons itself if a panic happened meanwhile (re-review finding C3).
+        self._panic_epoch = 0
         self.device_free.set()
         # Per-script cache: does the script report HEALTH state=transmitting (watch_flowgraph)?
         self._tx_marker_scripts: Dict[str, bool] = {}
@@ -1251,12 +1331,17 @@ class ProcessManager:
         every parameter, not only a swept level)."""
         return dict(self._get(name)._live_applied)
 
+    def live_applied_at(self, name: str) -> dict:
+        """{dest: ISO instant} of when each live_applied value was applied (see live_applied)."""
+        return dict(self._get(name)._live_applied_at)
+
     def cancel_pending_relaunches(self) -> int:
         """Abort every PENDING auto-restart relaunch (a faulted task waiting out its settle / claim
         delay on either detection path) and block any that has not started deciding yet: PANIC and
         shutdown must guarantee no transmitter comes up afterwards (review fixes #12/#33). Returns
         how many were cancelled. Sync (no await) so a caller holding no loop turn still gets it."""
         n = 0
+        self._panic_epoch += 1
         for proc in self._procs.values():
             proc._operator_stop_requested = True
             t = proc._relaunch_task
@@ -1303,6 +1388,21 @@ class ProcessManager:
         if live:
             logger.info("Stopping %d task(s) on shutdown ...", len(live))
             await asyncio.gather(*[p.stop() for p in live], return_exceptions=True)
+        # A slot whose stop was interrupted mid-grace (the health task cancelled above, or the runner
+        # loop cancelled mid-STOP-step) reads STOPPING with its process ALIVE: reap it, so the agent
+        # never exits with a transmitter running (re-review finding C6).
+        for proc in self._procs.values():
+            pr = proc._proc
+            if pr is not None and pr.returncode is None:
+                try:
+                    os.killpg(os.getpgid(pr.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+                try:
+                    await asyncio.wait_for(pr.wait(), timeout=5.0)
+                except (asyncio.TimeoutError, Exception):   # noqa: BLE001
+                    pass
+                proc.state = ProcessState.STOPPED
 
     async def _health_loop(self) -> None:
         """Periodic RF-fault watchdog (docs/rf-fault-recovery.md §5.2). Every HEALTH_POLL_S it scans
@@ -1340,6 +1440,8 @@ class ProcessManager:
         proc._log_offset, proc._log_inode = new_off, new_inode
         if not text:
             return
+        if self._scan_stale(proc, p0):
+            return                     # the bytes belong to an exited/replaced process (finding W10)
         proc.last_output_at = _utcnow()
         low = text.lower()
         # The script's "flowgraph up" report (paramkit.txhealth): the radio is on air from here — the
@@ -1363,7 +1465,11 @@ class ProcessManager:
         # operator=False: this is the internal auto-drop, so it must NOT block the task's own
         # standalone auto-restart recovery below (only an operator/API stop does).
         try:
-            await proc.stop(operator=False)
+            # Shielded: a cancel of the health task (shutdown) must not interrupt the SIGTERM→SIGKILL
+            # escalation and leave the faulted process alive in a STOPPING slot (finding C6).
+            await asyncio.shield(proc.stop(operator=False))
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:   # noqa: BLE001
             logger.warning("auto-drop-RF stop failed for '%s': %s", proc.config.name, exc)
             return
@@ -1418,7 +1524,9 @@ class ProcessManager:
             return False
         key = f"{script}|{proc.config.working_dir}"
         if key not in self._tx_marker_scripts:
-            src = self._read_script_source(script, proc.config.working_dir) or ""
+            src = self._read_script_source(script, proc.config.working_dir)
+            if src is None:
+                return False           # unreadable right now: never memoise a miss (finding W9)
             self._tx_marker_scripts[key] = "watch_flowgraph" in src
         return self._tx_marker_scripts[key]
 
@@ -1429,6 +1537,8 @@ class ProcessManager:
         proc = self._procs.get(name)
         if proc is None:
             return False
+        if not (_agentcfg.HEALTH_WATCH_ENABLED and _agentcfg.HEALTH_POLL_S > 0):
+            return True                # nothing reads the marker: running-and-OK is the rule (O2)
         if not self.expects_tx_marker(name):
             return True
         return proc.transmitting_at is not None
@@ -1561,13 +1671,27 @@ class ProcessManager:
         # as a one-shot, so nothing has to be running and the operator never sees it.
         req = request or StartRequest()
         cmd = _build_command(proc.config.command, req.args, req.replace_args)
+        # While a launch is parked below (the boot pre-image gate, the attenuator pre-command) its slot
+        # still reads STOPPED, so a Stop / PANIC landing meanwhile cannot signal a process: they leave
+        # their INTENT on the slot (stop() latches _operator_stop_requested even when nothing runs;
+        # PANIC bumps _panic_epoch) and the launch honours it after the gates instead of coming up on
+        # air after the operator stopped it (re-review findings C3/O1). A fresh operator/sequence
+        # launch supersedes any OLDER stop intent (cleared here); an auto-restart keeps the #11 rule
+        # (an operator stop BEFORE the relaunch's launch also stands it down).
+        if source != "auto-restart":
+            proc._operator_stop_requested = False
+        epoch0 = self._panic_epoch
+        epoch0 = self._panic_epoch
         await self.device_free.wait()          # never open the SDR under the boot pre-image (#9)
         await self._gate_precommand(name, cmd=cmd)
-        if source == "auto-restart" and (proc._operator_stop_requested or self._shutdown_flag.is_set()):
-            # An operator stop (or shutdown) landed during the attenuator pre-command: the relaunch
-            # must not proceed — proc.start() would have cleared the very flag that records it (#11).
-            logger.info("Auto-restart of '%s' abandoned: operator stop / shutdown during its pre-command", name)
-            return proc.status()
+        if self._panic_epoch != epoch0 or self._shutdown_flag.is_set():
+            raise RuntimeError(f"one-shot '{name}' abandoned: panic / shutdown while waiting to launch")
+        if proc._operator_stop_requested or self._shutdown_flag.is_set() or self._panic_epoch != epoch0:
+            if source == "auto-restart":
+                logger.info("Auto-restart of '%s' abandoned: operator stop / shutdown during its pre-command", name)
+                return proc.status()
+            raise RuntimeError(f"launch of '{name}' abandoned: it was stopped / panic-stopped while "
+                               f"waiting to launch")
         await proc.start(self._with_launch_freq(name, req, cmd))
         status = proc.status()
         if source == "manual":
@@ -1622,8 +1746,11 @@ class ProcessManager:
         # LIVE state rather than the launch request (review fix #2). A rejected value is not applied.
         try:
             rejected = set((result or {}).get("rejected") or {}) if isinstance(result, dict) else set()
-            self._get(name)._live_applied.update(
-                {k: v for k, v in dict(values).items() if k not in rejected})
+            applied = {k: v for k, v in dict(values).items() if k not in rejected}
+            proc_ = self._get(name)
+            proc_._live_applied.update(applied)
+            now_iso = _utcnow()
+            proc_._live_applied_at.update({k: now_iso for k in applied})
         except Exception:      # noqa: BLE001 — bookkeeping only
             pass
         return result
@@ -1946,9 +2073,15 @@ class ProcessManager:
         proc = self._get(name)
         req = request or StartRequest()
         cmd = _build_command(proc.config.command, req.args, req.replace_args)
+        await self.device_free.wait()          # never open the SDR under the boot pre-image (#9 / O6)
         await self._gate_precommand(name, cmd=cmd)
         if proc.state == ProcessState.RUNNING:
             await proc.stop()
+        elif proc.state == ProcessState.STOPPING or self.is_process_alive(name):
+            # A stop is in flight (its SIGTERM grace): wait it out rather than launch over the live
+            # process — start() refuses that (finding C1).
+            if not await proc.wait_stopped():
+                raise RuntimeError(f"Task '{name}' is still stopping — retry once it has stopped")
         await proc.start(self._with_launch_freq(name, req, cmd))
         status = proc.status()
         if source == "manual":
@@ -1990,6 +2123,7 @@ class ProcessManager:
         # the life of the process. See _script_spec.
         self._script_specs.clear()
         self._active_flags.clear()
+        self._tx_marker_scripts.clear()   # a re-deployed script may have adopted the marker (W9)
         current  = set(self._procs.keys())
         incoming = set(new_tasks.keys())
 

@@ -115,5 +115,6 @@ exec env \
     SDR_UNIT_ID="${SDR_UNIT_ID:-broadcaster-lab}" \
     SDR_UNIT_TYPE="${SDR_UNIT_TYPE:-broadcaster}" \
     GR_CONF_VMCIRCBUF_DEFAULT_FACTORY="${GR_CONF_VMCIRCBUF_DEFAULT_FACTORY:-mmap_shm_open}" \
+    `# ^ documentation only: GR reads a pref FILE the agent writes per launch (rf-fault-recovery.md §14f #1)` \
     PYTHONPATH="$HERE" \
     python3 -m uvicorn agent.main:app --host 0.0.0.0 --port "$PORT"

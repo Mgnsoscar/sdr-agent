@@ -116,7 +116,11 @@ at that instant. Phase 1 below makes the **next** occurrence self-diagnosing.
    not just a precaution: before launching a transmit task, and after a hard kill, remove staged
    shared-memory artifacts whose owning PID is dead (`/dev/shm/gal_*`/`gr-*`, and if `sysv_shm` is in
    use, `ipcs`/`ipcrm` orphans). This breaks the hang→SIGKILL→orphan→startup-failure ratchet.
-4. **Pin a known-good buffer backend** if the captured error implicates one — but note the scripts
+4. **Pin a known-good buffer backend** if the captured error implicates one — *[design-era text;
+   SUPERSEDED by §14f #1: verified against the upstream 3.8/3.10 sources, GR selects the vmcircbuf
+   backend from the `vmcircbuf_default_factory` pref FILE under the task HOME and never from an env
+   var, and `GR_DONT_LOAD_PREFS` does not govern it (3.10's `prefs.cc` has no such check at all) —
+   the agent WRITES that file per launch]* — but note the scripts
    set `GR_DONT_LOAD_PREFS=1` (§3.6), so a `~/.gnuradio/prefs/…` pin is **ignored**. Pin it in the
    task **launch env** instead — the GNU Radio config-override env var for `[vmcircbuf]
    default_factory` (`GR_CONF_VMCIRCBUF_DEFAULT_FACTORY` in current GR; verify against the deployed
@@ -191,7 +195,9 @@ found in the code/deploy config:
   engineered away; hence the primary cure is **detect-as-crash + auto-restart within the warm-up
   lead-in** (§7.0), which makes it a non-event regardless of mechanism.
 
-**Fixes (Phase 0):** pin the backend explicitly in the task **launch env** — because
+**Fixes (Phase 0):** *[SUPERSEDED by §14f #1 — the pin is the `vmcircbuf_default_factory` pref file
+the agent writes per launch at both GR generations' locations; the env var below is inert]* pin the
+backend explicitly in the task **launch env** — because
 `GR_DONT_LOAD_PREFS=1` is set, this must be the GNU Radio config-override env var
 (`GR_CONF_VMCIRCBUF_DEFAULT_FACTORY` in current GR; verify against the deployed version), **not** a
 `~/.gnuradio/prefs` file (which is not read); or drop `GR_DONT_LOAD_PREFS` and seed the prefs file.
@@ -344,9 +350,9 @@ restart.
 ### 6.3 Resource snapshot (the durable diagnostic)
 At fault detection, the agent captures and attaches to the fault record: `df /dev/shm` (used/total),
 the process's `map_count` vs `vm.max_map_count`, RSS, `ulimit -n`, the **effective `vmcircbuf`
-backend** (the launch env's `GR_CONF_VMCIRCBUF_DEFAULT_FACTORY` and — since `GR_DONT_LOAD_PREFS=1`
-means GR reads no prefs file — whatever compiled default GR actually used, via a one-shot
-`gnuradio-config-info --prefs`), the task's `HOME`, and (if `sysv_shm`) an `ipcs -m` summary. It also
+backend** (*as built (§14f #1): the `vmcircbuf_default_factory` pref FILE read back from the task's
+HOME — `FaultSnapshot.vmcircbuf_backend_pref`; the env var and any `gnuradio-config-info --prefs`
+entry are reported only as extras, the stock runtime conf has no such entry*), the task's `HOME`, and (if `sysv_shm`) an `ipcs -m` summary. It also
 attaches the **UHD log file** (§3.7 fix) so a device error suppressed on the console is on record.
 **This is what makes the next `vmcircbuf` self-diagnosing** and turns "I hope that was the last time"
 into a measurable outcome.
@@ -1342,9 +1348,126 @@ from its scheduled instant; no marker ⇒ nothing invented; the standalone relau
 `build_resume_request`; the marker through paramkit + argspec; the cmdargs helpers), the existing
 paramkit/argspec marker tests extended, `sdr-scripts/tests/test_cw_drift.py` (schema; the banner; the
 REAL `main()` in-process: born at the resume point, clock continues from `--elapsed`). Agent 656 → 668;
-scripts 110 → 112; client 1179 (mirror only). **Rollout:** OTA-push 1.32.0 + the library re-deploy for
-`cw_drift_tx.py`; no client change beyond the argspec mirror (the new `--elapsed` renders as an
+scripts 110 → 112; client 1179 (mirror only).
+
+**Rollout — ORDER MATTERS.** paramkit ships INSIDE the agent release, and `cw_drift_tx.py` now calls
+`number(..., is_elapsed=True)`: on a unit still running agent ≤ 1.31.1 that script CRASHES at
+`build_script()` on every launch (`TypeError: unexpected keyword argument 'is_elapsed'`) while the
+agent's static upload validator and the client's static reader both accept the file (§14h C-1). So:
+**OTA-update EVERY unit to 1.32.0 FIRST, then deploy the library.** The agent advertises the
+capability **`paramkit-is-elapsed`** and the client REFUSES to ship a script whose static argspec
+carries the marker to a unit without it (`api/script_markers.py` + `AgentClient.upload_script` /
+`deploy_library`, the same shape as the `CAL_*` gates), so the wrong order is refused per unit with the
+reason instead of bricking the drift. No other client change (the new `--elapsed` renders as an
 ordinary launch field, default 0).
+
+## 14h. Second adversarial review — the §14f fixes + §14g re-reviewed; 30 findings FIXED (`AGENT_VERSION 1.32.0`, capability `paramkit-is-elapsed`; branch `claude/system-familiarization-f5mezz`, cross-repo)
+
+Seven parallel reviewers (RF-safety of the new reconstruction · elapsed-time math + cw_drift ·
+abort/stop/shutdown concurrency · detection→recovery decision path · GR pin / boot / ops ·
+tests-as-specification · cross-repo consistency), each reproducing its findings against the real
+runner where it could (their repro pytests live outside the repo). Verdict: the §14f mechanisms hold in
+the interleavings they were built for; what broke was the same state machine one step outside them, and
+two genuine HIGHs. Everything below is fixed and pinned (`tests/test_review_fixes_2.py`, 31 tests, plus
+the extended §14g tests; agent 668 → 702, scripts 112 → 114, client 1179 → 1185).
+
+**HIGH.**
+- **C-1 (cross-repo) — the 1.32.0 library crashed cw_drift on a ≤ 1.31.1 unit.** See the §14g
+  rollout note: capability `paramkit-is-elapsed` + the client's marker deploy gate
+  (`api/script_markers.py`, `tests/test_script_marker_gate.py`).
+- **C1 (concurrency) — `start()` over a STOPPING slot spawned a SECOND process.** A stop's ≤ 10 s
+  SIGTERM grace left the slot STOPPING with the process alive; `ManagedProcess.start()` refused only
+  RUNNING/STARTING, so a manual/scheduler/restart launch put a second transmitter on the channel and
+  the stop's continuation then SIGKILLed / cleaned up the WRONG one (the old one stayed on air,
+  untracked). Now `start()` refuses a STOPPING slot / a still-alive process ("still stopping"), `stop()`
+  binds the process it began on, `ProcessManager.restart()` waits the stop out (`wait_stopped`).
+- **W1 (decision path) — resync relaunched INSIDE a scheduled OFF gap.** A sequence launching one task
+  twice (START…STOP…gap…START…STOP) faulted in epoch 1 and restarted in the gap got a synthetic START
+  at `now` with epoch 1's parameters — RF through a scheduled silence, then epoch 2's START refused
+  "already RUNNING" so epoch 1's signal ran through epoch 2's whole window. The reconstruction now walks
+  STOP fires too: when the latest counted fire is a STOP, `_relaunch_start_fire` returns None — the
+  fault is cleared and the re-instated second START relaunches on schedule (replay, which counts fired
+  fires only, still resumes the crash point).
+
+**MEDIUM.**
+- **C2** at one instant a run-2 START (a power-carrying muted launch, rank 0) sorted BEFORE run-1's
+  STOP of the same task — the START was refused, stamped fired, the STOP then killed the task and run 2
+  ran "on air" with nothing transmitting (the 2 s-gap day-schedule packing). `_tick` sorts a STOP
+  before any launch at the same instant; a failed START is now loud (W4).
+- **C3/O1** a launch parked before `proc.start()` (the boot pre-image gate, up to 55 s; the attenuator
+  pre-command) read STOPPED, so a Stop / PANIC found nothing and the transmitter came up AFTER the
+  operator stopped it. `stop()` already latched `_operator_stop_requested` on an idle slot; PANIC/
+  shutdown now bump `ProcessManager._panic_epoch`; `start()`/`run_oneshot` re-check both after their
+  gates for EVERY source (a fresh operator launch clears an older intent first); the scheduler stops a
+  launch that completes after its event was cancelled.
+- **C4** an exception/cancel inside the STARTING window (missing cwd/interpreter, ENOMEM, a log
+  OSError, a cancelled relaunch mid-exec) stranded the slot STARTING for ever: every later stop waited
+  30 s, abort/PANIC/shutdown stalled, the task was unstartable until an agent restart. `start()` wraps
+  the window and settles it (kill a spawned child, release `_spawned`, cleanup, re-raise); a stop that
+  times out on a stranded slot settles it too; the wait is 10 s.
+- **C5** `hold_now` landing while a window-A launch was in its pre-command flipped the run HOLDING and
+  `_fire_step`'s post-launch check read HOLDING as "dead" and stopped the task the Hold froze. HOLDING
+  is kept.
+- **W2** a #4-deferred tune outlived its run's STOP and fired into the SUCCESSOR run's process on the
+  same task (a leaked cool-down `rf off` muted the next plan). A due tune whose task the run no longer
+  owns — its own STOP fired after its launch, or a later run launched the task — is dropped as
+  `"skipped:stale"`, never deferred; **W3** `CTRL_BIND_GRACE_S` 30 → 180 s (L2C-full binds after ~14 s
+  here, 30–60 s on a Pi, plus a cold FPGA load) and a lost tune/launch is annotated in the run log.
+- **W4** a committed relaunch whose `start` FAILED left a "recovered" run (fault cleared, budget
+  consumed, quiet event sent) with a dead task and no alarm; a failed START now couples an RF fault into
+  the run (`on_task_fault("launch failed: …")`, loud), and a failed standalone relaunch re-raises the
+  health alarm.
+- **W5** a SECOND task faulting in an already-faulted run was recovered by nobody (the run policy keys
+  on one `fault_task`; the standalone path stood down as "driven"). It is now coupled (its steps
+  skipped, the alarm raised, the fault text appended) and released from the driven claim so its own
+  Auto-restart-on-fault checkbox may act (`_extra_faulted`).
+- **O2** with the watchdog disabled (`HEALTH_POLL_S ≤ 0`) nothing read the transmitting marker, so the
+  breaker's healthy-settle never reset and the third fault of the night got no auto-restart;
+  `task_transmitting_confirmed` falls back to running-and-OK when the watchdog is off.
+- **R1** a hand tune applied AFTER the schedule's last counted set of the same dest was discarded (the
+  relaunch un-muted / raised a task the operator had silenced): `set_params` stamps
+  `_live_applied_at`; a driven dest takes the hand value when it is later than the schedule's last
+  counted set. **R2** the live record was merged even when it belonged to ANOTHER process (a hand start
+  after the fault; a first-epoch process under a resync-counted later launch): merged only when the
+  process's `started_at` lies between the counted launch fire and the fault.
+- **R3/E3** an arm-time resume injection (`build_resume_request` — the marker, or the configured
+  `--start-offset` / env mode) lived in `StepFire.resume_offset_s`, not `args`, so the reconstruction
+  dropped it: the drift resumed that many seconds early. The launch is rebuilt exactly as `_fire_step`
+  built it; the marker path accumulates; the arg-mode flag is advanced by the time run; env mode rides
+  the synthetic fire's `resume_offset_s`.
+- **E1/R4** `%g` formatting rounded every reconstructed number to 6 significant digits (a 1602.5625
+  MHz carrier → 1602.56; an integer 1234567 → `1.23457e+06`, refused by an integer param) →
+  `cmdargs.num_text` (exact repr, whole numbers plain, integer-kind rounded); **E2/R5** an
+  `integer(..., is_elapsed=True)` marker was baked as a ms float its parser refused → whole seconds.
+
+**LOW (all fixed unless noted).** C6 shutdown reaps a STOPPING slot whose process is alive + the
+auto-drop stop is shielded from the health task's cancel; C7 the wedge relaunch awaits the old watcher
+under `asyncio.shield`; W6 a `_RestartDeferred` retry is bounded (`AUTO_RESTART_DEFER_TICKS`, 240 ≈
+60 s) then trips loudly; W7 a RUNNING-faulted run whose channel span is over completes (`_channel_over`)
+and releases its claim; W8 `hold_now` refuses a faulted run; W9 `expects_tx_marker` never memoises a
+miss and `reload()` clears it; W10 the transmitting marker is stamped only for the process the bytes
+came from; W11 `_started_after` counts a launch still in flight; O3/O4 the GR pref file is compared
+byte-exact (3.10 exact-matches; a trailing newline made GR probe and persist sysv_shm) and written
+atomically; O5 `_gnuradio_default_factory`'s docstring corrected (the stock conf has no such entry);
+O6 the boot pre-image skips when a task is launching (`is_live`) and `restart()` honours the gate;
+E4 an injection-only START over an empty-args replace launch appends (keeps the configured command);
+E7/R6 `--flag=value` tokens are read/rewritten, a dangling last flag gets its value; C-4 the client's
+"no pref file" hint names the pin knob. **Documented, not fixed:** a live `--restart` trigger fired
+before the fault (hand OR scheduled) is not replayed — the elapsed counts from the launch (E5); the
+baked elapsed runs ahead by the difference between a cold and a warm launch's latency (a few s, E6);
+the tick loop still fires launches serially, so a launch parked on the boot gate delays other runs'
+fires for that window (O1, boot only); `spec=None` cannot bake the elapsed (G13, pinned as "proceeds
+without it"); the client's `api/models.py` was committed as a whole-file CRLF→LF rewrite in dd88953
+(cosmetic; no EOL policy yet, C-3); no mock declares `is_elapsed`, so the headless unit cannot exercise
+the bake end-to-end (C-5). **Tests-as-spec critic:** 14 §14f mechanisms had no discriminating test;
+those now pinned in `test_review_fixes_2.py`: a real `start()` clears the live record (G3); an operator
+stop cancels a pending relaunch while the auto-drop does not (G7); the shutdown flag ALONE stands a
+crash-restart down (G4); a stop never cancels a CRASHED watcher outside its delay (G6); `run_oneshot`
+waits on the device gate (G8); `_wait_out_run_claim` gives up after its window (G10); a replay never
+re-instates a hold-skipped fire and floors a due-but-unfired one past now (G1/G9); `_fire_step` on an
+aborted run stamps nothing (G2); cw_drift's calibrated gain is folded at the resume frequency with the
+split pinned at the start carrier (G12, scripts); the client's hidden-checkbox assertion uses
+`isHidden()` (G16).
 
 ## 14. Open items
 

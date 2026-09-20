@@ -169,9 +169,13 @@ def test_restart_carries_an_operator_hand_tune_the_schedule_never_drove(tmp_path
             T._fire("stop", 0.0, now + timedelta(seconds=60), fired="skipped"),
         ]
         _install(runner, steps, T0=T0, now=now, fault_at=now - timedelta(seconds=2))
-        # The operator's hand tunes on the faulted process: bw (never scheduled) + rf off + power -45
-        # (both scheduled → the schedule wins).
-        mgr._procs["tx"]._live_applied = {"bw": 33.0, "rf": "off", "power": -45.0}
+        # The operator's hand tunes on the faulted process (spawned by THIS run's launch — the record
+        # is merged only for that process): bw (never scheduled) + rf off + power -45 applied BEFORE
+        # the schedule's own sets of those dests (so the schedule's position wins for them).
+        proc = mgr._procs["tx"]
+        proc.started_at = T._iso(T0 + timedelta(seconds=0.5))
+        proc._live_applied = {"bw": 33.0, "rf": "off", "power": -45.0}
+        proc._live_applied_at = {k: T._iso(T0 + timedelta(seconds=0.7)) for k in ("bw", "rf", "power")}
         out = await runner.restart_run("r1", RestartRequest(mode="resync", restart_at=T._iso(now)))
         a = _argdict(_relaunch_of(out).args)
         assert float(a["bw"]) == 33.0                  # the hand tune, carried
@@ -358,3 +362,53 @@ def test_cmdargs_elapsed_helpers():
     assert cmdargs.bake_elapsed(["--elapsed", "5"], ep, 12.3456) == ["--elapsed", "12.346"]
     assert cmdargs.bake_elapsed([], ep, -3) == ["-Elapsed", "0"]
     assert cmdargs.bake_elapsed(["--x", "1"], {"dest": "e", "flags": []}, 3) == ["--x", "1"]
+
+
+# ── review round: exact numeric text, an integer(...) marker, the --flag=value form ──────────────
+
+INT_SCRIPT = '''\
+from paramkit import Script
+s = (Script("d")
+     .integer("--elapsed", unit="s", min=0, default=0, is_elapsed=True)
+     .integer("--seed", min=0, default=1, live=True)
+     .number("--power", default=-50, live=True))
+'''
+
+
+def test_overlay_keeps_every_digit_of_a_tuned_value_and_whole_numbers_for_integers():
+    """A tuned carrier is relaunched EXACTLY (1602.5625 MHz — a GLONASS channel — not the %g-rounded
+    1602.56, 2.5 kHz off); a large whole number never becomes exponent form (an integer param refuses
+    it); an integer-kind param gets a whole number even for a float value."""
+    spec = extract_params(DRIFT_SCRIPT)
+    assert cmdargs.overlay_live_params([], {"freq": 1602.5625}, spec, None) == \
+        ["-Start-frequency", "1602.5625"]
+    assert cmdargs.overlay_live_params([], {"freq": 1575420123.0}, spec, None) == \
+        ["-Start-frequency", "1575420123"]
+    ispec = extract_params(INT_SCRIPT)
+    assert cmdargs.overlay_live_params([], {"seed": 1234567}, ispec, None) == ["--seed", "1234567"]
+    assert cmdargs.overlay_live_params([], {"seed": 12.0}, ispec, None) == ["--seed", "12"]
+    Script("x").integer("--seed", min=0, default=1, live=True).parse(["--seed", "1234567"])   # accepted
+    assert cmdargs.num_text(0.1) == "0.1" and cmdargs.num_text(60.0) == "60"
+    assert cmdargs.num_text(2.5, "integer") == "2" or cmdargs.num_text(2.5, "integer") == "3"
+    assert cmdargs.num_text("abc") == "abc"
+
+
+def test_bake_elapsed_gives_an_integer_marker_a_whole_second_the_parser_accepts():
+    ispec = extract_params(INT_SCRIPT)
+    ep = cmdargs.elapsed_param(ispec)
+    args = cmdargs.bake_elapsed(["--power", "-50"], ep, 45.6)
+    assert args == ["--power", "-50", "--elapsed", "46"]
+    ns = (Script("d").integer("--elapsed", unit="s", min=0, default=0, is_elapsed=True)
+          .number("--power", default=-50, live=True)).parse(args)
+    assert ns.elapsed == 46
+    # a number(...) marker keeps ms resolution
+    ep_f = cmdargs.elapsed_param(extract_params(DRIFT_SCRIPT))
+    assert cmdargs.bake_elapsed([], ep_f, 45.6) == ["-Elapsed", "45.6"]
+
+
+def test_flag_equals_value_form_is_read_and_rewritten():
+    ep = {"dest": "elapsed", "flags": ["-Elapsed", "--elapsed"], "kind": "number", "default": 0.0}
+    assert cmdargs.elapsed_of_args(["--elapsed=5400", "--x", "1"], ep) == 5400.0
+    assert cmdargs.bake_elapsed(["--elapsed=5400", "--x", "1"], ep, 5430.0) == ["--elapsed=5430", "--x", "1"]
+    assert cmdargs.set_arg_value(["--p=1", "--p", "2"], ["--p"], 3) == ["--p=3", "--p", "3"]
+    assert cmdargs.arg_value(["--p=1", "--p", "2"], ["--p"]) == "2"          # last occurrence wins

@@ -90,6 +90,26 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — SECOND adversarial review of the RF-fault arc: 30 findings FIXED (1.32.0, capability `paramkit-is-elapsed`) (branch `claude/system-familiarization-f5mezz`, cross-repo)
+Seven parallel reviewers re-reviewed the §14f fixes + the §14g work; record **`docs/rf-fault-recovery.md` §14h**.
+Suite 668 → 702 (`tests/test_review_fixes_2.py`, 31); scripts 112 → 114; client 1179 → 1185. Two HIGHs:
+- **`start()` over a STOPPING slot spawned a second process** (C1): `ManagedProcess.start` refuses a STOPPING
+  slot / a live process, `stop()` binds its process, `restart()` waits it out (`wait_stopped`). And **resync
+  relaunched inside a scheduled OFF gap** (W1: a two-epoch task): `_relaunch_start_fire` walks STOPs and
+  returns None when the schedule holds the task off — the re-instated START relaunches on time.
+- **Cross-repo skew (C-1, HIGH):** `cw_drift_tx.py`'s `is_elapsed=` kwarg CRASHES on a ≤1.31.1 unit's paramkit.
+  New capability **`paramkit-is-elapsed`**; the client refuses to deploy a marker-bearing script to a unit
+  without it (`api/script_markers.py`, gate in `AgentClient.upload_script`/`deploy_library`). **Rollout
+  order: OTA every unit to 1.32.0 FIRST, then deploy the library.**
+- MEDIUMs: a STOP sorts before a co-timed START of the same task (C2); a launch parked on the pre-image gate /
+  pre-command honours a Stop/PANIC (`_panic_epoch`, C3/O1); a failed launch settles the slot (C4); HOLDING keeps a
+  completing launch (C5); a stale deferred tune is dropped `"skipped:stale"`, never fired into the successor run
+  (W2), `CTRL_BIND_GRACE_S` 30 → 180 s (W3); a failed START couples an RF fault (W4); a second fault in a faulted
+  run is coupled + released to its own checkbox (W5); the disabled watchdog keeps the settle on running-and-OK
+  (O2); the hand-tune merge is time-ordered (`_live_applied_at`, R1) and process-scoped (`started_at` within the
+  launch→fault window, R2); an arm-time resume injection survives a restart (R3); exact numeric text
+  (`cmdargs.num_text`, no `%g`) + integer-kind elapsed (E1/E2). LOWs + documented limitations in §14h.
+
 ## Current state — restart reconstructs EVERY parameter + a script-declared ELAPSED time (1.32.0, no capability) (branch `claude/system-familiarization-f5mezz`, cross-repo)
 Owner follow-up to the review: a restarted process must come back with ALL parameters correct (not only a
 ramped power, and also with no ramp), and a time-dependent script (cw_drift) must declare something that lets
@@ -104,7 +124,8 @@ it resume at the right point. Record: **`docs/rf-fault-recovery.md` §14g**. Sui
   `elapsed_param`/`elapsed_of_args`/`bake_elapsed`. Run-owned restart: launch elapsed + (`elapsed_at` − the
   counted launch's actual instant; `now` for resync, `fault_at` for replay; a skipped launch from its scheduled
   `fire_at` via `_fire_instant`); chains across a prior relaunch. Standalone: launch elapsed + `proc.age_s()`.
-  `build_resume_request` treats a marker-declaring script as resumable. `AGENT_VERSION 1.31.1 → 1.32.0`.
+  `build_resume_request` treats a marker-declaring script as resumable. `AGENT_VERSION 1.31.1 → 1.32.0`,
+  capability `paramkit-is-elapsed` (the client's deploy gate — see the review note above; OTA first).
 - **`sdr-scripts` `cw_drift_tx.py --elapsed`** (`-Elapsed`, s, default 0): `t0 = monotonic() − elapsed`; the
   top block is built AT the resume frequency (LO window + NCO + gain folded there; the attenuator split stays
   pinned at the start carrier); banner `resumed at`. Limitations: a live `--restart` trigger before the fault
@@ -401,7 +422,8 @@ guard intact). Suite 519 → 537.
 - **`process_manager.py`** — `_launch_env_pins(task_dir)` merged at all THREE launch env sites
   (`start`/`run_oneshot`/`_launch_oneshot_wait`) BETWEEN `os.environ` and `cfg.env`, so the pins beat
   ambient but `cfg.env`/`req.env_overrides` still win: `HOME` (stable+writable), the GR vmcircbuf
-  backend (`GR_CONF_VMCIRCBUF_DEFAULT_FACTORY` — the only pin GR reads, since scripts set
+  backend (`GR_CONF_VMCIRCBUF_DEFAULT_FACTORY` — *superseded by §14f #1: GR reads a pref FILE the
+  agent now writes; the env var is inert* — was believed the only pin GR reads, since scripts set
   `GR_DONT_LOAD_PREFS=1`), and per-task UHD file logging (`UHD_LOG_FILE` next to `current.log` +
   level, capturing the FPGA image load while the console stays off). `_sweep_shm_orphans()`
   (flag-gated, best-effort) runs before each managed launch and in `_cleanup()` (post-exit/SIGKILL).

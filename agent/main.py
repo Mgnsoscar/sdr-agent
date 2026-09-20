@@ -692,8 +692,11 @@ async def _preimage_when_idle() -> None:
         return                          # a zero timeout is a disable too (review fix #8)
     gate = getattr(_manager, "device_free", None)
     try:
-        if _manager is not None and any(_manager.is_running(n) for n in _manager.task_names()):
-            logger.info("Boot SDR pre-image skipped: a task already holds the device")
+        probe = getattr(_manager, "is_live", None) if _manager is not None else None
+        held = (any(probe(n) for n in _manager.task_names()) if callable(probe) else
+                (_manager is not None and any(_manager.is_running(n) for n in _manager.task_names())))
+        if held:
+            logger.info("Boot SDR pre-image skipped: a task already holds the device (or is launching)")
             return
         # Hold the manager's device gate while the probe owns the SDR: a task launched meanwhile
         # WAITS for it instead of colliding on the device and failing at start (review fix #9).

@@ -405,9 +405,12 @@ def _read_vmcircbuf_pref(home: str, gr_prefs_path: str = "") -> str:
 
 
 def _gnuradio_default_factory() -> str:
-    """The COMPILED-in vmcircbuf default from `gnuradio-config-info --prefs` ([vmcircbuf]
-    default_factory) — what GR uses under GR_DONT_LOAD_PREFS=1 when no GR_CONF_* env pin is set.
-    Blank when the tool is absent (no-GR box) or the section isn't present."""
+    """A `[vmcircbuf] default_factory` entry in `gnuradio-config-info --prefs`, if the deployed GR
+    build ships one — the stock gnuradio-runtime.conf has NO such section (the shipped 3.8/3.10
+    builds pick the backend from the `vmcircbuf_default_factory` pref FILE under the task HOME, else
+    probe sysv_shm first; see process_manager._pin_gr_vmcircbuf_pref), so this is normally blank and
+    `FaultSnapshot.vmcircbuf_backend_pref` carries the effective backend. Kept as a best-effort extra
+    for a vendor build that does declare one. Blank when the tool is absent or the entry isn't."""
     exe = shutil.which("gnuradio-config-info")
     if exe is None:
         return ""

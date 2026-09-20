@@ -583,6 +583,11 @@ AGENT_CAPABILITIES = [
                                          # it RF-faults, IF the task is not owned by an active run (a
                                          # run-owned fault stays the run policy's job). Budget-limited.
                                          # The client gates its "Auto-restart on fault" checkbox on it.
+    "paramkit-is-elapsed",               # paramkit Param.is_elapsed (number/integer(..., is_elapsed=True)):
+                                         # a time-dependent script declares its elapsed-time parameter and the
+                                         # agent bakes it on an RF-fault restart (1.32.0). The client refuses to
+                                         # deploy a script using the kwarg to a unit without it (an older paramkit
+                                         # would crash the script at build_script()).
 ]
 
 # The interpreter tasks should launch with, reported to the client so it pre-fills
@@ -662,7 +667,12 @@ HEALTH_POLL_S        = float(os.environ.get("SDR_HEALTH_POLL_S", "2.0"))
 # Pi). A sequence TUNE due inside that window is DEFERRED to a later tick until the socket exists,
 # for up to this grace after the task's spawn, instead of being fired into nothing and silently lost
 # (review fix #4: a lost RF-on / ramp point left a 'recovered' run muted or at the wrong level).
-CTRL_BIND_GRACE_S    = float(os.environ.get("SDR_CTRL_BIND_GRACE_S", "30.0"))
+# How long after a (re)launch's spawn a due tune is DEFERRED while the script has not yet bound its
+# control socket (review fix #4). Every real generator binds only after its IQ build AND the UHD open:
+# L2C `--loop full` takes ~14 s here and ~30-60 s on a Pi, a cold FPGA image load adds more — 30 s
+# lost the tune again on exactly those launches (re-review finding W3). A tune this run no longer
+# owns is dropped, never deferred (finding W2), so a long grace cannot leak into a successor run.
+CTRL_BIND_GRACE_S    = float(os.environ.get("SDR_CTRL_BIND_GRACE_S", "180.0"))
 
 # Curated fault signatures the log-scan matches (case-insensitive, substring). The authoritative one
 # is the Layer-1 done-watcher marker (paramkit.txhealth.FAULT_MARKER) — a script emits it the instant
@@ -685,6 +695,9 @@ HEALTH_FAULT_PATTERNS = [
 AUTO_RESTART_ENABLED          = _env_flag("SDR_AUTO_RESTART", True)
 AUTO_RESTART_BUDGET           = int(os.environ.get("SDR_AUTO_RESTART_BUDGET", "2"))
 AUTO_RESTART_HEALTHY_RESET_S  = float(os.environ.get("SDR_AUTO_RESTART_HEALTHY_RESET_S", "60.0"))
+# Consecutive ticks (~0.25 s each) the auto trigger may DEFER a restart (an unreadable schema, #18)
+# before it trips loudly instead of retrying forever in silence (re-review finding W6). 0 = unbounded.
+AUTO_RESTART_DEFER_TICKS      = int(os.environ.get("SDR_AUTO_RESTART_DEFER_TICKS", "240"))
 
 # ── Auth (optional shared secret) ────────────────────────────────────────────
 # Set SDR_API_KEY on both the Pi and your client. Leave empty to disable auth.
