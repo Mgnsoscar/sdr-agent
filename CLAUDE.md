@@ -59,7 +59,8 @@ view it with `screenshot.py --tab calibration`.
 - **Capabilities + version:** a new client-visible feature adds a string to
   `AGENT_CAPABILITIES` and bumps `AGENT_VERSION` (both in `agent/config.py`); `test_meta_endpoint.py`
   asserts the capability set. The client feature-gates on these exact strings. Current version is
-  in `config.py` (`1.19.0`: edit-while-holding — Phase 3c — `POST …/proceed` honours
+  in `config.py` (`1.35.0`: plan-level anchoring replica — Phase: plan editor redesign — capability
+  `plan-item-anchors`; `1.19.0`: edit-while-holding — Phase 3c — `POST …/proceed` honours
   `ProceedRequest.steps` behind `sequence-hold-edit`; `1.18.0`: Fast-Forward-to-Hold — Phase 3b —
   `POST …/hold-now` behind `sequence-hold-now`; `1.17.0`: the Hold-step HOLDING runtime — Phase 1 —
   behind `sequence-hold` (added 1.16.0): a hold-aware arm parks at the hold and `POST …/proceed`
@@ -91,6 +92,20 @@ is always dBm so one stage ceiling gauges every signal. `resolve()` folds all th
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
 ## MERGED TO `main` (all three repos, fast-forward, 1.34.0) — field rollout: OTA every unit's agent FIRST, then deploy the library; rebuild the client bundle from 1.34.0. Nothing in the RF-fault arc has run on real hardware yet (mock scripts + fake gnuradio + the headless unit only).
+
+## Current state — plan REPLICA carries the client's plan-level anchors (1.35.0, capability `plan-item-anchors`) (branch `claude/system-familiarization-f5mezz`, cross-repo)
+The client's PLAN EDITOR was redesigned (see `sdr-client/CLAUDE.md`, spec `sdr-client/docs/plan-editor-mockup.html`):
+every unit's sequences on one timeline, each a collapsible frame embedding the real sequence editor, and
+"anything anchors to anything" — a plan item's on-/off-air hangs off the plan's anchors (`"plan"`, the old
+meaning), another item's edge (`"item"`) or a step's edge in another item (`"step"`); a step may hang off a
+step / window edge in another item (`SequenceStep.anchor_item`). Plans are client-only but REPLICATED to units
+(`/plans`, `ClientStateStore`), so `agent/models.py` `PlanItem` gains `id`, `on_air_anchor`/`off_air_anchor` +
+`*_anchor_item`/`*_anchor_edge`/`*_anchor_step`, `expanded`, and `SequenceStep.anchor_item` — STORAGE ONLY: the
+client compiles the graph to absolute instants (and rewrites cross-item step anchors to on-air offsets of their
+own sequence) before every arm, so an `ArmSequenceRequest` never carries them and the runtime never reads them.
+An older agent drops the fields → a plan using anchors reads as drifted until the unit is OTA'd. `AGENT_VERSION
+1.34.0 → 1.35.0`, capability `plan-item-anchors` (informational; the client doesn't gate on it). Tests:
+`tests/test_plan_replica_anchors.py` (+2) + `test_meta_endpoint`. Suite 711 → 713; client 1185 → 1206.
 
 ## Current state — an ABSOLUTE clock origin makes the resume EXACT (1.34.0, capability `paramkit-clock-origin`) (branch `claude/system-familiarization-f5mezz`, cross-repo)
 Owner ask: a drift faulting at T0+10 s and restarted-and-rejoined at T0+50 s must land where the never-faulted

@@ -406,6 +406,11 @@ class SequenceStep(BaseModel):
     # it: offset_s is ALWAYS the step's START offset from the target edge (for an end-tied ramp
     # the client sends end_offset − duration), so resolution is unchanged either way.
     anchor_own_edge: str = "start"
+    # Client authoring metadata (plan-level anchoring, 1.35.0): on a step stored in a PLAN item,
+    # a non-empty `anchor_item` names another plan item whose step / window edge this step hangs
+    # off. Carried through the plan replica untouched; the client compiles it to a plain on-air
+    # offset before arming, so an arm request never carries it (the runtime never reads it).
+    anchor_item: str = ""
     offset_s: float                    # relative to the chosen anchor (on-air side for "both")
     # For a "both"-anchored ramp: the off-air-side inset (≤ 0 = before off-air). The
     # ramp fills [on-air + offset_s, off-air + offset_end_s]. Ignored otherwise.
@@ -747,6 +752,21 @@ class PlanItem(BaseModel):
     overrides: list[StepOverride] = []
     on_air_offset_s: float = 0.0
     off_air_offset_s: float = 0.0
+    # Plan-level anchoring (mirrors the client's PlanItem, 1.35.0): each edge hangs off the plan's
+    # own anchors ("plan", the default), another item's on-/off-air edge ("item") or a step's edge
+    # inside another item ("step"); the offsets above are measured from that. Replica storage only —
+    # the client resolves + compiles them to absolute times before arming; the agent never reads
+    # them. Persisted so a replica round-trips (an older agent would drop them → permanent drift).
+    id: str = ""
+    on_air_anchor: str = "plan"
+    on_air_anchor_item: str = ""
+    on_air_anchor_edge: str = "on"
+    on_air_anchor_step: str = ""
+    off_air_anchor: str = "plan"
+    off_air_anchor_item: str = ""
+    off_air_anchor_edge: str = "off"
+    off_air_anchor_step: str = ""
+    expanded: bool = True
     # Per-item RF-fault recovery override (mirrors the client's PlanItem): "" = INHERIT the seeded
     # sequence's authored recovery_policy/recovery_mode. Persisted so the unit replica round-trips a
     # plan-item override instead of stripping it (review fix #24).
