@@ -191,6 +191,9 @@ def main() -> int:
     check(smd["enbw_mhz"]["hidden"] is True, "hidden derived field surfaces")
     check(smd["band_span"]["provides"] == "bw", "derived provides surfaces")
     check(smd["band_center"]["provides"] is None, "a plain derived field provides nothing")
+    check(smd["band_span"]["is_elapsed"] is False, "a plain field is not the elapsed-time param")
+    el = {p["name"]: p for p in Script("e").number("--elapsed", is_elapsed=True).describe()["params"]}
+    check(el["elapsed"]["is_elapsed"] is True, "number(is_elapsed=True) surfaces the marker")
     ns = sm.parse(["--band-mode", "start_stop", "--start", "1570", "--stop", "1580"])
     check(getattr(ns, "band_mode") == "start_stop", "mode selector parses")
     check(not hasattr(ns, "band_span") and not hasattr(ns, "band_center"),

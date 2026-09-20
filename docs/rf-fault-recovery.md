@@ -1265,6 +1265,87 @@ detection stack (its engine's stdout is not the channel task's log — a scope n
 a false hit auto-drops a healthy transmitter — no false hit exists in today's scripts); wall-clock steps vs
 `restart_at`/replay shift on an RTC-less Pi; a systematic "0 = disable" sweep of the remaining knobs.
 
+## 14g. Every parameter + the script's elapsed time — BUILT (`AGENT_VERSION 1.32.0`, no capability; branch `claude/system-familiarization-f5mezz`, cross-repo)
+
+Owner follow-up after the §14f review: *"make sure that this is not limited to the power in a ramp, but
+that the process is restarted with all parameters correct, even if there's no ramp"* and *"for signals
+that use time-dependent scripts, such as the cw drift, the script should declare something that lets it
+be restartable at the correct time"*. Two gaps, both closed.
+
+### Every parameter, on both restart paths
+
+The run-owned reconstruction (`SequenceRunner._relaunch_start_fire`, §7) baked only NUMERIC tuned values
+back onto the relaunch — a tuned choice/string (a drift mode, a modulation, the RF gate handled apart)
+silently reverted to the launch value, while the standalone relaunch (§14e, `ProcessManager.relaunch`)
+already baked everything through `cmdargs.overlay_live_params`. Both paths now use that ONE helper: the
+RF gate via its own flags, every other tuned dest with known argspec flags by value (numbers formatted
+`%g`, strings as-is; a store_true trigger such as cw_drift's `--restart` is an EVENT, not state, and is
+never re-fired), `--power`/`--gain` via `LEVEL_FALLBACK_FLAGS` when the argspec is momentarily
+unreadable. A run that ramps nothing was always covered — its launch args ARE its state — and is now
+pinned by a test (`test_restart_with_no_ramp_reproduces_every_launch_and_tuned_param`).
+
+**Hand-tuned parameters are carried too.** A value the operator applied through the Tune… dialog
+during a run is recorded on the process (`_live_applied`, review fix #2) but is NOT in `run.steps`, so
+the schedule walk never saw it. The reconstruction now merges `ProcessManager.live_applied(task)` for
+every dest the schedule NEVER drives (the crash-time live state is the truth there — a hand-lowered
+power on a fixed-power run, a hand-muted gate); a dest the schedule DOES drive follows the schedule's
+position at the cutoff (a hand-tune of a ramped power is superseded by the ramp's next point anyway).
+Merged only when the run's counted epoch launched the task (the record belongs to that process); the
+`_RestartDeferred` (#18) check runs over the merged state, so a hand-tuned choice with an unreadable
+schema defers too.
+
+### The script-declared elapsed time (`is_elapsed`)
+
+A time-dependent script owns a clock the agent cannot see: cw_drift moves the carrier as
+`drift_freq(now − t0, …)` from its launch. Relaunching it "with the right parameters" restarted the drift
+from the START frequency. The existing `TaskConfig.resumable` / `--start-offset` mechanism is
+operator-configured per task and never reached the restart paths. Now the SCRIPT declares it:
+
+- **paramkit** `Param.is_elapsed` (`number(..., is_elapsed=True)` / `integer(...)`, emitted by
+  `to_dict`): the ONE parameter that takes the seconds already elapsed on the script's own timeline.
+  The script owns the semantics (it shifts its clock by that much at launch). Extracted by the static
+  `agent/argspec.py` (mirrored byte-identically to `sdr-client/api/argspec.py`; drift guard green).
+- **`agent/cmdargs.py`** `elapsed_param(spec)` / `elapsed_of_args(args, p)` (the LAST occurrence, like
+  argparse; junk/negative → 0) / `bake_elapsed(args, p, s)` (ms resolution, via the flag the launch
+  used, else the canonical first flag).
+- **Run-owned restart** — `_relaunch_start_fire(..., elapsed_at=)`: the counted launch's own elapsed +
+  `(elapsed_at − that launch's actual instant)`; `restart_run` passes **`now` for resync** (rejoin the
+  schedule as it stands) and **`fault_at` for replay** (the rest of the profile is shifted by the
+  down-time, so the clock is too). A fault-skipped launch counted by resync runs from its SCHEDULED
+  instant (`_fire_instant`). The synthetic relaunch fire carries the baked value, so a SECOND fault
+  chains correctly (500 carried + 40 s run → 540).
+- **Standalone relaunch** — `ProcessManager.relaunch`: launch elapsed + `proc.age_s()` (seconds since
+  the faulted spawn — resync semantics; a standalone drift rejoins its own wall-clock, it has no
+  schedule to shift). Unknown spawn time ⇒ left as launched. The launch request is otherwise untouched
+  (`env_overrides`, custom args).
+- **`build_resume_request`** — a non-`resumable` task whose script declares the marker is resumable by
+  contract: the arm-time `resume_offset_s` is injected via that flag (the operator-configured
+  mechanism is unchanged; a script with no marker still gets an empty request).
+- **`sdr-scripts` `cw_drift_tx.py`** `--elapsed` (`-Elapsed`, seconds, min 0, default 0,
+  `is_elapsed=True`): `t0 = monotonic() − elapsed`, and the tone is BORN at that point — the top block
+  is built at `f0 = drift_freq(elapsed, …)` in its LO window (`plan_lo`) with the SDR gain folded THERE
+  (the attenuator split stays pinned at the START carrier, where the agent positions it from `--freq`),
+  so nothing is emitted at the start frequency first. The banner reports `resumed at : N s into the
+  drift → f MHz`. `--restart` (the live trigger) still re-runs from the start.
+
+**Limitations (documented, not fixed).** A live `--restart` trigger fired before the fault is not
+replayed — the elapsed counts from the launch, not the trigger (a per-script semantic; declare a marker
+for it if a script ever needs it). With `spec=None` the elapsed cannot be baked (no flags known); the
+restart proceeds as before (the #18 deferral covers only TUNED dests) — the argspec is memoised on the
+first successful read, so this is a script-file-vanished condition. The FIFO `--duration` stagers
+(`gps_l1p`/`gps_l2p`/noise) have a finite timeline too and could declare the marker later.
+
+**Tests.** `tests/test_restart_all_params.py` (12: a tuned choice + carrier + trigger; a no-ramp run
+reproduces every parameter; the hand-tune merge + schedule-wins; no merge without a counted launch;
+resync-now / replay-fault elapsed; accumulation across a prior relaunch; a fault-skipped launch counts
+from its scheduled instant; no marker ⇒ nothing invented; the standalone relaunch + untouched request;
+`build_resume_request`; the marker through paramkit + argspec; the cmdargs helpers), the existing
+paramkit/argspec marker tests extended, `sdr-scripts/tests/test_cw_drift.py` (schema; the banner; the
+REAL `main()` in-process: born at the resume point, clock continues from `--elapsed`). Agent 656 → 668;
+scripts 110 → 112; client 1179 (mirror only). **Rollout:** OTA-push 1.32.0 + the library re-deploy for
+`cw_drift_tx.py`; no client change beyond the argspec mirror (the new `--elapsed` renders as an
+ordinary launch field, default 0).
+
 ## 14. Open items
 
 - Retrieve the archived `run_<ts>.log` from the affected unit + `df /dev/shm` /

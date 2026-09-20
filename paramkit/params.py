@@ -199,6 +199,14 @@ class Param:
     # export blank the power quantities on an off row instead of showing a phantom held level.
     # See paramkit.rf for how a gate is recognised (this marker, else the --rf on/off convention).
     is_rf: bool = False
+    # NUMBER/INTEGER only: marks this parameter as the script's ELAPSED-TIME input — how many
+    # SECONDS into its own timeline the script should start (0 = from the beginning). A
+    # time-dependent script (a drift that moves the carrier over hours) declares one so the
+    # agent can RESTART it at the right point after an RF fault: the relaunch bakes the value the
+    # crashed run was launched with PLUS the wall-clock seconds it ran, so the script resumes where
+    # the timeline stands now instead of from the start. The script owns the semantics (it shifts
+    # its own clock by this many seconds at launch). See docs/rf-fault-recovery.md §14g.
+    is_elapsed: bool = False
 
     @property
     def display_name(self) -> str:
@@ -230,6 +238,7 @@ class Param:
             "hidden": self.hidden,
             "provides": self.provides,
             "is_rf": self.is_rf,
+            "is_elapsed": self.is_elapsed,
         }
 
 
@@ -355,18 +364,22 @@ class Script:
                step: Optional[float] = None, presets: PresetsInput = None,
                default: Optional[float] = None, required: bool = False,
                multiple: bool = False, live: bool = False,
-               show_when: Optional[Dict[str, Any]] = None) -> "Script":
+               show_when: Optional[Dict[str, Any]] = None,
+               is_elapsed: bool = False) -> "Script":
         """A floating-point parameter with optional unit, range, and named presets.
 
         Pass live=True to mark it tunable while the script runs — a GUI can then
         offer a control that applies changes mid-run (the script reads updates via
         Script.live_control). Pass show_when={controller: value} to reveal the field
-        only in a given mode (see Param.show_when)."""
+        only in a given mode (see Param.show_when). Pass is_elapsed=True on the ONE
+        parameter that takes the seconds already elapsed on the script's own timeline
+        (see Param.is_elapsed) so an agent restart resumes it at the right point."""
         n, flags = self._derive_name(flags, name)
         return self._add(Param(
             name=n, flags=flags, kind=NUMBER, help=help, unit=unit, min=min, max=max,
             step=step, presets=_normalise_presets(presets), default=default,
             required=required, multiple=multiple, live=live, show_when=show_when,
+            is_elapsed=is_elapsed,
         ))
 
     def integer(self, *flags: str, name: Optional[str] = None, help: str = "",
@@ -374,14 +387,16 @@ class Script:
                 step: Optional[int] = None, presets: PresetsInput = None,
                 default: Optional[int] = None, required: bool = False,
                 multiple: bool = False, live: bool = False,
-                show_when: Optional[Dict[str, Any]] = None) -> "Script":
+                show_when: Optional[Dict[str, Any]] = None,
+                is_elapsed: bool = False) -> "Script":
         """A whole-number parameter. Like number() but values are ints. See number()
-        for the live= and show_when= flags."""
+        for the live=, show_when= and is_elapsed= flags."""
         n, flags = self._derive_name(flags, name)
         return self._add(Param(
             name=n, flags=flags, kind=INTEGER, help=help, unit=unit, min=min, max=max,
             step=step, presets=_normalise_presets(presets), default=default,
             required=required, multiple=multiple, live=live, show_when=show_when,
+            is_elapsed=is_elapsed,
         ))
 
     def choice(self, *flags: str, options: ChoiceInput, name: Optional[str] = None,

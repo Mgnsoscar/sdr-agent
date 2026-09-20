@@ -78,3 +78,49 @@ def overlay_live_params(args: list, live: dict, spec: Optional[dict], gate: Opti
         text = f"{float(value):g}" if isinstance(value, (int, float)) else str(value)
         out = set_arg_value(out, list(flags), text, canonical=flags[0])
     return out
+
+
+# ── Elapsed-time parameter (a time-dependent script's resume point) ──────────────────────────
+
+def elapsed_param(spec: Optional[dict]) -> Optional[dict]:
+    """The script's ELAPSED-TIME parameter (its argspec entry with `is_elapsed`, see
+    paramkit.Param.is_elapsed), or None when the script declares none / the spec is unreadable.
+    The first flagged param wins."""
+    for p in (spec or {}).get("params", []) or []:
+        if p.get("is_elapsed") and p.get("dest") and (p.get("flags") or []):
+            return p
+    return None
+
+
+def arg_value(args: list, flags, default=None):
+    """The value following the LAST occurrence of any flag in `flags` (argparse semantics — the
+    last one wins), else `default`."""
+    flagset = {str(f) for f in flags}
+    val = default
+    for i, a in enumerate(args or []):
+        if str(a) in flagset and i + 1 < len(args):
+            val = args[i + 1]
+    return val
+
+
+def elapsed_of_args(args: list, param: dict) -> float:
+    """The elapsed seconds a launch's post-script args already carry on the elapsed param (its
+    LAST occurrence), else the param's declared default, else 0. Never raises (0 on junk)."""
+    raw = arg_value(args, [str(f) for f in (param.get("flags") or [])], None)
+    if raw is None:
+        raw = param.get("default")
+    try:
+        v = float(raw) if raw is not None else 0.0
+    except (TypeError, ValueError):
+        v = 0.0
+    return v if v == v and v >= 0 else 0.0            # NaN / negative → 0
+
+
+def bake_elapsed(args: list, param: dict, elapsed_s: float) -> list:
+    """Set the elapsed param on a launch's post-script args to `elapsed_s` seconds (clamped ≥ 0,
+    ms resolution) via its own flags — the relaunch of a time-dependent script resumes there."""
+    flags = [str(f) for f in (param.get("flags") or [])]
+    if not flags:
+        return list(args or [])
+    val = max(0.0, float(elapsed_s))
+    return set_arg_value(args, flags, f"{val:.3f}".rstrip("0").rstrip("."), canonical=flags[0])

@@ -320,6 +320,7 @@ def extract_paramkit_spec(source: str) -> Dict[str, Any]:
         if not isinstance(provides, str) or not provides:
             provides = None
         is_rf = bool(_literal(kw["is_rf"], consts)) if "is_rf" in kw else False
+        is_elapsed = bool(_literal(kw["is_elapsed"], consts)) if "is_elapsed" in kw else False
 
         params.append({
             # rich (paramkit) fields
@@ -352,6 +353,7 @@ def extract_paramkit_spec(source: str) -> Dict[str, Any]:
             "hidden": hidden,
             "provides": provides,
             "is_rf": is_rf,
+            "is_elapsed": is_elapsed,
         })
     # A calibration-aware script declares a stable CAL_SIGNAL_ID module constant; a
     # task opts into power calibration by setting SDR_CAL_SIGNAL_ID to it. Surface it

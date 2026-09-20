@@ -174,8 +174,12 @@ def main() -> int:
         " formula={'table': TBL}))\n"
     )
     bsrc = bsrc.replace("MAXW = 55.0\n", "MAXW = 55.0\nTBL = ['sidelobes', 0.9, 1.0]\n")
+    bsrc = bsrc.replace("  .derived('-Sweep-width'",
+                        "  .number('-Elapsed', '--elapsed', unit='s', min=0, default=0.0, is_elapsed=True)\n"
+                        "  .derived('-Sweep-width'")
     bspec = extract_params(bsrc)
     bby = {p["name"]: p for p in bspec["params"]}
+    check(bby["elapsed"]["is_elapsed"] is True, "is_elapsed marker extracts on a number")
     check(bby["freq"]["show_when"] == {"band_mode": "center_bw"}, "show_when extracted on a number")
     check(bby["band_span"]["kind"] == "derived", "derived kind extracted")
     check(bby["band_span"]["formula"] == {"span": ["start", "stop"]}, "derived formula extracted")
@@ -185,6 +189,7 @@ def main() -> int:
     check(bby["band_span"]["hidden"] is False, "a visible derived field extracts hidden=False")
     check(bby["enbw_mhz"]["hidden"] is True, "hidden derived field extracts")
     check(bby["band_span"]["provides"] == "bw", "derived provides extracts")
+    check(bby["band_span"]["is_elapsed"] is False, "a param without is_elapsed extracts False")
     check(bby["band_center"]["provides"] is None, "a plain derived field extracts provides=None")
     check(bby["enbw_mhz"]["formula"] == {"table": ["sidelobes", 0.9, 1.0]},
           "table formula (named const list) resolves")

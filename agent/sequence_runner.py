@@ -1319,10 +1319,15 @@ class SequenceRunner:
             fault_at = _parse(run.fault_at) if run.fault_at else now
             downtime = max(0.0, (now - fault_at).total_seconds())
             spec = self._spec_of(task)
+            # The instant the relaunched script's OWN timeline must resume at: resync rejoins the
+            # schedule as it stands now; replay resumes from the crash point (the rest of the
+            # profile is shifted by the down-time, so the script's clock is too).
+            elapsed_at = now if mode == "resync" else fault_at
             # Dry-run the plan + the reconstruction: refuses (no future STOP / replay collision /
             # unreadable schema) raise here, before the pre-stop and before any mutation.
             self._plan_restart(run, task, now, mode, downtime)
-            self._relaunch_start_fire(run, task, now, spec, include_skipped=(mode == "resync"))
+            self._relaunch_start_fire(run, task, now, spec, include_skipped=(mode == "resync"),
+                                      elapsed_at=elapsed_at)
             # A task the operator started BY HAND after the fault is not the faulted process: refuse
             # rather than kill the operator's transmission with a pre-stop (review fix #16).
             if self._started_after(task, run.fault_at):
@@ -1372,7 +1377,8 @@ class SequenceRunner:
 
                 # ── Reconstruct the relaunch (born at the recovered level, gate as scheduled) ──
                 relaunch = self._relaunch_start_fire(
-                    run, task, now, spec, include_skipped=(mode == "resync"))
+                    run, task, now, spec, include_skipped=(mode == "resync"),
+                    elapsed_at=elapsed_at)
                 l_now = self._power_of_args(relaunch.args)
 
                 # ── COMMIT: apply the plan, float off-air (replay), add the relaunch, clear the fault ──
@@ -1529,7 +1535,8 @@ class SequenceRunner:
         return _cmdargs.set_arg_value(args, flags, value, canonical)
 
     def _relaunch_start_fire(self, run: SequenceRun, task: str, now: datetime,
-                             spec: Optional[dict], *, include_skipped: bool) -> StepFire:
+                             spec: Optional[dict], *, include_skipped: bool,
+                             elapsed_at: Optional[datetime] = None) -> StepFire:
         """A synthetic `start` StepFire that relaunches `task` at `now`, born transmitting exactly
         as a never-faulted peer holds now: the task's launch command with EVERY changed live
         parameter (power, gain, or whatever it swept) baked in AND the RF gate at its RECONSTRUCTED
@@ -1549,7 +1556,23 @@ class SequenceRunner:
         over-power blip if the launch level sat above the crash level). The RF gate is set to the
         state the schedule holds at the cutoff — a fault in the muted pre-roll (launch --rf off, an
         RF-on tune at T0) or the cool-down tail (an RF-off tune at off-air, STOP after) relaunches
-        MUTED so the re-instated RF-on tune / the STOP drives the gate, not an unconditional on."""
+        MUTED so the re-instated RF-on tune / the STOP drives the gate, not an unconditional on.
+
+        EVERY tuned parameter is reconstructed, not only a swept level: a choice/string (a drift
+        mode, a modulation), a bridge number (--bw, --sidelobes), the carrier — whatever the counted
+        tune/ramp points set — is baked back by its argspec flags (shared with the standalone
+        relaunch: cmdargs.overlay_live_params). And a run that never ramps anything is covered the
+        same way: its launch args ARE its state. Parameters the operator tuned BY HAND during the
+        run (the Tune… dialog — not in run.steps) are carried too, from the process's live-applied
+        record, for every dest the schedule never drives; a dest the schedule DOES drive follows
+        the schedule (its position at the cutoff is the authority — a hand-tune of a ramped power
+        is superseded by the ramp's next point anyway).
+
+        A time-dependent script (one declaring an `is_elapsed` parameter — cw_drift's --elapsed)
+        is relaunched with that parameter set to the seconds its OWN timeline has reached at
+        `elapsed_at`: the elapsed the counted launch carried + (elapsed_at − that launch's actual
+        time), so the drift continues from the right point (resync: `now`; replay: the fault
+        instant, since the rest of the profile is shifted by the down-time). None ⇒ not baked."""
         dest_flags = self._dest_flag_map(spec)
         try:
             base = self._post_script_args(list(self._manager.get_config(task).command))
@@ -1560,6 +1583,7 @@ class SequenceRunner:
         steps = sorted((s for s in run.steps if s.task_name == task),
                        key=lambda s: _parse(s.fire_at))
         launch_args = list(base)
+        launch_at: Optional[datetime] = None         # when the counted launch actually happened
         state: dict = {}
         for s in steps:
             if not self._counts_at_cutoff(s, now, include_skipped):
@@ -1570,8 +1594,16 @@ class SequenceRunner:
                 launch_args = (list(s.args) if (s.replace_args and s.args)
                                else list(base) + list(s.args or []))
                 state = {}                           # a (re)launch resets the accumulated live state
+                launch_at = self._fire_instant(s)
             elif s.action == "tune" and s.params:
                 state.update(dict(s.params))
+        # Hand-tuned parameters (a Tune… the operator applied outside the schedule) for the dests
+        # the schedule never drove: the crash-time live state is the truth for those. Only when the
+        # task WAS launched by this run (the live record belongs to that process).
+        if launch_at is not None:
+            for dest, value in self._manager_live_applied(task).items():
+                if dest not in state:
+                    state[dest] = value
         args = list(launch_args)
 
         gate = None
@@ -1593,28 +1625,44 @@ class SequenceRunner:
                     f"cannot reconstruct '{task}' faithfully yet: its parameter schema is unreadable "
                     f"and the run tuned {sorted(unbaked)} — retry the restart in a moment")
 
-        # Overlay each changed NUMERIC live param onto the launch command; a boolean/toggle live
-        # param keeps the launch default (only a swept level need be re-baked). --power/--gain fall
-        # back to their canonical flags when the argspec is unreadable, so the level is never lost.
-        for dest, value in state.items():
-            if dest == gate_dest or isinstance(value, bool) or not isinstance(value, (int, float)):
-                continue
-            flags = dest_flags.get(dest) or _LEVEL_FALLBACK_FLAGS.get(dest)
-            if flags:
-                args = self._set_arg_value(args, list(flags), f"{float(value):g}",
-                                           canonical=flags[0])
+        # Overlay EVERY changed live param onto the launch command by its argspec flags — numbers
+        # AND strings/choices alike (a boolean store_true flag has no value to bake and keeps the
+        # launch default: a --restart trigger is an event, not state). --power/--gain fall back to
+        # their canonical flags when the argspec is unreadable, so the level is never lost. The RF
+        # gate is reconstructed to the state the schedule holds at the cutoff: a counted tune of the
+        # gate dest is applied via the gate's own flags; otherwise the launch args' own gate value
+        # is the effective state (launched-on ⇒ on; a muted pre-roll ⇒ off). No unconditional
+        # force-on. Same helper as the standalone auto-restart relaunch, so the two paths agree.
+        args = _cmdargs.overlay_live_params(args, state, spec, gate)
+        del dest_flags, gate_dest                     # (both folded into the shared overlay)
 
-        # Reconstruct the RF gate the schedule holds at the cutoff. If a counted tune drove the gate
-        # dest, apply that value; otherwise the launch args' own gate value is the effective state
-        # (launched-on ⇒ on; a muted pre-roll ⇒ off). No unconditional force-on.
-        if gate and gate_dest is not None and gate_dest in state:
-            gate_flags = [str(f) for f in (gate.get("flags") or [])]
-            if gate_flags:
-                args = self._set_arg_value(args, gate_flags, str(state[gate_dest]),
-                                           canonical=gate_flags[0])
+        # A time-dependent script resumes its OWN timeline where it stands at `elapsed_at`.
+        ep = _cmdargs.elapsed_param(spec)
+        if ep is not None and elapsed_at is not None and launch_at is not None:
+            ran_s = max(0.0, (elapsed_at - launch_at).total_seconds())
+            args = _cmdargs.bake_elapsed(args, ep, _cmdargs.elapsed_of_args(args, ep) + ran_s)
         return StepFire(anchor="start", offset_s=0.0, action="start", task_name=task,
                         fire_at=now.isoformat(), fired_actual=None,
                         args=args, replace_args=True)
+
+    @staticmethod
+    def _fire_instant(step: StepFire) -> datetime:
+        """When a counted fire HAPPENED: its actual firing time when it fired, else its scheduled
+        fire_at (a resync-counted fire the fault skipped: the schedule's instant is the truth)."""
+        fa = step.fired_actual
+        if fa and not str(fa).startswith("skipped"):
+            try:
+                return _parse(fa)
+            except (TypeError, ValueError):
+                pass
+        return _parse(step.fire_at)
+
+    def _manager_live_applied(self, task: str) -> dict:
+        """The values live-tuned onto the task's current process (any source), {} when unknown."""
+        try:
+            return dict(self._manager.live_applied(task))
+        except Exception:                            # noqa: BLE001 — best effort
+            return {}
 
     def _guard_replay_channel(self, run: SequenceRun, start: datetime, new_end: datetime) -> None:
         """Refuse a replay whose shifted window [start, new_end] would overlap another ACTIVE run's

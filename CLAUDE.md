@@ -90,6 +90,27 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — restart reconstructs EVERY parameter + a script-declared ELAPSED time (1.32.0, no capability) (branch `claude/system-familiarization-f5mezz`, cross-repo)
+Owner follow-up to the review: a restarted process must come back with ALL parameters correct (not only a
+ramped power, and also with no ramp), and a time-dependent script (cw_drift) must declare something that lets
+it resume at the right point. Record: **`docs/rf-fault-recovery.md` §14g**. Suite 656 → 668; scripts 110 → 112.
+- **Every parameter, both paths:** `SequenceRunner._relaunch_start_fire` now bakes through the SAME
+  `cmdargs.overlay_live_params` as the standalone `ProcessManager.relaunch` (numbers AND choices/strings;
+  the gate via its flags; a store_true trigger never re-fired). It also MERGES `ProcessManager.live_applied(task)`
+  (hand tunes via the Tune… dialog, not in `run.steps`) for every dest the schedule never drives; a
+  schedule-driven dest follows the schedule's position at the cutoff. Only when the counted epoch launched the task.
+- **`is_elapsed` marker:** paramkit `Param.is_elapsed` (`number/integer(..., is_elapsed=True)`, in `to_dict`),
+  extracted by `agent/argspec.py` (**mirrored to `sdr-client/api/argspec.py`** — drift guard). `agent/cmdargs.py`
+  `elapsed_param`/`elapsed_of_args`/`bake_elapsed`. Run-owned restart: launch elapsed + (`elapsed_at` − the
+  counted launch's actual instant; `now` for resync, `fault_at` for replay; a skipped launch from its scheduled
+  `fire_at` via `_fire_instant`); chains across a prior relaunch. Standalone: launch elapsed + `proc.age_s()`.
+  `build_resume_request` treats a marker-declaring script as resumable. `AGENT_VERSION 1.31.1 → 1.32.0`.
+- **`sdr-scripts` `cw_drift_tx.py --elapsed`** (`-Elapsed`, s, default 0): `t0 = monotonic() − elapsed`; the
+  top block is built AT the resume frequency (LO window + NCO + gain folded there; the attenuator split stays
+  pinned at the start carrier); banner `resumed at`. Limitations: a live `--restart` trigger before the fault
+  isn't replayed; `spec=None` can't bake the elapsed. Tests: `tests/test_restart_all_params.py` (12) + the
+  marker tests; scripts `tests/test_cw_drift.py` (schema, banner, the real `main()` in-process).
+
 ## Current state — RF-fault arc ADVERSARIAL REVIEW: 31 findings FIXED (1.31.1, no capability) (branch `claude/system-familiarization-f5mezz`, cross-repo)
 A full multi-agent review of P0–P3b (11 dimensions → 41 raw → 32 unique → 30 confirmed by independent skeptics,
 5 HIGH ones by reproduction against the real runner; 2 refuted; +1 gap from the completeness critic confirmed by

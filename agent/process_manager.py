@@ -1222,17 +1222,34 @@ class ProcessManager:
         proc = self._get(name)
         live = dict(proc._live_applied)
         req = request or StartRequest()
+        spec = self._script_spec(name)
+        if live and spec is None:
+            logger.error("Auto-restart of '%s' STOOD DOWN: it was live-tuned (%s) but its argspec is "
+                         "unreadable — refusing to relaunch at the launch parameters",
+                         name, sorted(live))
+            return
+        base = _cmdargs.post_script_args(_build_command(proc.config.command, req.args, req.replace_args))
+        args = list(base)
         if live:
-            spec = self._script_spec(name)
-            if spec is None:
-                logger.error("Auto-restart of '%s' STOOD DOWN: it was live-tuned (%s) but its argspec is "
-                             "unreadable — refusing to relaunch at the launch parameters",
-                             name, sorted(live))
-                return
-            base = _cmdargs.post_script_args(_build_command(proc.config.command, req.args, req.replace_args))
-            args = _cmdargs.overlay_live_params(base, live, spec, self._rf_gate(name))
+            args = _cmdargs.overlay_live_params(args, live, spec, self._rf_gate(name))
+        # A time-dependent script (one declaring an `is_elapsed` parameter) resumes its OWN
+        # timeline where it stands NOW: the elapsed the faulted launch carried + the wall-clock
+        # seconds since it was spawned (resync semantics — a standalone drift rejoins its own
+        # clock, it has no schedule to shift). Unknown spawn time ⇒ left as launched.
+        ep = _cmdargs.elapsed_param(spec)
+        age = proc.age_s() if ep is not None else None
+        if ep is not None and age is not None:
+            args = _cmdargs.bake_elapsed(args, ep, _cmdargs.elapsed_of_args(args, ep) + age)
+        if args != base or live:
             req = req.model_copy(update={"args": args, "replace_args": True})
         await self.start(name, req, source="auto-restart")
+
+    def live_applied(self, name: str) -> dict:
+        """The live-parameter values applied to `name`'s CURRENT process by any set_params source
+        (a sequence tune or an operator's Tune…), {dest: value}; reset on every launch. A restart
+        reconstruction carries these for the dests its schedule never drives (review follow-up:
+        every parameter, not only a swept level)."""
+        return dict(self._get(name)._live_applied)
 
     def cancel_pending_relaunches(self) -> int:
         """Abort every PENDING auto-restart relaunch (a faulted task waiting out its settle / claim
@@ -1446,6 +1463,11 @@ class ProcessManager:
             return req
         cfg = self._get(name).config
         if not cfg.resumable:
+            # A script that DECLARES its elapsed-time parameter (paramkit `is_elapsed`) is
+            # resumable by contract, without the operator configuring the flag by hand.
+            ep = _cmdargs.elapsed_param(self._script_spec(name))
+            if ep is not None:
+                req.args = _cmdargs.bake_elapsed([], ep, offset_s)
             return req
         if cfg.resume_offset_mode == "env":
             req.env_overrides = {cfg.resume_offset_env: str(offset_s)}
