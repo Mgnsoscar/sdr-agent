@@ -1318,11 +1318,34 @@ class ProcessManager:
         # clock, it has no schedule to shift). Unknown spawn time ⇒ left as launched.
         ep = _cmdargs.elapsed_param(spec)
         age = proc.age_s() if ep is not None else None
-        if ep is not None and age is not None:
+        reset_at = self._last_reset_applied_at(proc, spec) if ep is not None else None
+        if ep is not None and reset_at is not None:
+            # A live elapsed-RESET trigger (`restart`, declared resets_elapsed) was applied to the
+            # faulted run: its clock started THERE (§14i), so resume from now − that instant.
+            args = _cmdargs.bake_elapsed(args, ep, max(0.0, reset_at))
+        elif ep is not None and age is not None:
             args = _cmdargs.bake_elapsed(args, ep, _cmdargs.elapsed_of_args(args, ep) + age)
         if args != base or live:
             req = req.model_copy(update={"args": args, "replace_args": True})
         await self.start(name, req, source="auto-restart")
+
+    @staticmethod
+    def _last_reset_applied_at(proc: "ManagedProcess", spec: Optional[dict]) -> Optional[float]:
+        """Seconds since the LAST applied elapsed-reset trigger on this process (None when none)."""
+        best = None
+        for d in _cmdargs.resets_elapsed_dests(spec):
+            if d in proc._live_applied and _cmdargs.is_reset_fire({d: proc._live_applied[d]}, {d}):
+                ts = proc._live_applied_at.get(d)
+                if not ts:
+                    continue
+                try:
+                    from datetime import datetime, timezone
+                    t = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                    age = (datetime.now(timezone.utc) - t).total_seconds()
+                except (TypeError, ValueError):
+                    continue
+                best = age if best is None else min(best, age)
+        return best
 
     def live_applied(self, name: str) -> dict:
         """The live-parameter values applied to `name`'s CURRENT process by any set_params source

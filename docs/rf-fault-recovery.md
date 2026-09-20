@@ -1358,7 +1358,8 @@ agent's static upload validator and the client's static reader both accept the f
 capability **`paramkit-is-elapsed`** and the client REFUSES to ship a script whose static argspec
 carries the marker to a unit without it (`api/script_markers.py` + `AgentClient.upload_script` /
 `deploy_library`, the same shape as the `CAL_*` gates), so the wrong order is refused per unit with the
-reason instead of bricking the drift. No other client change (the new `--elapsed` renders as an
+reason instead of bricking the drift. (§14i adds a second marker, `resets_elapsed` → capability
+`paramkit-resets-elapsed`, 1.33.0 — the same gate, the same order.) No other client change (the new `--elapsed` renders as an
 ordinary launch field, default 0).
 
 ## 14h. Second adversarial review — the §14f fixes + §14g re-reviewed; 30 findings FIXED (`AGENT_VERSION 1.32.0`, capability `paramkit-is-elapsed`; branch `claude/system-familiarization-f5mezz`, cross-repo)
@@ -1452,8 +1453,8 @@ atomically; O5 `_gnuradio_default_factory`'s docstring corrected (the stock conf
 O6 the boot pre-image skips when a task is launching (`is_live`) and `restart()` honours the gate;
 E4 an injection-only START over an empty-args replace launch appends (keeps the configured command);
 E7/R6 `--flag=value` tokens are read/rewritten, a dangling last flag gets its value; C-4 the client's
-"no pref file" hint names the pin knob. **Documented, not fixed:** a live `--restart` trigger fired
-before the fault (hand OR scheduled) is not replayed — the elapsed counts from the launch (E5); the
+"no pref file" hint names the pin knob. **Documented, not fixed:** ~~a live `--restart` trigger fired
+before the fault is not replayed (E5)~~ — FIXED in §14i (the owner's normal workflow fires it AT on-air); the
 baked elapsed runs ahead by the difference between a cold and a warm launch's latency (a few s, E6);
 the tick loop still fires launches serially, so a launch parked on the boot gate delays other runs'
 fires for that window (O1, boot only); `spec=None` cannot bake the elapsed (G13, pinned as "proceeds
@@ -1468,6 +1469,38 @@ re-instates a hold-skipped fire and floors a due-but-unfired one past now (G1/G9
 aborted run stamps nothing (G2); cw_drift's calibrated gain is folded at the resume frequency with the
 split pinned at the start carrier (G12, scripts); the client's hidden-checkbox assertion uses
 `isHidden()` (G16).
+
+## 14i. The elapsed-RESET trigger — `resets_elapsed` (`AGENT_VERSION 1.33.0`, capability `paramkit-resets-elapsed`; branch `claude/system-familiarization-f5mezz`, cross-repo)
+
+The owner's standard drift workflow: launch `cw_drift` **X seconds before on-air with `--rf off`**, then
+AT on-air fire `rf on` **and `--restart`**, so the drift genuinely begins at T0. That makes the trigger the
+NORMAL case, not the rare one §14h documented: a restart that counted the elapsed from the launch resumed
+the drift X seconds too far along. Now the script declares which live trigger restarts its own clock:
+
+- **paramkit** `Param.resets_elapsed` (`flag(..., resets_elapsed=True)`, emitted by `to_dict`); extracted
+  by the static `agent/argspec.py` (mirrored byte-identically to `sdr-client/api/argspec.py`).
+  `cmdargs.resets_elapsed_dests(spec)` / `is_reset_fire(params, dests)` (a truthy value — bool True or
+  "on"/"true"/"1"/"yes" — on a reset dest).
+- **Run-owned restart** (`_relaunch_start_fire`): the walk keeps `clock_at` = the instant of the LAST
+  counted tune firing a reset trigger (a launch resets it to None). With a `clock_at` the baked elapsed is
+  `elapsed_at − clock_at` (0 at the trigger — the launch's own `--elapsed` / resume offset no longer
+  applies); without one, the launch rule stands. A fault-skipped trigger counts for **resync** (the
+  schedule says the drift restarted at T0) and not for **replay** (what actually ran). The trigger itself
+  is a bool and is never re-fired on the relaunch (`overlay_live_params` skips bools).
+- **Standalone relaunch** (`ProcessManager.relaunch`): the elapsed is `now − the last applied reset
+  trigger's _live_applied_at` when one was applied to the faulted process (`_last_reset_applied_at`),
+  else the launch elapsed + `age_s()` as before.
+- **`cw_drift_tx.py`** marks `--restart` `resets_elapsed=True`.
+- **Rollout/skew**: the same hard rule as §14g — the kwarg crashes an older paramkit at `build_script()`,
+  so the agent advertises `paramkit-resets-elapsed` and the client's marker gate refuses the script to a
+  unit without it (a 1.32.0 unit lacks it). **OTA every unit to 1.33.0 first, then deploy the library.**
+
+Tests: `tests/test_restart_all_params.py` (the marker through paramkit/argspec/cmdargs; the owner's exact
+shape — START 5 s before on-air muted, `rf on` + `restart` at T0, fault at T0+30: resync bakes 130 s and
+replay 30 s, NOT +5; a launch begun 500 s in and then restarted counts from the trigger; a fault-skipped
+trigger counts for resync only; the standalone path counts from the last applied trigger, else the spawn),
+`sdr-scripts/tests/test_cw_drift.py` (schema: exactly one `resets_elapsed` param), the client gate test
+(a script using both markers needs both capabilities). Agent 702 → 707; scripts 114; client 1185.
 
 ## 14. Open items
 

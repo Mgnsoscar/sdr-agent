@@ -133,6 +133,27 @@ def elapsed_param(spec: Optional[dict]) -> Optional[dict]:
     return None
 
 
+def resets_elapsed_dests(spec: Optional[dict]) -> set:
+    """The dests of the script's elapsed-RESET triggers (params with `resets_elapsed`, see
+    paramkit.Param.resets_elapsed): a counted tune that fires one restarts the script's own clock,
+    so a restart counts the elapsed from that instant, not from the launch."""
+    return {p.get("dest") for p in (spec or {}).get("params", []) or []
+            if p.get("resets_elapsed") and p.get("dest")}
+
+
+def is_reset_fire(params: dict, reset_dests: set) -> bool:
+    """Whether a tune's params fire an elapsed-reset trigger (a truthy value on a reset dest)."""
+    for d in reset_dests:
+        if d in (params or {}):
+            v = params[d]
+            if isinstance(v, str):
+                if v.strip().lower() in ("1", "true", "yes", "on"):
+                    return True
+            elif v:
+                return True
+    return False
+
+
 def arg_value(args: list, flags, default=None):
     """The value following the LAST occurrence of any flag in `flags` (argparse semantics — the
     last one wins), else `default`."""

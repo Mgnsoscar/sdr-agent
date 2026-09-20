@@ -1644,6 +1644,12 @@ class SequenceRunner:
         state: dict = {}
         state_at: dict = {}                          # dest -> instant of the last counted fire setting it
         sched_off = False                            # the latest counted fire is a STOP
+        # The instant the script's OWN clock last started: the launch, or the last counted firing of
+        # an elapsed-RESET trigger (cw_drift's `--restart`, declared `resets_elapsed` — the normal
+        # shape is a muted pre-roll launch and, AT on-air, `rf on` + `restart`, so the drift begins at
+        # T0 and a restart must count from THERE, not from the launch; §14i).
+        reset_dests = _cmdargs.resets_elapsed_dests(spec)
+        clock_at: Optional[datetime] = None
         for s in steps:
             if not self._counts_at_cutoff(s, now, include_skipped):
                 continue
@@ -1658,12 +1664,15 @@ class SequenceRunner:
                 state_at = {}
                 launch_at = self._fire_instant(s)
                 launch_fire = s
+                clock_at = None
                 sched_off = False
             elif s.action == "tune" and s.params:
                 state.update(dict(s.params))
                 at = self._fire_instant(s)
                 for d in s.params:
                     state_at[d] = at
+                if reset_dests and _cmdargs.is_reset_fire(s.params, reset_dests):
+                    clock_at = at                    # the script's clock restarted here
             elif s.action == "stop" and launch_at is not None:
                 sched_off = True
         if sched_off:
@@ -1720,11 +1729,16 @@ class SequenceRunner:
         args = _cmdargs.overlay_live_params(args, state, spec, gate)
         del dest_flags, gate_dest                     # (both folded into the shared overlay)
 
-        # A time-dependent script resumes its OWN timeline where it stands at `elapsed_at`.
+        # A time-dependent script resumes its OWN timeline where it stands at `elapsed_at`: from the
+        # launch's own elapsed + the time run, or — when a counted reset trigger fired — from 0 at that
+        # trigger's instant (the launch's elapsed / resume offset no longer applies past a reset).
         ran_s = (max(0.0, (elapsed_at - launch_at).total_seconds())
                  if (elapsed_at is not None and launch_at is not None) else None)
         ep = _cmdargs.elapsed_param(spec)
-        if ep is not None and ran_s is not None:
+        if ep is not None and clock_at is not None and elapsed_at is not None:
+            args = _cmdargs.bake_elapsed(args, ep, max(0.0, (elapsed_at - clock_at).total_seconds()))
+            ran_s = None                             # the resume-offset advance below doesn't apply
+        elif ep is not None and ran_s is not None:
             args = _cmdargs.bake_elapsed(args, ep, _cmdargs.elapsed_of_args(args, ep) + ran_s)
         # The operator-configured resume offset (TaskConfig.resumable): the arg-mode flag is advanced
         # by the time run in place; an env-mode injection rides the synthetic fire's resume_offset_s

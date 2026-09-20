@@ -90,7 +90,19 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
-## MERGED TO `main` (all three repos, fast-forward, 1.32.0) — field rollout: OTA every unit's agent FIRST, then deploy the library; rebuild the client bundle from 1.32.0. Nothing in the RF-fault arc has run on real hardware yet (mock scripts + fake gnuradio + the headless unit only).
+## MERGED TO `main` (all three repos, fast-forward, 1.33.0) — field rollout: OTA every unit's agent FIRST, then deploy the library; rebuild the client bundle from 1.33.0. Nothing in the RF-fault arc has run on real hardware yet (mock scripts + fake gnuradio + the headless unit only).
+
+## Current state — the elapsed-RESET trigger marker `resets_elapsed` (1.33.0, capability `paramkit-resets-elapsed`) (branch `claude/system-familiarization-f5mezz`, cross-repo)
+Owner workflow: launch cw_drift X s BEFORE on-air with `--rf off`, then AT on-air fire `rf on` + `--restart`
+so the drift begins at T0 — so a restart must count the elapsed from that trigger, not the launch (§14h's
+"documented limitation" E5 was the owner's normal case). Record **`docs/rf-fault-recovery.md` §14i**. paramkit
+`flag(..., resets_elapsed=True)` (→ `Param.resets_elapsed`, `to_dict`, `agent/argspec.py` — **mirrored to
+`sdr-client/api/argspec.py`**); `cmdargs.resets_elapsed_dests`/`is_reset_fire`; `_relaunch_start_fire` keeps
+`clock_at` = the last counted reset-trigger fire (resync counts a fault-skipped one, replay doesn't) and bakes
+`elapsed_at − clock_at` (the launch's `--elapsed`/resume offset no longer applies); `ProcessManager.relaunch`
+counts from the last applied trigger's `_live_applied_at` (`_last_reset_applied_at`). `cw_drift_tx.py --restart`
+declares it. Skew: the same crash-on-old-paramkit rule → capability `paramkit-resets-elapsed` + the client marker
+gate; **OTA to 1.33.0 first, then deploy the library**. Tests in `tests/test_restart_all_params.py` (+5). Suite 702 → 707.
 
 ## Current state — SECOND adversarial review of the RF-fault arc: 30 findings FIXED (1.32.0, capability `paramkit-is-elapsed`) (branch `claude/system-familiarization-f5mezz`, cross-repo)
 Seven parallel reviewers re-reviewed the §14f fixes + the §14g work; record **`docs/rf-fault-recovery.md` §14h**.

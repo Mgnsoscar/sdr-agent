@@ -37,7 +37,7 @@ s = (Script("drift")
      .number("--bw", min=1, max=40, default=10, live=True)
      .number("--power", min=-120, max=0, default=-50, live=True)
      .choice("--rf", options=["on", "off"], default="off", live=True, is_rf=True)
-     .flag("--restart", live=True))
+     .flag("--restart", live=True, resets_elapsed=True))
 args = s.parse()
 ctrl = s.live_control(args)
 while True:
@@ -412,3 +412,100 @@ def test_flag_equals_value_form_is_read_and_rewritten():
     assert cmdargs.bake_elapsed(["--elapsed=5400", "--x", "1"], ep, 5430.0) == ["--elapsed=5430", "--x", "1"]
     assert cmdargs.set_arg_value(["--p=1", "--p", "2"], ["--p"], 3) == ["--p=3", "--p", "3"]
     assert cmdargs.arg_value(["--p=1", "--p", "2"], ["--p"]) == "2"          # last occurrence wins
+
+
+# ── the elapsed-RESET trigger (owner workflow: muted pre-roll launch, then `rf on` + `restart` AT on-air) ──
+
+def test_resets_elapsed_marker_surfaces_through_paramkit_argspec_and_cmdargs():
+    d = {p["name"]: p for p in (Script("d").flag("--restart", live=True, resets_elapsed=True)
+                                .flag("--other", live=True)).describe()["params"]}
+    assert d["restart"]["resets_elapsed"] is True and d["other"]["resets_elapsed"] is False
+    spec = extract_params(DRIFT_SCRIPT)
+    by = {p["dest"]: p for p in spec["params"]}
+    assert by["restart"]["resets_elapsed"] is True and by["elapsed"]["resets_elapsed"] is False
+    assert cmdargs.resets_elapsed_dests(spec) == {"restart"}
+    assert cmdargs.is_reset_fire({"restart": True}, {"restart"})
+    assert cmdargs.is_reset_fire({"restart": "on"}, {"restart"})
+    assert not cmdargs.is_reset_fire({"restart": False}, {"restart"})
+    assert not cmdargs.is_reset_fire({"rf": "on"}, {"restart"})
+
+
+def _preroll_run(runner, now, *, fault_s=30, launch_elapsed=None, restart_skipped=False):
+    """The owner's shape: START 5 s BEFORE on-air with RF muted; AT on-air `rf on` + `restart` (so the
+    drift begins at T0); fault `fault_s` after T0."""
+    T0 = now - timedelta(seconds=130)
+    launch_args = ["--freq", "1600", "--duration", "180", "--power", "-30", "--rf", "off"]
+    if launch_elapsed is not None:
+        launch_args += ["-Elapsed", str(launch_elapsed)]
+    fired_restart = "skipped" if restart_skipped else T._iso(T0)
+    steps = [
+        T._fire("start", -5.0, T0 - timedelta(seconds=5), fired=T._iso(T0 - timedelta(seconds=5)),
+                args=launch_args, replace=True),
+        T._fire("tune", 0.0, T0, fired=T._iso(T0), params={"rf": "on"}),
+        T._fire("tune", 0.0, T0, fired=fired_restart, params={"restart": True}),
+        T._fire("stop", 0.0, now + timedelta(seconds=600), fired="skipped"),
+    ]
+    return T0, _install(runner, steps, T0=T0, now=now, fault_at=T0 + timedelta(seconds=fault_s),
+                        on_air_end=now + timedelta(seconds=600))
+
+
+def test_restart_counts_the_elapsed_from_the_on_air_restart_trigger_not_the_launch(tmp_path, monkeypatch):
+    async def scenario():
+        for mode, expect in (("resync", 130.0), ("replay", 30.0)):   # now − T0 / fault − T0, NOT +5 s
+            (tmp_path / mode).mkdir()
+            mgr, runner = _mk(tmp_path / mode, monkeypatch, ["--freq", "1600", "--power", "-30", "--rf", "off"])
+            now = datetime.now(timezone.utc)
+            _preroll_run(runner, now)
+            out = await runner.restart_run("r1", RestartRequest(mode=mode, restart_at=T._iso(now)))
+            a = _argdict(_relaunch_of(out).args)
+            assert abs(float(a["elapsed"]) - expect) < 0.01, (mode, a)
+            assert a["rf"] == "on" and "--restart" not in _relaunch_of(out).args
+    asyncio.run(scenario())
+
+
+def test_restart_trigger_overrides_a_launch_that_began_part_way(tmp_path, monkeypatch):
+    """A launch started 500 s into the drift and then RESTARTED at on-air: the clock began at 0 at the
+    trigger — the launch's own --elapsed no longer applies."""
+    mgr, runner = _mk(tmp_path, monkeypatch, ["--freq", "1600", "--power", "-30", "--rf", "off"])
+    now = datetime.now(timezone.utc)
+    _, run = _preroll_run(runner, now, launch_elapsed=500)
+    fire = runner._relaunch_start_fire(run, "tx", now, runner._spec_of("tx"), include_skipped=True, elapsed_at=now)
+    assert abs(float(_argdict(fire.args)["elapsed"]) - 130.0) < 0.01
+
+
+def test_a_fault_skipped_restart_trigger_counts_for_resync_only(tmp_path, monkeypatch):
+    """The trigger the fault skipped: resync (the schedule's position) counts it — the drift SHOULD have
+    restarted at T0; replay (what actually ran) does not — the clock still runs from the launch."""
+    mgr, runner = _mk(tmp_path, monkeypatch, ["--freq", "1600", "--power", "-30", "--rf", "off"])
+    now = datetime.now(timezone.utc)
+    T0, run = _preroll_run(runner, now, fault_s=-2, restart_skipped=True)   # faulted 2 s BEFORE on-air
+    spec = runner._spec_of("tx")
+    resync = runner._relaunch_start_fire(run, "tx", now, spec, include_skipped=True, elapsed_at=now)
+    assert abs(float(_argdict(resync.args)["elapsed"]) - 130.0) < 0.01          # from the (skipped) trigger
+    fault_at = T0 - timedelta(seconds=2)
+    replay = runner._relaunch_start_fire(run, "tx", now, spec, include_skipped=False, elapsed_at=fault_at)
+    assert abs(float(_argdict(replay.args)["elapsed"]) - 3.0) < 0.01            # launch → fault: 5 − 2
+
+
+def test_standalone_relaunch_counts_from_the_last_applied_restart_trigger(tmp_path, monkeypatch):
+    async def scenario():
+        mgr, runner = _mk(tmp_path, monkeypatch, [], auto_restart_on_fault=True, restart_delay_s=0.0)
+        proc = mgr._procs["tx"]
+        calls = []
+
+        async def fake_start(request=None):
+            calls.append(request)
+        proc.start = fake_start
+        now = datetime.now(timezone.utc)
+        proc.started_at = (now - timedelta(seconds=60)).isoformat()
+        proc._live_applied = {"rf": "on", "restart": True}
+        proc._live_applied_at = {"rf": (now - timedelta(seconds=20)).isoformat(),
+                                 "restart": (now - timedelta(seconds=20)).isoformat()}
+        await mgr.relaunch("tx", StartRequest(args=["--freq", "1600", "--rf", "off"], replace_args=True))
+        a = _argdict(calls[-1].args)
+        assert abs(float(a["elapsed"]) - 20.0) < 1.0                     # from the trigger, not the spawn
+        assert a["rf"] == "on" and "--restart" not in calls[-1].args     # the trigger is never re-fired
+        proc._live_applied, proc._live_applied_at = {"rf": "on"}, {"rf": (now - timedelta(seconds=20)).isoformat()}
+        await mgr.relaunch("tx", StartRequest(args=["--freq", "1600", "--rf", "off"], replace_args=True))
+        assert abs(float(_argdict(calls[-1].args)["elapsed"]) - 60.0) < 1.0   # no trigger: since the spawn
+    asyncio.run(scenario())

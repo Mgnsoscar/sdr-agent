@@ -207,6 +207,11 @@ class Param:
     # the timeline stands now instead of from the start. The script owns the semantics (it shifts
     # its own clock by this many seconds at launch). See docs/rf-fault-recovery.md §14g.
     is_elapsed: bool = False
+    # FLAG only (a live store_true trigger): firing it RESETS the script's elapsed-time clock to 0
+    # (a "restart the drift from the start" trigger). The agent's RF-fault restart then counts the
+    # elapsed from the last such trigger, not from the launch — the normal shape is a muted pre-roll
+    # launch and, AT on-air, `rf on` + this trigger. See docs/rf-fault-recovery.md §14i.
+    resets_elapsed: bool = False
 
     @property
     def display_name(self) -> str:
@@ -239,6 +244,7 @@ class Param:
             "provides": self.provides,
             "is_rf": self.is_rf,
             "is_elapsed": self.is_elapsed,
+            "resets_elapsed": self.resets_elapsed,
         }
 
 
@@ -472,13 +478,15 @@ class Script:
 
     def flag(self, *flags: str, name: Optional[str] = None, help: str = "",
              default: bool = False, live: bool = False,
-             show_when: Optional[Dict[str, Any]] = None) -> "Script":
+             show_when: Optional[Dict[str, Any]] = None,
+             resets_elapsed: bool = False) -> "Script":
         """A boolean on/off switch (a GUI checkbox). Present on the CLI ⇒ True.
-        See number() for the live= and show_when= flags."""
+        See number() for the live= and show_when= flags. Pass resets_elapsed=True on a live
+        trigger that restarts the script's own timeline (see Param.resets_elapsed)."""
         n, flags = self._derive_name(flags, name)
         return self._add(Param(
             name=n, flags=flags, kind=FLAG, help=help, default=bool(default), live=live,
-            show_when=show_when,
+            show_when=show_when, resets_elapsed=resets_elapsed,
         ))
 
     def derived(self, *flags: str, name: Optional[str] = None, help: str = "",
