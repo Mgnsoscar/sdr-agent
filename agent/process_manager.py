@@ -336,6 +336,19 @@ def _freq_from_command(cmd, spec: Optional[dict]) -> Optional[float]:
     return _tune_log.freq_hz_of(spec, {dest: last} if last is not None else {})
 
 
+def _last_clock_origin(text: str) -> Optional[float]:
+    """The value of the LAST `CLOCK origin=<unix seconds>` marker in `text`, or None."""
+    m = None
+    for m in re.finditer(re.escape(_txhealth.CLOCK_MARKER) + r"\s*([0-9]+(?:\.[0-9]+)?)", text or ""):
+        pass
+    if m is None:
+        return None
+    try:
+        return float(m.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
 def _fmt_num(v: float) -> str:
     """A numeric CLI argument value: whole numbers without a trailing .0 so int-typed
     argparse params accept them (e.g. 60.0 → '60', 0.25 → '0.25')."""
@@ -521,6 +534,10 @@ class ManagedProcess:
         # When the script reported HEALTH state=transmitting (paramkit.txhealth) — the radio is up.
         # A recovery breaker's healthy-settle clock starts here, not at spawn (review fix #19).
         self.transmitting_at: Optional[str] = None
+        # The ABSOLUTE instant (Unix seconds) the script's own timeline last (re)started, as the script
+        # REPORTED it (txhealth.CLOCK_MARKER, read by the watchdog scan). A restart bakes it back so a
+        # time-dependent script resumes exactly, whatever the launch latency (§14j). None = not reported.
+        self.clock_origin: Optional[float] = None
         # Live-parameter values applied to THIS run by set_params ({dest: value}), so a standalone
         # auto-restart relaunches at the LIVE state (a muted / lowered task comes back muted / lowered),
         # not the launch request (review fix #2). Cleared on start.
@@ -555,6 +572,7 @@ class ManagedProcess:
         self._log_inode = None
         self._spawned.clear()
         self.transmitting_at = None
+        self.clock_origin = None
         self._live_applied = {}
         self._live_applied_at = {}
         self.state = ProcessState.STARTING
@@ -1319,12 +1337,28 @@ class ProcessManager:
         ep = _cmdargs.elapsed_param(spec)
         age = proc.age_s() if ep is not None else None
         reset_at = self._last_reset_applied_at(proc, spec) if ep is not None else None
+        launch_elapsed = _cmdargs.elapsed_of_args(args, ep) if ep is not None else 0.0
         if ep is not None and reset_at is not None:
             # A live elapsed-RESET trigger (`restart`, declared resets_elapsed) was applied to the
             # faulted run: its clock started THERE (§14i), so resume from now − that instant.
             args = _cmdargs.bake_elapsed(args, ep, max(0.0, reset_at))
         elif ep is not None and age is not None:
-            args = _cmdargs.bake_elapsed(args, ep, _cmdargs.elapsed_of_args(args, ep) + age)
+            args = _cmdargs.bake_elapsed(args, ep, launch_elapsed + age)
+        # The ABSOLUTE origin (§14j): the script's own report when it gave one (exact — it is the
+        # instant its clock actually started, a reset trigger included), else the best reconstruction:
+        # the applied reset trigger's instant, else the spawn minus the launch's own elapsed. The
+        # script prefers the origin over --elapsed, so the relaunch lands on the never-faulted position
+        # whatever the launch latency.
+        cp = _cmdargs.clock_origin_param(spec)
+        if cp is not None:
+            import time as _time
+            origin = proc.clock_origin
+            if origin is None and reset_at is not None:
+                origin = _time.time() - reset_at
+            if origin is None and age is not None:
+                origin = _time.time() - age - launch_elapsed
+            if origin is not None:
+                args = _cmdargs.bake_clock_origin(args, cp, origin)
         if args != base or live:
             req = req.model_copy(update={"args": args, "replace_args": True})
         await self.start(name, req, source="auto-restart")
@@ -1353,6 +1387,10 @@ class ProcessManager:
         reconstruction carries these for the dests its schedule never drives (review follow-up:
         every parameter, not only a swept level)."""
         return dict(self._get(name)._live_applied)
+
+    def clock_origin(self, name: str) -> Optional[float]:
+        """The script-reported absolute clock origin (Unix seconds) of `name`'s CURRENT process, or None."""
+        return self._get(name).clock_origin
 
     def live_applied_at(self, name: str) -> dict:
         """{dest: ISO instant} of when each live_applied value was applied (see live_applied)."""
@@ -1471,6 +1509,11 @@ class ProcessManager:
         # recovery breaker's healthy-settle clock keys on it, not on the spawn (review fix #19).
         if proc.transmitting_at is None and _txhealth.TRANSMITTING_MARKER.lower() in low:
             proc.transmitting_at = _utcnow()
+        # The script's reported clock origin (`CLOCK origin=<unix>`): the LAST one wins — a reset
+        # trigger prints a new one when it restarts the timeline (§14j).
+        origin = _last_clock_origin(text)
+        if origin is not None:
+            proc.clock_origin = origin
         hit = next((p for p in _agentcfg.HEALTH_FAULT_PATTERNS if p.lower() in low), None)
         if hit is None:
             return

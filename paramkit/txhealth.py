@@ -39,6 +39,11 @@ FAULT_MARKER = "HEALTH state=faulted"
 # and a slow generator that faults at the end of a long warm-up can't read as healthy warm-up time
 # and hand itself an unlimited restart budget (review fix #19).
 TRANSMITTING_MARKER = "HEALTH state=transmitting"
+# A time-dependent script reports the ABSOLUTE instant its own timeline (re)started — `CLOCK
+# origin=<unix seconds>` — whenever its clock starts or a reset trigger restarts it. The agent's
+# watchdog scan records the latest value, and an RF-fault restart bakes it back (`is_clock_origin`)
+# so the relaunch resumes exactly where the timeline stands, whatever the launch latency.
+CLOCK_MARKER = "CLOCK origin="
 
 
 class Watcher:
@@ -54,6 +59,12 @@ class Watcher:
     def join(self, timeout: float | None = None) -> None:
         if self._thread is not None:
             self._thread.join(timeout)
+
+
+def report_clock_origin(origin_unix: float, stream=None) -> None:
+    """Print the CLOCK marker for `origin_unix` (Unix seconds, UTC), flushed whole on one line."""
+    out = stream if stream is not None else sys.stdout
+    print(f"{CLOCK_MARKER}{float(origin_unix):.3f}", file=out, flush=True)
 
 
 def watch_flowgraph(tb, stop, *, reason: str = "flowgraph halted", stream=None) -> Watcher:

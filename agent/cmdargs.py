@@ -133,6 +133,23 @@ def elapsed_param(spec: Optional[dict]) -> Optional[dict]:
     return None
 
 
+def clock_origin_param(spec: Optional[dict]) -> Optional[dict]:
+    """The script's ABSOLUTE clock-origin parameter (its argspec entry with `is_clock_origin`, see
+    paramkit.Param.is_clock_origin), or None."""
+    for p in (spec or {}).get("params", []) or []:
+        if p.get("is_clock_origin") and p.get("dest") and (p.get("flags") or []):
+            return p
+    return None
+
+
+def bake_clock_origin(args: list, param: dict, origin_unix: float) -> list:
+    """Set the clock-origin param to `origin_unix` (Unix seconds, ms resolution) via its own flags."""
+    flags = [str(f) for f in (param.get("flags") or [])]
+    if not flags:
+        return list(args or [])
+    return set_arg_value(args, flags, f"{float(origin_unix):.3f}", canonical=flags[0])
+
+
 def resets_elapsed_dests(spec: Optional[dict]) -> set:
     """The dests of the script's elapsed-RESET triggers (params with `resets_elapsed`, see
     paramkit.Param.resets_elapsed): a counted tune that fires one restarts the script's own clock,

@@ -40,6 +40,7 @@ def test_capabilities_advertised_and_stable():
     assert "task-auto-restart" in cfg.AGENT_CAPABILITIES                   # standalone task auto-restart (Phase 3b)
     assert "paramkit-is-elapsed" in cfg.AGENT_CAPABILITIES                 # is_elapsed param marker (1.32.0)
     assert "paramkit-resets-elapsed" in cfg.AGENT_CAPABILITIES             # resets_elapsed trigger marker (1.33.0)
+    assert "paramkit-clock-origin" in cfg.AGENT_CAPABILITIES               # is_clock_origin marker (1.34.0)
 
 
 def test_agent_info_carries_capabilities():

@@ -1735,11 +1735,32 @@ class SequenceRunner:
         ran_s = (max(0.0, (elapsed_at - launch_at).total_seconds())
                  if (elapsed_at is not None and launch_at is not None) else None)
         ep = _cmdargs.elapsed_param(spec)
+        launch_elapsed = _cmdargs.elapsed_of_args(args, ep) if ep is not None else 0.0
         if ep is not None and clock_at is not None and elapsed_at is not None:
             args = _cmdargs.bake_elapsed(args, ep, max(0.0, (elapsed_at - clock_at).total_seconds()))
             ran_s = None                             # the resume-offset advance below doesn't apply
         elif ep is not None and ran_s is not None:
-            args = _cmdargs.bake_elapsed(args, ep, _cmdargs.elapsed_of_args(args, ep) + ran_s)
+            args = _cmdargs.bake_elapsed(args, ep, launch_elapsed + ran_s)
+        # The ABSOLUTE origin (§14j), which the script prefers over --elapsed so the relaunch lands
+        # EXACTLY on the timeline whatever the launch latency. The schedule's origin is the counted
+        # reset trigger's instant, else the launch instant minus the launch's own elapsed; the
+        # process's own REPORTED origin (txhealth CLOCK marker) is used instead when it belongs to this
+        # launch and no counted trigger lies after it (a fault-SKIPPED trigger never fired in the
+        # process — resync then follows the schedule). replay shifts the origin by the down-time
+        # (`now − fault_at`), exactly as it shifts the rest of the profile.
+        cp = _cmdargs.clock_origin_param(spec)
+        if cp is not None and elapsed_at is not None and launch_at is not None:
+            sched_origin = clock_at if clock_at is not None else (
+                launch_at - timedelta(seconds=launch_elapsed))
+            origin_dt = sched_origin
+            if self._live_record_is_this_launch(run, task, launch_at):
+                reported = self._manager_clock_origin(task)
+                if reported is not None:
+                    rep_dt = datetime.fromtimestamp(reported, tz=timezone.utc)
+                    if clock_at is None or rep_dt >= clock_at - timedelta(seconds=1.0):
+                        origin_dt = rep_dt
+            shift = (now - elapsed_at).total_seconds()      # 0 for resync; the down-time for replay
+            args = _cmdargs.bake_clock_origin(args, cp, origin_dt.timestamp() + max(0.0, shift))
         # The operator-configured resume offset (TaskConfig.resumable): the arg-mode flag is advanced
         # by the time run in place; an env-mode injection rides the synthetic fire's resume_offset_s
         # (re-injected by _fire_step through build_resume_request) — finding R3.
@@ -1795,6 +1816,13 @@ class SequenceRunner:
         # bounds are tight; the slack only covers clock granularity.
         slack = timedelta(seconds=0.1)
         return (launch_at - slack) <= t <= (fault_at + slack)
+
+    def _manager_clock_origin(self, task: str) -> Optional[float]:
+        try:
+            probe = getattr(self._manager, "clock_origin", None)
+            return probe(task) if callable(probe) else None
+        except Exception:                            # noqa: BLE001
+            return None
 
     def _manager_live_applied_at(self, task: str) -> dict:
         try:

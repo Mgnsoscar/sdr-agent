@@ -34,6 +34,7 @@ s = (Script("drift")
      .number("-Duration", "--duration", unit="min", min=0.1, default=10.0)
      .choice("-Drift", "--drift", options=["once", "loop", "pingpong"], default="once", live=True)
      .number("-Elapsed", "--elapsed", unit="s", min=0.0, default=0.0, is_elapsed=True)
+     .number("-Clock-origin", "--clock-origin", unit="s", min=0.0, default=0.0, is_clock_origin=True)
      .number("--bw", min=1, max=40, default=10, live=True)
      .number("--power", min=-120, max=0, default=-50, live=True)
      .choice("--rf", options=["on", "off"], default="off", live=True, is_rf=True)
@@ -70,6 +71,7 @@ def _install(runner, steps, *, T0, now, fault_at, rid="r1", on_air_end=None):
 # The flags the DRIFT_SCRIPT params answer to (either spelling reaches the same dest).
 _FLAGS = {"freq": ("-Start-frequency", "--freq"), "duration": ("-Duration", "--duration"),
           "drift": ("-Drift", "--drift"), "elapsed": ("-Elapsed", "--elapsed"), "bw": ("--bw",),
+          "clock_origin": ("-Clock-origin", "--clock-origin"),
           "power": ("--power",), "rf": ("--rf",), "restart": ("--restart",)}
 
 
@@ -143,7 +145,7 @@ def test_restart_with_no_ramp_reproduces_every_launch_and_tuned_param(tmp_path, 
         out = await runner.restart_run("r1", RestartRequest(mode="replay", restart_at=T._iso(now)))
         a = _argdict(_relaunch_of(out).args)
         expect = dict(_argdict(launch), power="-40")
-        got = {k: v for k, v in a.items() if k != "elapsed"}   # (+ the elapsed the marker adds)
+        got = {k: v for k, v in a.items() if k not in ("elapsed", "clock_origin")}   # (+ what the markers add)
         norm = lambda d: {k: (v if k in ("drift", "rf") else float(v)) for k, v in d.items()}
         assert norm(got) == norm(expect)
     asyncio.run(scenario())
@@ -508,4 +510,114 @@ def test_standalone_relaunch_counts_from_the_last_applied_restart_trigger(tmp_pa
         proc._live_applied, proc._live_applied_at = {"rf": "on"}, {"rf": (now - timedelta(seconds=20)).isoformat()}
         await mgr.relaunch("tx", StartRequest(args=["--freq", "1600", "--rf", "off"], replace_args=True))
         assert abs(float(_argdict(calls[-1].args)["elapsed"]) - 60.0) < 1.0   # no trigger: since the spawn
+    asyncio.run(scenario())
+
+
+# ── the ABSOLUTE clock origin (§14j): exact, whatever the launch latency ────────────────────────
+
+def test_clock_origin_marker_surfaces_and_the_scan_records_the_scripts_report(tmp_path, monkeypatch):
+    spec = extract_params(DRIFT_SCRIPT)
+    by = {p["dest"]: p for p in spec["params"]}
+    assert by["clock_origin"]["is_clock_origin"] is True and by["elapsed"]["is_clock_origin"] is False
+    assert cmdargs.clock_origin_param(spec)["dest"] == "clock_origin"
+    assert cmdargs.bake_clock_origin(["--x", "1"], cmdargs.clock_origin_param(spec), 1758400000.12345) == \
+        ["--x", "1", "-Clock-origin", "1758400000.123"]
+    assert pm._last_clock_origin("noise\nCLOCK origin=1758400000.500\nmore\nCLOCK origin=1758400100.250\n") == 1758400100.25
+    assert pm._last_clock_origin("no marker here") is None
+
+    async def scenario():
+        mgr, _ = _mk(tmp_path, monkeypatch, [])
+        proc = mgr._procs["tx"]
+        proc.state = pm.ProcessState.RUNNING
+        proc._proc = type("P", (), {"returncode": None, "pid": 1})()
+
+        async def read(off, inode):
+            return ("HEALTH state=transmitting\nCLOCK origin=1758400000.500\n", 60, 1)
+        monkeypatch.setattr(proc.log, "read_since", read)
+        await mgr._scan_task_health(proc)
+        assert proc.clock_origin == 1758400000.5 and mgr.clock_origin("tx") == 1758400000.5
+    asyncio.run(scenario())
+
+
+def test_run_restart_bakes_the_reported_origin_resync_exact_replay_shifted(tmp_path, monkeypatch):
+    """The owner's shape (muted pre-roll, `rf on` + `restart` at T0). The process REPORTED its origin
+    when the trigger reset its clock (T0 + a few ms): resync bakes exactly that origin (the launch
+    latency of the relaunch no longer matters — the script computes its own elapsed from it);
+    replay bakes it shifted by the down-time, like the rest of the profile."""
+    mgr, runner = _mk(tmp_path, monkeypatch, ["--freq", "1600", "--power", "-30", "--rf", "off"])
+    now = datetime.now(timezone.utc)
+    T0, run = _preroll_run(runner, now)                     # launch T0−5, trigger at T0, fault T0+30
+    proc = mgr._procs["tx"]
+    proc.started_at = T._iso(T0 - timedelta(seconds=4.5))    # this run's process
+    proc.clock_origin = (T0 + timedelta(milliseconds=40)).timestamp()   # reported by the script
+    spec = runner._spec_of("tx")
+    resync = runner._relaunch_start_fire(run, "tx", now, spec, include_skipped=True, elapsed_at=now)
+    a = _argdict(resync.args)
+    assert abs(float(a["clock_origin"]) - proc.clock_origin) < 0.002          # exact, unshifted
+    assert abs(float(a["elapsed"]) - 130.0) < 0.01                             # still baked as a fallback
+    fault_at = T0 + timedelta(seconds=30)
+    replay = runner._relaunch_start_fire(run, "tx", now, spec, include_skipped=False, elapsed_at=fault_at)
+    downtime = (now - fault_at).total_seconds()
+    assert abs(float(_argdict(replay.args)["clock_origin"]) - (proc.clock_origin + downtime)) < 0.01
+
+
+def test_run_restart_origin_falls_back_to_the_schedule(tmp_path, monkeypatch):
+    """No report (watchdog off / an older script), a foreign process, or a fault-SKIPPED trigger that
+    never fired in the process: the origin is the schedule's — the counted trigger's instant, else
+    the launch instant minus the launch's own elapsed."""
+    mgr, runner = _mk(tmp_path, monkeypatch, ["--freq", "1600", "--power", "-30", "--rf", "off"])
+    now = datetime.now(timezone.utc)
+    T0, run = _preroll_run(runner, now)
+    spec = runner._spec_of("tx")
+    fire = runner._relaunch_start_fire(run, "tx", now, spec, include_skipped=True, elapsed_at=now)
+    assert abs(float(_argdict(fire.args)["clock_origin"]) - T0.timestamp()) < 0.002   # the trigger
+    # the process reported an origin, but a hand start AFTER the fault owns it → schedule
+    proc = mgr._procs["tx"]
+    proc.started_at = T._iso(now - timedelta(seconds=1))
+    proc.clock_origin = (now - timedelta(seconds=1)).timestamp()
+    fire = runner._relaunch_start_fire(run, "tx", now, spec, include_skipped=True, elapsed_at=now)
+    assert abs(float(_argdict(fire.args)["clock_origin"]) - T0.timestamp()) < 0.002
+    # a fault-SKIPPED trigger (never fired): the process's report is the LAUNCH's clock → resync
+    # follows the schedule (the trigger's instant); the launch-only origin = launch − its elapsed
+    mgr2, runner2 = _mk(tmp_path / "s", monkeypatch, ["--freq", "1600", "--power", "-30", "--rf", "off"]) \
+        if (tmp_path / "s").mkdir() is None else (None, None)
+    T0b, run2 = _preroll_run(runner2, now, fault_s=-2, restart_skipped=True, launch_elapsed=500)
+    proc2 = mgr2._procs["tx"]
+    proc2.started_at = T._iso(T0b - timedelta(seconds=4.5))
+    proc2.clock_origin = (T0b - timedelta(seconds=504)).timestamp()      # launch's clock, 500 s in
+    spec2 = runner2._spec_of("tx")
+    resync = runner2._relaunch_start_fire(run2, "tx", now, spec2, include_skipped=True, elapsed_at=now)
+    assert abs(float(_argdict(resync.args)["clock_origin"]) - T0b.timestamp()) < 0.002
+    fault_at = T0b - timedelta(seconds=2)
+    replay = runner2._relaunch_start_fire(run2, "tx", now, spec2, include_skipped=False, elapsed_at=fault_at)
+    downtime = (now - fault_at).total_seconds()
+    assert abs(float(_argdict(replay.args)["clock_origin"]) - (proc2.clock_origin + downtime)) < 0.01
+
+
+def test_standalone_relaunch_bakes_the_reported_origin_else_a_reconstruction(tmp_path, monkeypatch):
+    async def scenario():
+        mgr, runner = _mk(tmp_path, monkeypatch, [], auto_restart_on_fault=True, restart_delay_s=0.0)
+        proc = mgr._procs["tx"]
+        calls = []
+
+        async def fake_start(request=None):
+            calls.append(request)
+        proc.start = fake_start
+        now = datetime.now(timezone.utc)
+        proc.started_at = (now - timedelta(seconds=60)).isoformat()
+        proc.clock_origin = (now - timedelta(seconds=57.3)).timestamp()   # the script's own report
+        req = StartRequest(args=["--freq", "1600", "--rf", "on"], replace_args=True)
+        await mgr.relaunch("tx", req)
+        a = _argdict(calls[-1].args)
+        assert abs(float(a["clock_origin"]) - proc.clock_origin) < 0.002
+        # no report: the spawn minus the launch's own elapsed
+        proc.clock_origin = None
+        await mgr.relaunch("tx", StartRequest(args=["--freq", "1600", "--elapsed", "100"], replace_args=True))
+        a = _argdict(calls[-1].args)
+        assert abs(float(a["clock_origin"]) - (now - timedelta(seconds=160)).timestamp()) < 1.5
+        # no report, a reset trigger applied 20 s ago: the trigger's instant
+        proc._live_applied = {"restart": True}
+        proc._live_applied_at = {"restart": (now - timedelta(seconds=20)).isoformat()}
+        await mgr.relaunch("tx", req)
+        assert abs(float(_argdict(calls[-1].args)["clock_origin"]) - (now - timedelta(seconds=20)).timestamp()) < 1.5
     asyncio.run(scenario())

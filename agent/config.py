@@ -430,7 +430,7 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # two never double-transmit on the single TX channel (an owned-query gates it). Gated by the master
 # kill-switch AUTO_RESTART_ENABLED. Adds capability `task-auto-restart` (the client gates its
 # "Auto-restart on fault" checkbox on it); opt-in per task (default False = today's behaviour).
-AGENT_VERSION = "1.33.0"
+AGENT_VERSION = "1.34.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -583,6 +583,9 @@ AGENT_CAPABILITIES = [
                                          # it RF-faults, IF the task is not owned by an active run (a
                                          # run-owned fault stays the run policy's job). Budget-limited.
                                          # The client gates its "Auto-restart on fault" checkbox on it.
+    "paramkit-clock-origin",             # paramkit Param.is_clock_origin (number(..., is_clock_origin=True)): the
+                                         # script takes/reports the ABSOLUTE instant its timeline began, so a
+                                         # restart lands exactly, whatever the launch latency (1.34.0). Same gate.
     "paramkit-resets-elapsed",           # paramkit Param.resets_elapsed (flag(..., resets_elapsed=True)): a live
                                          # trigger that restarts the script's own clock; the RF-fault restart counts
                                          # the elapsed from its last firing (1.33.0). Same client deploy gate.

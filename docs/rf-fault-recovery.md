@@ -1359,7 +1359,8 @@ capability **`paramkit-is-elapsed`** and the client REFUSES to ship a script who
 carries the marker to a unit without it (`api/script_markers.py` + `AgentClient.upload_script` /
 `deploy_library`, the same shape as the `CAL_*` gates), so the wrong order is refused per unit with the
 reason instead of bricking the drift. (§14i adds a second marker, `resets_elapsed` → capability
-`paramkit-resets-elapsed`, 1.33.0 — the same gate, the same order.) No other client change (the new `--elapsed` renders as an
+`paramkit-resets-elapsed`, 1.33.0, and §14j a third, `is_clock_origin` → `paramkit-clock-origin`, 1.34.0 —
+the same gate, the same order.) No other client change (the new `--elapsed` renders as an
 ordinary launch field, default 0).
 
 ## 14h. Second adversarial review — the §14f fixes + §14g re-reviewed; 30 findings FIXED (`AGENT_VERSION 1.32.0`, capability `paramkit-is-elapsed`; branch `claude/system-familiarization-f5mezz`, cross-repo)
@@ -1501,6 +1502,65 @@ replay 30 s, NOT +5; a launch begun 500 s in and then restarted counts from the 
 trigger counts for resync only; the standalone path counts from the last applied trigger, else the spawn),
 `sdr-scripts/tests/test_cw_drift.py` (schema: exactly one `resets_elapsed` param), the client gate test
 (a script using both markers needs both capabilities). Agent 702 → 707; scripts 114; client 1185.
+
+## 14j. An ABSOLUTE clock origin — `is_clock_origin` (`AGENT_VERSION 1.34.0`, capability `paramkit-clock-origin`; branch `claude/system-familiarization-f5mezz`, cross-repo)
+
+The owner's scenario: the drift starts at T0 via the `--restart` trigger, faults at T0+10 s, and the operator
+presses "Restart and rejoin" at T0+50 s. §14g/§14i put the relaunch at the right point **up to the launch
+latency**: the agent baked `--elapsed = elapsed_at − clock_at` at the instant it DECIDED to relaunch, and the
+script only started its own clock some seconds later (attenuator pre-command, spawn, UHD open, flowgraph
+build — a few seconds on a Pi), so the resumed drift trailed the never-faulted one by exactly that latency.
+The owner asked for it to be exact, and to work in BOTH the scheduled (run-owned) and the independent-task
+(standalone) case. The fix moves the elapsed computation to the one place that knows when the clock really
+starts — the script — and gives it an ABSOLUTE reference instead of a relative one:
+
+- **paramkit** `Param.is_clock_origin` (`number(..., is_clock_origin=True)`, emitted by `to_dict`); extracted
+  by the static `agent/argspec.py` (mirrored byte-identically to `sdr-client/api/argspec.py`). The value is
+  the Unix instant (UTC seconds) the script's own timeline began; 0 = unset. **When set it overrides the
+  relative `is_elapsed` value**: the script computes `elapsed = time.time() − origin` at the moment its clock
+  actually starts, so whatever the launch took is absorbed. `cmdargs.clock_origin_param(spec)` /
+  `bake_clock_origin(args, param, origin_unix)` (ms resolution, via the param's own flags).
+- **The script REPORTS its origin** — `paramkit.txhealth.CLOCK_MARKER = "CLOCK origin="` +
+  `report_clock_origin(origin_unix)` (one flushed line on stdout). `cw_drift_tx.py` prints it once when its
+  clock starts (`time.time() − elapsed0`, so a launch that itself resumed part-way reports the true origin)
+  and AGAIN from the `--restart` handler (the timeline restarted NOW). The agent's watchdog scan
+  (`_scan_task_health`, the same read that catches the HEALTH markers) records the LAST marker into
+  `ManagedProcess.clock_origin` (`_last_clock_origin`; reset on `start()`), exposed as
+  `ProcessManager.clock_origin(task)`. So the agent holds the exact instant the faulted process's clock
+  last (re)started — not its own estimate of it.
+- **Run-owned restart** (`_relaunch_start_fire`, after the elapsed bake): the schedule's origin is the counted
+  reset trigger's instant (`clock_at`) else the counted launch instant minus the launch's own `--elapsed`.
+  The process's REPORTED origin replaces it when the live record belongs to this launch
+  (`_live_record_is_this_launch`) and no counted trigger lies after it (a fault-SKIPPED trigger never fired
+  in the process, so resync follows the schedule there; a reported origin ≥ `clock_at − 1 s` is the trigger's
+  own report and wins). **resync** bakes that origin unchanged — the relaunch lands exactly where the
+  never-faulted drift would be at the moment the script's clock starts, whether the operator pressed the
+  button at T0+50 s or T0+500 s. **replay** shifts the origin by the down-time (`now − fault_at`), exactly as
+  it shifts the rest of the profile, so the drift resumes from the crash point. `--elapsed` is still baked
+  (the fallback for a script whose origin is 0, and what an operator reads in the log).
+- **Standalone relaunch** (`ProcessManager.relaunch`): the reported origin when the process gave one, else
+  the applied reset trigger's instant (`now − _last_reset_applied_at`), else the spawn minus the launch's
+  own elapsed (`now − age_s − launch_elapsed`). Same override rule in the script, so the independent-task
+  case is exact too.
+- **Skew rule**: identical to §14g/§14i — the kwarg crashes an older paramkit at `build_script()`, so the
+  agent advertises **`paramkit-clock-origin`** and the client's marker gate (`api/script_markers.py`)
+  refuses the script to a unit without it (a 1.33.0 unit lacks it). **OTA every unit to 1.34.0 first, then
+  deploy the library.** A hand-set `--clock-origin` is meaningless (leave it 0; `--elapsed` is the manual
+  knob). Clock skew between the unit and anything else does not enter: the origin is written and read on
+  the SAME unit's wall clock.
+- **Limitations**: a script that never reports (no marker) falls back to the agent's reconstruction, which
+  is what §14i delivered (exact to the launch latency); a wall-clock step on the unit between the report
+  and the relaunch moves the resume by that step (NTP slew is fine).
+
+Tests: `tests/test_restart_all_params.py` (+4: the marker through paramkit/argspec/cmdargs and the scan
+recording the script's report, last one wins; a run restart bakes the REPORTED origin — resync exact, replay
+shifted by the down-time; the fallback to the schedule's origin when the record isn't this launch's / the
+trigger was fault-skipped; the standalone relaunch bakes the reported origin, else the reconstruction),
+`tests/test_meta_endpoint.py` (the capability), `sdr-scripts/tests/test_cw_drift.py` (+2: the real `main()`
+with `--clock-origin` 5400 s ago ignores a contradicting `--elapsed`, reports the marker at start and again
+on `--restart` with the restarted origin; 0 = unset), the client gate test (`is_clock_origin` →
+`paramkit-clock-origin`; a script using all three markers needs all three capabilities). Agent 707 → 711;
+scripts 114 → 116; client 1185.
 
 ## 14. Open items
 

@@ -90,7 +90,23 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
-## MERGED TO `main` (all three repos, fast-forward, 1.33.0) — field rollout: OTA every unit's agent FIRST, then deploy the library; rebuild the client bundle from 1.33.0. Nothing in the RF-fault arc has run on real hardware yet (mock scripts + fake gnuradio + the headless unit only).
+## MERGED TO `main` (all three repos, fast-forward, 1.34.0) — field rollout: OTA every unit's agent FIRST, then deploy the library; rebuild the client bundle from 1.34.0. Nothing in the RF-fault arc has run on real hardware yet (mock scripts + fake gnuradio + the headless unit only).
+
+## Current state — an ABSOLUTE clock origin makes the resume EXACT (1.34.0, capability `paramkit-clock-origin`) (branch `claude/system-familiarization-f5mezz`, cross-repo)
+Owner ask: a drift faulting at T0+10 s and restarted-and-rejoined at T0+50 s must land where the never-faulted
+drift would be — exactly, not "minus the launch latency" — in BOTH the scheduled and the independent-task case.
+Record **`docs/rf-fault-recovery.md` §14j**. paramkit `number(..., is_clock_origin=True)` (→ `Param.is_clock_origin`,
+`to_dict`, `agent/argspec.py` — **mirrored to `sdr-client/api/argspec.py`**): the ABSOLUTE Unix instant the script's
+timeline began; when > 0 the script computes `elapsed = time.time() − origin` itself when its clock starts, so the
+launch's seconds never shift it. The script REPORTS its origin (`paramkit.txhealth.CLOCK_MARKER` / `report_clock_origin`,
+once at clock start and again on a reset trigger); the watchdog scan records the last one into
+`ManagedProcess.clock_origin` (`_last_clock_origin`, `ProcessManager.clock_origin(task)`). `cmdargs.clock_origin_param` /
+`bake_clock_origin`. `_relaunch_start_fire` bakes the reported origin when the live record is this launch's and no
+counted trigger lies after it, else the schedule's (`clock_at`, else launch − launch elapsed); resync bakes it
+unchanged (exact), replay shifts it by `now − fault_at`. `ProcessManager.relaunch`: reported → the applied
+trigger's instant → spawn − launch elapsed. `cw_drift_tx.py --clock-origin`. Same skew rule → capability
+`paramkit-clock-origin` + the client marker gate; **OTA to 1.34.0 first, then deploy the library**. Tests:
+`tests/test_restart_all_params.py` (+4). Suite 707 → 711; scripts 116; client 1185.
 
 ## Current state — the elapsed-RESET trigger marker `resets_elapsed` (1.33.0, capability `paramkit-resets-elapsed`) (branch `claude/system-familiarization-f5mezz`, cross-repo)
 Owner workflow: launch cw_drift X s BEFORE on-air with `--rf off`, then AT on-air fire `rf on` + `--restart`

@@ -212,6 +212,13 @@ class Param:
     # elapsed from the last such trigger, not from the launch — the normal shape is a muted pre-roll
     # launch and, AT on-air, `rf on` + this trigger. See docs/rf-fault-recovery.md §14i.
     resets_elapsed: bool = False
+    # NUMBER only: the ABSOLUTE wall-clock instant (Unix seconds, UTC) the script's own timeline
+    # began; 0 = unset. When set it OVERRIDES the relative `is_elapsed` value: the script computes
+    # `elapsed = time.time() − origin` at the moment its clock actually starts, so a relaunch lands on
+    # the never-faulted position regardless of launch latency (attenuator pre-command, spawn, UHD
+    # open, flowgraph build). The script reports its origin back on stdout (txhealth.CLOCK_MARKER)
+    # whenever its clock (re)starts, so the agent bakes the exact value. See rf-fault-recovery.md §14j.
+    is_clock_origin: bool = False
 
     @property
     def display_name(self) -> str:
@@ -245,6 +252,7 @@ class Param:
             "is_rf": self.is_rf,
             "is_elapsed": self.is_elapsed,
             "resets_elapsed": self.resets_elapsed,
+            "is_clock_origin": self.is_clock_origin,
         }
 
 
@@ -371,7 +379,7 @@ class Script:
                default: Optional[float] = None, required: bool = False,
                multiple: bool = False, live: bool = False,
                show_when: Optional[Dict[str, Any]] = None,
-               is_elapsed: bool = False) -> "Script":
+               is_elapsed: bool = False, is_clock_origin: bool = False) -> "Script":
         """A floating-point parameter with optional unit, range, and named presets.
 
         Pass live=True to mark it tunable while the script runs — a GUI can then
@@ -385,7 +393,7 @@ class Script:
             name=n, flags=flags, kind=NUMBER, help=help, unit=unit, min=min, max=max,
             step=step, presets=_normalise_presets(presets), default=default,
             required=required, multiple=multiple, live=live, show_when=show_when,
-            is_elapsed=is_elapsed,
+            is_elapsed=is_elapsed, is_clock_origin=is_clock_origin,
         ))
 
     def integer(self, *flags: str, name: Optional[str] = None, help: str = "",
