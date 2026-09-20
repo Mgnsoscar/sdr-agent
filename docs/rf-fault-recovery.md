@@ -1023,9 +1023,11 @@ The fast-warm IQ cache (§8) stays deferred. `argspec`/`ramp` untouched (drift g
   aborts a pending relaunch — so an operator stopping the faulted task wins, while the auto-drop that
   frees the channel does NOT cancel its own recovery.
 - **Owned-query wiring.** `ProcessManager.set_owned_query(query)` (applied to every current + future proc,
-  mirroring `set_fault_hook`); `main.py` lifespan wires it to `SequenceRunner.owned_task_names` (a public,
-  no-await accessor over `_tasks_owned_by_active_runs`). `shutdown()` cancels any pending relaunch so a
-  faulted task can't launch a fresh process mid-teardown.
+  mirroring `set_fault_hook`); `main.py` lifespan wires it to **`SequenceRunner.tasks_claimed_by_active_runs`**
+  (a public, no-await accessor: the tasks active runs DRIVE, plus every not-yet-fired launch they will still
+  perform — broader than `_tasks_owned_by_active_runs`; the review's §14f corrected this line, which named a
+  method that never existed). `shutdown()` cancels any pending relaunch so a faulted task can't launch a
+  fresh process mid-teardown (both detection paths since §14f).
 - **Persistence.** `_spec_to_entry` now emits `auto_restart_on_fault` (and `max_fault_restarts` when
   non-default) so the flag survives the `tasks.yaml` write → `load_tasks()` reload — the primary authoring
   path (a review HIGH: without it the client's saved checkbox reverted and the task never auto-restarted).
@@ -1109,6 +1111,159 @@ by measurement):** the "fast-warm" §8 shipped as an IN-PLACE ~2.3× speed-up of
 generator (`sdr-scripts` `gps_l2c_tx.py` `--loop full`), not a disk cache — L1C / L2C-cm measured ~0.3-0.5 s,
 so a cache was pointless; see §8's BUILT note. **Phase 3b (and the RF-fault recovery arc P0–P3b) is now
 complete.**
+
+## 14f. Adversarial review of P0–P3b — 31 findings FIXED (`AGENT_VERSION 1.31.1`, no capability; branch `claude/system-familiarization-f5mezz`, cross-repo)
+
+**Method.** Eleven review dimensions (P0 · P1 · P2 reconstruction · P2 guards · P3 · P3b · asyncio concurrency ·
+RF-emission safety · client/contract skew · cross-repo consistency + tests · DSP), one reviewer agent each →
+41 raw findings → 32 unique (7 defects found independently by 2–4 dimensions; the abort-vs-restart race by four)
+→ each adversarially verified by independent skeptics instructed to default to refuted (HIGH: a code-walk **and**
+a reproduction agent that wrote and ran a pytest against the real runner/manager) → **30 confirmed, 2 refuted**
+(#26 D-state consequence doesn't follow; #29 trigger unreachable) → a synthesis pass re-checked every fix against
+the code and the tests → a completeness critic named what the dimension split couldn't see, one of which (#33)
+was confirmed by hand. Full record: the review report + `findings.json` kept with the session. Every fix is
+pinned by `tests/test_review_fixes.py` (30 tests; the five HIGH ones are the verifiers' reproductions inverted,
+over real subprocesses), plus the scripts/client tests named below. Agent suite 626 → 656; client 1166 → 1179;
+scripts 106 → 110.
+
+**The headline correction — the P0 GR pin was inert (#1, HIGH).** Verified against the upstream sources
+(maint-3.8 + maint-3.10 `gnuradio-runtime/lib/vmcircbuf.cc`, `vmcircbuf_prefs.cc`, `sys_paths.cc`): GR selects
+the backend by reading a per-key **pref FILE** named `vmcircbuf_default_factory` whose content is a factory
+NAME (`gr::vmcircbuf_mmap_shm_open_factory`) — 3.8 at `$HOME/.gnuradio/prefs/`, 3.10 under `userconf()` =
+`$GR_PREFS_PATH` | `$XDG_CONFIG_HOME/gnuradio` | `$HOME/.config/gnuradio` (| the legacy `$HOME/.gnuradio`).
+That code never consults the `GR_CONF_<SECTION>_<OPTION>` env override (it exists only in `gr::prefs`) and is
+NOT governed by `GR_DONT_LOAD_PREFS` — §3.6's "verify against the deployed version" was never done, and
+§14a/CLAUDE.md asserted the env var as "the only pin GR reads". With no valid file GR probes createfilemapping →
+**sysv_shm** → mmap_shm_open → mmap_tmpfile and persists the first that works — on Linux `sysv_shm`, the leaky
+suspect — so every unit ran the incident configuration while the P1 snapshot and the client dialog reported the
+inert env value as the effective backend and skipped `ipcs`. **Fix:** `process_manager._launch_env_pins` now
+writes the pref file (idempotently, per launch) at BOTH locations under the pinned task HOME via
+`_pin_gr_vmcircbuf_pref` and pins `GR_PREFS_PATH=<HOME>/.config/gnuradio` so 3.10 is deterministic regardless
+of an ambient `XDG_CONFIG_HOME`; `system.capture_fault_snapshot` reads that file back
+(`_read_vmcircbuf_pref`, from the task's `/proc/<pid>/environ` HOME/GR_PREFS_PATH, else the configured HOME)
+into a new **`FaultSnapshot.vmcircbuf_backend_pref`** (the EFFECTIVE backend; a missing file adds the note
+"no vmcircbuf pref file — GR chose its own backend" and triggers the `ipcs -m` capture); the client dialog keys
+on it. The `GR_CONF_*` env var stays exported as documentation. **Rollout consequence:** the pin is now AGENT
+code, so it reaches field units by the OTA "Update agent…" push — no re-provision needed for the backend fix
+(the service-unit env var is inert and harmless either way).
+
+**RF left on (cardinal sin 2).**
+- **#33 (HIGH, critic's gap, confirmed by hand)** PANIC did not abort a pending standalone relaunch: a faulted
+  task reads `crashed` (exit path, sleeping its settle delay inside `_watch`) or `stopped` (wedge path, detached
+  `_relaunch_task`), and `recovery.panic_stop` only stopped `running`/`starting` — the task came back on air
+  AFTER panic, with every run already aborted so nothing would stop it. → new
+  **`ProcessManager.cancel_pending_relaunches()`** (sets every proc's operator-stop flag, cancels a pending
+  `_relaunch_task`, cancels a CRASHED watcher that is in its delay), called by `panic_stop` right after the
+  run/event aborts and by `shutdown()`.
+- **#6 (HIGH, four dimensions)** abort racing a restart relaunch: `_abort_run` stopped only `is_running()` tasks
+  and flipped ABORTED *after* the loop, so a relaunch fire the tick had already collected came up RF-on in an
+  ABORTED run whose STOP never fires. → `_abort_run` leaves the active states FIRST (under the lock), stops
+  everything **`is_live`** (RUNNING, STARTING, or the OS process still alive) with a second sweep, and
+  `_fire_step` (a) re-checks the run under the lock before stamping/acting and (b) stops a launch that
+  completed into an already-dead run (the abort can land while the launch is parked in the attenuator
+  pre-command — the case no sweep can see).
+- **#10** `stop()` during STARTING was lost (no process to signal → `_cleanup` + "success", then `start()`
+  resumed into RUNNING with the log closed and the socket unlinked). → a `_spawned` event: `stop()` waits for
+  the spawn (bounded 30 s) and `start()` kills the child it just spawned when it sees `_stop_requested`, raising
+  "stopped during its launch".
+- **#12** `shutdown()` cancelled only the wedge-path `_relaunch_task`; the exit-path relaunch slept inside the
+  CRASHED task's `_watch` and spawned into the teardown. → a manager `_shutdown_flag` set FIRST, checked after
+  every restart/settle sleep; `cancel_pending_relaunches()`; STARTING procs stopped too.
+- **#11** an operator Stop during the relaunch's ≤ 5 s attenuator pre-command was a no-op (and `proc.start()`
+  then cleared the flag). → `stop(operator=True)` cancels a pending `_relaunch_task`; `ProcessManager.start`
+  re-checks the operator-stop / shutdown flags AFTER `_gate_precommand` for an auto-restart source.
+
+**Wrong level / hot relaunch (cardinal sin 3).**
+- **#2 (HIGH)** the standalone relaunch used `_last_request` verbatim — a task the operator live-tuned to
+  `rf off` / −100 dBm came back RF-on at the launch level. → `ProcessManager.set_params` records every applied
+  value in `proc._live_applied` (cleared on start); `relaunch()` bakes them onto the launch args by the argspec
+  flags (`agent/cmdargs.overlay_live_params`, the gate via its own flags) and STANDS DOWN (logged) if the task
+  was tuned but the argspec is unreadable — never a hot guess.
+- **#5 (HIGH)** `hold_now` and `on_task_fault` stamped the SAME `"skipped"` sentinel, so a resync restart counted
+  the fast-forward-skipped up-ramp points as the schedule's level and relaunched at the ramp TOP the operator
+  skipped past (reproduced: −30 relaunched over −70 on air). → `hold_now` stamps **`"skipped:hold"`**;
+  `_counts_at_cutoff` counts only the fault sentinel `"skipped"` (and only for resync); `_live_tasks_of` treats
+  both as not-a-launch; the restart plan never re-instates a hold-skipped fire.
+- **#4 (HIGH)** a re-instated tune landing before the relaunched script bound its control socket (every real
+  generator binds AFTER its IQ build — seconds on a Pi) was fired into nothing and marked fired: a down-ramp held
+  the higher level for a dwell, a lost RF-on left a "recovered" run muted while the healthy-settle zeroed the
+  budget. → `_fire_step` **DEFERS** a tune (leaves it un-fired for the next tick) while
+  `ProcessManager.tune_ready` says the socket is absent and the task is younger than
+  `CTRL_BIND_GRACE_S` (30 s, config); replayed fires are floored to `now + 1 ms` so none sort before the
+  synthetic START; the auto trigger passes a FRESH `restart_at` instead of the tick's stale `now`.
+- **#18** with `spec=None` the RF gate and a tuned bridge param had no fallback: a muted-pre-roll launch
+  relaunched `--rf off` mid-transmission (recovered-but-silent, budget reset). → `_relaunch_start_fire` raises
+  **`_RestartDeferred`** when the schema is unreadable AND the run tuned a dest without a spec-independent
+  fallback; the auto trigger stands down for the tick (no trip, retry next), a manual POST maps to 409.
+- **#16** the pre-stop ran BEFORE the guards that can refuse, so a refused Restart killed a task the operator had
+  restarted by hand. → `restart_run` dry-runs the plan, the guards and the reconstruction in the FIRST lock
+  (`_plan_restart`), refuses a task started by hand after the fault (`_started_after`) instead of pre-stopping
+  it, and re-plans at commit as the backstop.
+- **#15** a never-restarted faulted run "owned" its dead task forever, so arm guard A0 exempted a HAND-started
+  instance. → `_tasks_owned_by_active_runs` excludes `run.fault_task` while faulted; the owned-query
+  (`tasks_claimed_by_active_runs`) still claims it explicitly, so the standalone path stands down.
+
+**Recovery that never happens / undetected (cardinal sin 4).**
+- **#3 (HIGH)** `apply_sequences` (PUT /library, the client's only library→unit path) rebuilt
+  `Sequence(id,name,description,steps)`, dropping `recovery_policy`/`recovery_mode` — the overnight schedule armed
+  `manual` while the operator authored `auto`. → `seq.model_copy(deep=True)`. Client **#21**: the library drift
+  fingerprints ignored the policy and the auto-restart flag, so a policy-only change never showed as drift
+  (`state/library_sync.py` + `tests/test_library_sync_policy.py`, 12 tests). **#24** the agent `PlanItem` lacked
+  the recovery fields the client's carries → mirrored.
+- **#13 / #14** (one root cause) `_scan_task_health` decided "faulted", awaited the slow `_flag_rf_fault`, then
+  `stop()`ed whatever the proc held by then: an exited process (Layer 1) → `stop()`'s CRASHED branch cancelled
+  the exit-path `_watch` mid-`_flag_rf_fault` (alarm + run coupling lost — a silent, unrecovered fault); an
+  already-relaunched task → the healthy relaunch SIGTERMed and relaunched again (two budget slots per fault).
+  → the scan captures the process before the read and **returns if it is no longer the RUNNING one** (before
+  the flag and again before the stop: `_scan_stale`); `stop()` cancels a CRASHED watcher only while it is in
+  a restart/settle DELAY (`_in_restart_delay`), never mid-exit-handling.
+- **#7 (scripts)** all 30 adopters tore down with `finally: ctrl.close(); tb.stop(); tb.wait()` WITHOUT setting
+  `stop`, so ANY Python exception in the loop read as an RF fault (false marker; crash-restart bypassed; an
+  auto run burned its budget relaunching a deterministic traceback). → `stop.set()` first in every adopter's
+  teardown; `tests/test_txhealth_adoption.py` pins it statically for all 30 and behaviourally on `cw_tx.py`.
+- **#17** `has_future_stop` scanned only the fault-SKIPPED plan, so a fault taken while HOLDING then Proceed
+  (an un-skipped future STOP) was refused forever and tripped the auto breaker. → an un-fired future STOP in
+  `run.steps` counts too. **#31** `_service_holds` counted fault-skipped fires as window-A done and parked a
+  faulted run into HOLDING (unrestartable) → requires `not run.fault`.
+
+**Runaway recovery.**
+- **#19** `_task_healthy` was true from spawn, so a slow generator faulting at the end of a warm-up ≥ the settle
+  window had its counter zeroed every cycle — an unbounded relaunch loop with the radio silent (the incident's
+  own fault class). → `paramkit.txhealth.watch_flowgraph` prints **`HEALTH state=transmitting`** when called
+  (right after `tb.start()` in every adopter); the watchdog stamps `proc.transmitting_at` on it;
+  `ProcessManager.task_transmitting_confirmed` requires it for a script whose source uses `watch_flowgraph`
+  (`expects_tx_marker`, read off the script once) and keeps the running-and-OK rule for scripts without it
+  (FIFO stagers, mocks, x410); `_task_healthy` consults it.
+- **#20** with `AUTO_RESTART_BUDGET=0` a REFUSED restart was retried every tick forever (pre-stop each time). →
+  a tripped run (`_auto_gaveup`) is never re-selected.
+- **#28** a task claimed ONLY by a not-yet-fired launch got no recovery from either side. → the standalone path
+  now distinguishes a DRIVEN claim (stand down: the run's policy owns it) from a PENDING one
+  (`SequenceRunner.tasks_pending_launch_by_active_runs`, wired via `set_pending_query`) and waits the latter out
+  (`_wait_out_run_claim`, bounded by `restart_window_s`). **#27** the owned-query now also counts a HOLDING
+  run's deferred window-B start/run definitions.
+
+**Operability / config / docs.** **#9** the boot pre-image's single pre-check let a task launched during the
+≤ 55 s probe collide on the SDR → `ProcessManager.device_free` (an Event) is cleared around the probe and
+awaited by `start`/`run_oneshot`. **#8** `PREIMAGE_TIMEOUT_S <= 0` now disables the pre-image (it spawned and
+SIGKILLed the probe). **#25** `HEALTH_POLL_S <= 0` now disables the watchdog (it spun). **#23** `uhd.log` is
+rotated per run (`LogManager.rotate_uhd` → `uhd_<ts>.log`) and pruned with the run logs. **#30** the
+reconstruction mirrors `_build_command` for `replace_args=True, args=[]` (the configured `--power` survived).
+**#22 (scripts)** `_circular_convolve`'s unreachable `m >= n` branch refuses loudly instead of truncating the FIR.
+**#32** §14e named a non-existent `owned_task_names` (corrected above). Shared arg helpers moved to
+`agent/cmdargs.py` (the `SequenceRunner` statics delegate).
+
+**Refuted, for the record.** #26 (the watchdog blocking on a D-state process leaves later wedges undetected):
+with one radio per unit no later task can wedge until the same USB reset frees the device. #29 (the stale `now`
+across a ≤ 10 s pre-stop): the trigger — a manual Restart finding the faulted process still RUNNING — is
+unreachable, since the fault is stamped inside `_flag_rf_fault` and the auto-drop holds the process in STOPPING
+before any restart can see it (and `restart_run` refuses over a live process anyway).
+
+**Still open from the critic (not fixed here, by design or scope):** the x410 tree is outside the entire
+detection stack (its engine's stdout is not the channel task's log — a scope note, RPi-only detection);
+`_reconcile_on_startup` aborts an active `auto` run on an agent restart/OTA update with no morning-after alarm
+(documented Phase-1 fail-safe); `HEALTH_FAULT_PATTERNS` substring precision (`"vmcircbuf"` matches any mention;
+a false hit auto-drops a healthy transmitter — no false hit exists in today's scripts); wall-clock steps vs
+`restart_at`/replay shift on an RTC-less Pi; a systematic "0 = disable" sweep of the remaining knobs.
 
 ## 14. Open items
 

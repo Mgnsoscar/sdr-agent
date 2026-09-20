@@ -382,6 +382,28 @@ def _tail_file(path, n: int) -> list:
         return []
 
 
+def _read_vmcircbuf_pref(home: str, gr_prefs_path: str = "") -> str:
+    """The backend GR ACTUALLY selects: the content of its `vmcircbuf_default_factory` pref file —
+    3.10 reads userconf()/prefs/ (userconf = $GR_PREFS_PATH | $HOME/.config/gnuradio | the legacy
+    $HOME/.gnuradio), 3.8 reads $HOME/.gnuradio/prefs/. Returns the first non-empty one found, else
+    "" (GR then probes and persists the first working factory — sysv_shm on Linux)."""
+    from . import config as cfg
+    candidates = []
+    if gr_prefs_path:
+        candidates.append(Path(gr_prefs_path) / "prefs" / cfg.GR_VMCIRCBUF_PREF_KEY)
+    if home:
+        candidates.append(Path(home) / ".config" / "gnuradio" / "prefs" / cfg.GR_VMCIRCBUF_PREF_KEY)
+        candidates.append(Path(home) / ".gnuradio" / "prefs" / cfg.GR_VMCIRCBUF_PREF_KEY)
+    for p in candidates:
+        try:
+            val = p.read_text(errors="replace").strip()
+        except OSError:
+            continue
+        if val:
+            return val
+    return ""
+
+
 def _gnuradio_default_factory() -> str:
     """The COMPILED-in vmcircbuf default from `gnuradio-config-info --prefs` ([vmcircbuf]
     default_factory) — what GR uses under GR_DONT_LOAD_PREFS=1 when no GR_CONF_* env pin is set.
@@ -456,6 +478,8 @@ def capture_fault_snapshot(pid: Optional[int], uhd_log_path=None, task_dir=None,
             env = proc.environ()
             snap.vmcircbuf_backend_env = env.get(cfg.GR_VMCIRCBUF_ENV, "")
             snap.task_home = env.get("HOME", "")
+            snap.vmcircbuf_backend_pref = _read_vmcircbuf_pref(
+                snap.task_home, env.get(cfg.GR_PREFS_PATH_ENV, ""))
         except Exception:      # noqa: BLE001 — AccessDenied / Zombie
             notes.append("task env unreadable")
 
@@ -466,11 +490,17 @@ def capture_fault_snapshot(pid: Optional[int], uhd_log_path=None, task_dir=None,
         notes.append("backend from config, not live env")
     if not snap.task_home:
         snap.task_home = str(cfg.TASK_HOME)
+    if not snap.vmcircbuf_backend_pref:
+        # The pref file GR reads (review fix #1) — from the pinned task HOME when the live env was
+        # unreadable. Blank = GR probed for itself (sysv_shm first on Linux) — treat as SysV-suspect.
+        snap.vmcircbuf_backend_pref = _read_vmcircbuf_pref(snap.task_home)
+        if not snap.vmcircbuf_backend_pref:
+            notes.append("no vmcircbuf pref file — GR chose its own backend (sysv_shm first on Linux)")
 
     snap.vmcircbuf_backend_compiled = _gnuradio_default_factory()
 
-    backends = (snap.vmcircbuf_backend_env + " " + snap.vmcircbuf_backend_compiled).lower()
-    if "sysv" in backends:
+    backends = (snap.vmcircbuf_backend_pref + " " + snap.vmcircbuf_backend_compiled).lower()
+    if "sysv" in backends or not snap.vmcircbuf_backend_pref:
         snap.ipcs_summary = _ipcs_summary()
 
     if uhd_log_path:

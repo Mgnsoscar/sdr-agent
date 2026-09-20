@@ -327,8 +327,11 @@ def test_hold_now_fast_forwards_to_the_hold(tmp_path, monkeypatch):
             assert held.held_actual is not None
             assert held.on_air_end is None and held.open_ended is True
             # The un-fired window-A tune (55) is skipped (never fires); START/41 kept their times.
-            skipped = [s for s in held.steps if s.fired_actual == "skipped"]
+            # hold_now stamps its OWN sentinel ("skipped:hold" — never the fault sentinel "skipped"),
+            # so a later resync restart never counts a fast-forwarded point as the schedule's level.
+            skipped = [s for s in held.steps if s.fired_actual == "skipped:hold"]
             assert len(skipped) == 1 and skipped[0].params.get("gain") == 55
+            assert not [s for s in held.steps if s.fired_actual == "skipped"]
             assert not any(s.anchor == "hold" for s in held.steps)     # window B still deferred
             assert len(held.window_b_steps) == 3                        # 2 hold tunes + the stop
 

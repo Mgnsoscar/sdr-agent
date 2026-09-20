@@ -106,9 +106,10 @@ Environment=SDR_AGENT_BASE=$LINK
 Environment=SDR_STATE_DIR=$SHARED
 Environment=SDR_UNIT_ID=$UNIT_ID
 Environment=SDR_MDNS_EXCLUDE_IFACES=int0
-# RF-fault prevention (docs/rf-fault-recovery.md): belt-and-suspenders GR vmcircbuf backend pin
-# (the agent also pins it per task) — GR_DONT_LOAD_PREFS=1 in the scripts means this GR_CONF_*
-# launch-env override is the only backend pin GR reads. HOME=/root is set above.
+# RF-fault prevention (docs/rf-fault-recovery.md §14f): the agent pins the GR vmcircbuf backend per
+# task launch by writing GR's `vmcircbuf_default_factory` pref FILE under the task HOME — the only
+# thing GR's vmcircbuf code reads. This GR_CONF_* env var is documentation only (GR never consults
+# it); kept so a reader sees the intent. HOME=/root is set above.
 Environment=GR_CONF_VMCIRCBUF_DEFAULT_FACTORY=mmap_shm_open
 ${SDR_API_KEY:+Environment=SDR_API_KEY=$SDR_API_KEY}
 ExecStart=$PYBIN -m uvicorn agent.main:app --host 0.0.0.0 --port $PORT

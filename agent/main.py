@@ -158,6 +158,7 @@ async def lifespan(app: FastAPI):
     # a task a run currently owns or is about to launch (that fault is the run policy's to recover — no
     # double-transmit); the launch hook relaunches through the full path (repositions the attenuator).
     _manager.set_owned_query(_runner.tasks_claimed_by_active_runs)
+    _manager.set_pending_query(_runner.tasks_pending_launch_by_active_runs)
     _manager.set_launch_hook(_manager.relaunch)
 
     await _manager.startup()
@@ -687,12 +688,18 @@ async def _preimage_when_idle() -> None:
         uninterruptible D-state (a bad USB SDR) and its reaping thread blocks, THIS coroutine still
         returns — the agent keeps running and the first task just pays the image load if still cold.
     A no-op when no radio is on PATH (dev / CI / mock), so those units are unaffected."""
-    if not cfg.PREIMAGE_ON_BOOT:
-        return
+    if not cfg.PREIMAGE_ON_BOOT or cfg.PREIMAGE_TIMEOUT_S <= 0:
+        return                          # a zero timeout is a disable too (review fix #8)
+    gate = getattr(_manager, "device_free", None)
     try:
         if _manager is not None and any(_manager.is_running(n) for n in _manager.task_names()):
             logger.info("Boot SDR pre-image skipped: a task already holds the device")
             return
+        # Hold the manager's device gate while the probe owns the SDR: a task launched meanwhile
+        # WAITS for it instead of colliding on the device and failing at start (review fix #9).
+        # Bounded by the same hard timeout; the finally always releases it.
+        if gate is not None:
+            gate.clear()
         result = await asyncio.wait_for(
             sysmon.pre_image_sdr(cfg.PREIMAGE_TIMEOUT_S),
             timeout=cfg.PREIMAGE_TIMEOUT_S + 10,
@@ -703,6 +710,9 @@ async def _preimage_when_idle() -> None:
                        "first task will pay the image load if the device is still cold.")
     except Exception as exc:            # noqa: BLE001 — best-effort; never disturb a running agent
         logger.warning("Boot SDR pre-image failed: %s", exc)
+    finally:
+        if gate is not None:
+            gate.set()
 
 
 @app.post("/scripts/upload", tags=["scripts"], dependencies=[Depends(verify_key)])

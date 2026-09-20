@@ -430,7 +430,7 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # two never double-transmit on the single TX channel (an owned-query gates it). Gated by the master
 # kill-switch AUTO_RESTART_ENABLED. Adds capability `task-auto-restart` (the client gates its
 # "Auto-restart on fault" checkbox on it); opt-in per task (default False = today's behaviour).
-AGENT_VERSION = "1.31.0"
+AGENT_VERSION = "1.31.1"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -611,16 +611,22 @@ def _env_flag(name: str, default: bool) -> bool:
 # lands somewhere writable. Override with SDR_TASK_HOME (empty → don't pin, inherit ambient HOME).
 TASK_HOME = os.environ.get("SDR_TASK_HOME", str(STATE_DIR))
 
-# Pin the GNU Radio vmcircbuf backend via GR's config-override env var. The scripts set
-# GR_DONT_LOAD_PREFS=1 (a repo-wide os.environ.setdefault, for a faster startup), so GR never
-# reads ~/.gnuradio/prefs — a prefs-file pin is IGNORED; it MUST be this launch-env override.
-# `mmap_shm_open` is GR's standard, self-unlinking (self-cleaning on death) default: pinning it
-# makes the backend deterministic and skips the startup probe, and it is a no-op-or-better on a
-# correctly-configured box. VERIFY-FIRST: the exact override var NAME can differ by GR version
-# (§14) — an unknown var name is a harmless no-op. Set SDR_GR_VMCIRCBUF_FACTORY="" to omit the
-# pin entirely (e.g. once gnuradio-config-info confirms a different scheme).
+# Pin the GNU Radio vmcircbuf backend. VERIFIED against the upstream sources (maint-3.8 + maint-3.10,
+# gnuradio-runtime/lib/vmcircbuf.cc + vmcircbuf_prefs.cc): GR selects the backend by reading a
+# per-key PREF FILE named `vmcircbuf_default_factory` whose content is a factory NAME — on 3.8 at
+# `$HOME/.gnuradio/prefs/`, on 3.10 under userconf() = `$GR_PREFS_PATH` | `$XDG_CONFIG_HOME/gnuradio`
+# | `$HOME/.config/gnuradio` (| the legacy `$HOME/.gnuradio`). That code path never consults the
+# `GR_CONF_<SECTION>_<OPTION>` env override (that exists only in gr::prefs) and is NOT affected by
+# GR_DONT_LOAD_PREFS. With no (valid) file GR probes createfilemapping → sysv_shm → mmap_shm_open →
+# mmap_tmpfile and PERSISTS the first that works — on Linux `sysv_shm`, the leaky suspect. So the
+# agent writes that pref file (both locations, under the pinned task HOME) before every launch and
+# pins GR_PREFS_PATH so 3.10 is deterministic regardless of an ambient XDG_CONFIG_HOME (review fix
+# #1 — the earlier env-var-only pin was inert). The GR_CONF_* var is still exported, harmlessly, as
+# documentation. Set SDR_GR_VMCIRCBUF_FACTORY="" to omit the pin entirely.
 GR_VMCIRCBUF_ENV     = "GR_CONF_VMCIRCBUF_DEFAULT_FACTORY"
 GR_VMCIRCBUF_FACTORY = os.environ.get("SDR_GR_VMCIRCBUF_FACTORY", "mmap_shm_open")
+GR_VMCIRCBUF_PREF_KEY = "vmcircbuf_default_factory"     # the pref FILE name GR reads (both versions)
+GR_PREFS_PATH_ENV    = "GR_PREFS_PATH"
 
 # Route UHD's log to a FILE (per task, next to current.log) at a useful level, WITHOUT touching
 # the scripts' UHD_LOG_CONSOLE_LEVEL=off — so the FPGA image-load line, UHD init warnings and any
@@ -638,6 +644,9 @@ SHM_SWEEP_ENABLED = _env_flag("SDR_SHM_SWEEP", True)
 # Pre-image the SDR at boot: open the device with `uhd_usrp_probe` (which loads the FPGA image)
 # while no task holds it, so the first real task warms up fast/predictably instead of paying the
 # one-time image load at on-air (the "started after on-air" miss). A no-op with no radio on PATH.
+# PREIMAGE_TIMEOUT_S <= 0 ALSO disables the pre-image (review fix #8: it used to spawn the probe and
+# SIGKILL it at 0 s). While the probe holds the SDR the manager's device_free gate makes a task launch
+# WAIT for it (bounded by the timeout + 10 s) instead of colliding on the device (review fix #9).
 PREIMAGE_ON_BOOT   = _env_flag("SDR_PREIMAGE_ON_BOOT", True)
 PREIMAGE_TIMEOUT_S = float(os.environ.get("SDR_PREIMAGE_TIMEOUT_S", "45"))
 
@@ -645,8 +654,15 @@ PREIMAGE_TIMEOUT_S = float(os.environ.get("SDR_PREIMAGE_TIMEOUT_S", "45"))
 # ── RF-fault DETECTION (Phase 1, docs/rf-fault-recovery.md §5.2) ───────────────
 # The agent health watchdog log-scans each running task's NEW log bytes on this cadence for a fault
 # signature and, when a task an active run owns goes dead-but-alive, flips its health to rf_fault.
+# SDR_HEALTH_POLL_S <= 0 disables the watchdog too (review fix #25: it used to spin a hot loop).
 HEALTH_WATCH_ENABLED = _env_flag("SDR_HEALTH_WATCH", True)
 HEALTH_POLL_S        = float(os.environ.get("SDR_HEALTH_POLL_S", "2.0"))
+
+# A relaunched script binds its live-parameter control socket only AFTER its IQ build (seconds on a
+# Pi). A sequence TUNE due inside that window is DEFERRED to a later tick until the socket exists,
+# for up to this grace after the task's spawn, instead of being fired into nothing and silently lost
+# (review fix #4: a lost RF-on / ramp point left a 'recovered' run muted or at the wrong level).
+CTRL_BIND_GRACE_S    = float(os.environ.get("SDR_CTRL_BIND_GRACE_S", "30.0"))
 
 # Curated fault signatures the log-scan matches (case-insensitive, substring). The authoritative one
 # is the Layer-1 done-watcher marker (paramkit.txhealth.FAULT_MARKER) — a script emits it the instant

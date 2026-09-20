@@ -8,7 +8,7 @@ sets stop, and flags .faulted so main() returns non-zero (the agent's crash pipe
 import io
 import threading
 
-from paramkit.txhealth import watch_flowgraph, FAULT_MARKER
+from paramkit.txhealth import TRANSMITTING_MARKER, watch_flowgraph, FAULT_MARKER
 from agent import config as cfg
 
 
@@ -47,7 +47,8 @@ def test_intentional_stop_is_not_a_fault():
     tb.release()                      # then the graph tears down
     w.join(timeout=5)
     assert w.faulted is False
-    assert out.getvalue() == ""       # no marker on a clean stop
+    assert FAULT_MARKER not in out.getvalue()     # no FAULT marker on a clean stop
+    assert out.getvalue().strip() == TRANSMITTING_MARKER   # only the flowgraph-up report
 
 
 def test_marker_matches_the_agent_pattern_list():

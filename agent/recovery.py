@@ -69,6 +69,14 @@ async def panic_stop(
     # 2. Cancel/stop scheduled events
     events_cancelled = await scheduler.cancel_all_active(reason="panic stop")
 
+    # 2b. Cancel every PENDING standalone auto-restart-on-fault relaunch (a faulted task sleeping its
+    #     settle delay reads 'crashed'/'stopped', not 'running', so the loop below never stop()s it —
+    #     and its relaunch would put the radio back on air AFTER the panic; review fix #33).
+    try:
+        manager.cancel_pending_relaunches()
+    except Exception as exc:
+        logger.error("Panic: failed to cancel pending relaunches: %s", exc)
+
     # 3. Stop any tasks still running OR mid-launch (manual starts, or anything left
     #    over). "starting" is included so a task caught in its launch window during a
     #    panic can't slip through and go on air a moment later.

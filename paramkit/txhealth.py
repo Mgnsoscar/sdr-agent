@@ -33,6 +33,12 @@ import threading
 # keep them in step (a test pins the agreement). flush=True because tasks run with GR/UHD console
 # logging suppressed and a buffered marker could be swallowed before the crash tail reads it.
 FAULT_MARKER = "HEALTH state=faulted"
+# Printed ONCE when watch_flowgraph is called (i.e. right after tb.start()): the flowgraph is up and
+# the radio is (or is about to be) on air. The agent stamps the task's `transmitting_at` on it, so a
+# recovery breaker's "healthy for N s" settle clock starts when transmission starts — NOT at spawn —
+# and a slow generator that faults at the end of a long warm-up can't read as healthy warm-up time
+# and hand itself an unlimited restart budget (review fix #19).
+TRANSMITTING_MARKER = "HEALTH state=transmitting"
 
 
 class Watcher:
@@ -61,6 +67,10 @@ def watch_flowgraph(tb, stop, *, reason: str = "flowgraph halted", stream=None) 
     """
     out = stream if stream is not None else sys.stdout
     w = Watcher()
+    try:
+        print(TRANSMITTING_MARKER, file=out, flush=True)
+    except Exception:      # noqa: BLE001 — never let reporting break a launch
+        pass
 
     def _run() -> None:
         try:

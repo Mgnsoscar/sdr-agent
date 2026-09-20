@@ -49,6 +49,18 @@ class LogManager:
         self.current.touch()
         return self.current
 
+    def rotate_uhd(self, name: str = "uhd.log") -> None:
+        """Archive the previous run's UHD file log (the per-task UHD_LOG_FILE pin) to a timestamped
+        `uhd_<ts>.log`, so it is per-run like current.log instead of growing forever, and so the
+        fault snapshot's UHD tail can't carry an unrelated earlier run's lines (review fix #23)."""
+        path = self.task_dir / name
+        try:
+            if path.exists() and path.stat().st_size > 0:
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                path.rename(self.task_dir / f"uhd_{ts}.log")
+        except OSError:
+            pass
+
     def cleanup(self, keep_runs: int = 10, max_age_days: float = 7.0) -> int:
         """
         Delete old archived run logs for this task.
@@ -77,17 +89,19 @@ class LogManager:
                 except OSError:
                     pass
 
-        # Also bound the fault snapshots (docs/rf-fault-recovery.md §6.3) written beside the run
-        # logs, so they never accumulate on the SD card — same keep-N / max-age policy.
-        snaps = sorted(self.task_dir.glob("snapshot_*.json"),
-                       key=lambda p: p.stat().st_mtime, reverse=True)
-        for idx, path in enumerate(snaps):
-            if idx >= keep_runs or path.stat().st_mtime < cutoff:
-                try:
-                    path.unlink()
-                    deleted += 1
-                except OSError:
-                    pass
+        # Also bound the fault snapshots (docs/rf-fault-recovery.md §6.3) and the archived UHD file
+        # logs written beside the run logs, so they never accumulate on the SD card — same keep-N /
+        # max-age policy.
+        for pattern in ("snapshot_*.json", "uhd_*.log"):
+            extra = sorted(self.task_dir.glob(pattern),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+            for idx, path in enumerate(extra):
+                if idx >= keep_runs or path.stat().st_mtime < cutoff:
+                    try:
+                        path.unlink()
+                        deleted += 1
+                    except OSError:
+                        pass
 
         return deleted
 

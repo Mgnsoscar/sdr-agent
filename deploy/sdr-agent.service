@@ -15,9 +15,10 @@ Environment=SDR_RELEASES_DIR=/opt/sdr-agent-releases
 Environment=SDR_CURRENT_LINK=/opt/sdr-agent
 # RF-fault prevention (docs/rf-fault-recovery.md §3.6): a stable, writable HOME so GNU Radio's
 # ~/.gnuradio handling is deterministic (the agent per-task pin overrides this for launched tasks;
-# this is the agent process's own home). Belt-and-suspenders GR vmcircbuf backend pin — the agent
-# also pins it per task; a service-level default reaches any GR the agent invokes directly. The
-# scripts set GR_DONT_LOAD_PREFS=1, so this GR_CONF_* launch-env override is the only pin GR reads.
+# this is the agent process's own home). The GR vmcircbuf backend is pinned by the AGENT per task
+# launch, by writing GR's `vmcircbuf_default_factory` pref FILE under the task HOME (the only thing
+# GR's vmcircbuf code reads — verified against the 3.8/3.10 sources; review fix #1). The GR_CONF_*
+# env var below is documentation only: GR never consults it. Kept so a reader sees the intent.
 Environment=HOME=/root
 Environment=GR_CONF_VMCIRCBUF_DEFAULT_FACTORY=mmap_shm_open
 # --timeout-graceful-shutdown bounds uvicorn's "waiting for connections to close" on

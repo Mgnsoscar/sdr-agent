@@ -181,7 +181,9 @@ class FaultSnapshot(BaseModel):
     rss_bytes: Optional[int] = None
     nofile_soft: Optional[int] = None          # the task's RLIMIT_NOFILE (the service LimitNOFILE)
     nofile_hard: Optional[int] = None
-    vmcircbuf_backend_env: str = ""            # the task's effective GR_CONF_VMCIRCBUF_DEFAULT_FACTORY
+    vmcircbuf_backend_env: str = ""            # the task's GR_CONF_VMCIRCBUF_DEFAULT_FACTORY env var (informational)
+    vmcircbuf_backend_pref: str = ""           # the EFFECTIVE backend: GR's `vmcircbuf_default_factory` pref
+                                                # file under the task's HOME (what GR actually selects; review fix #1)
     vmcircbuf_backend_compiled: str = ""       # gnuradio-config-info --prefs [vmcircbuf] default_factory
     task_home: str = ""
     ipcs_summary: str = ""                     # only captured when a SysV backend is implicated
@@ -745,6 +747,11 @@ class PlanItem(BaseModel):
     overrides: list[StepOverride] = []
     on_air_offset_s: float = 0.0
     off_air_offset_s: float = 0.0
+    # Per-item RF-fault recovery override (mirrors the client's PlanItem): "" = INHERIT the seeded
+    # sequence's authored recovery_policy/recovery_mode. Persisted so the unit replica round-trips a
+    # plan-item override instead of stripping it (review fix #24).
+    recovery_policy: str = ""
+    recovery_mode: str = ""
 
 
 class Plan(BaseModel):

@@ -90,6 +90,54 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## Current state — RF-fault arc ADVERSARIAL REVIEW: 31 findings FIXED (1.31.1, no capability) (branch `claude/system-familiarization-f5mezz`, cross-repo)
+A full multi-agent review of P0–P3b (11 dimensions → 41 raw → 32 unique → 30 confirmed by independent skeptics,
+5 HIGH ones by reproduction against the real runner; 2 refuted; +1 gap from the completeness critic confirmed by
+hand) found the arc **not shippable**: RF-left-on races, hot relaunches, an inert prevention control. All 31 are
+fixed and pinned; the record with every finding, fix and the verification method is **`docs/rf-fault-recovery.md`
+§14f**. Suite 626 → 656 (`tests/test_review_fixes.py`, 30 tests — the HIGH ones are the verifiers' reproductions
+inverted over real subprocesses); client 1166 → 1179; scripts 106 → 110. `argspec`/`ramp` untouched.
+- **#1 the P0 GR vmcircbuf pin was INERT.** Verified against upstream 3.8/3.10: GR reads a **pref FILE**
+  `vmcircbuf_default_factory` (a factory name) under the task HOME — never the `GR_CONF_*` env var, and not
+  governed by `GR_DONT_LOAD_PREFS`; with no file it probes and persists **sysv_shm** (the leaky suspect). Now
+  `_launch_env_pins` → `_pin_gr_vmcircbuf_pref` writes it at both the 3.8 and 3.10 locations + pins
+  `GR_PREFS_PATH`; the snapshot reads it back as **`FaultSnapshot.vmcircbuf_backend_pref`** (the effective
+  backend); the client dialog keys on it. **This ships by OTA** (agent code) — the earlier "needs a re-provision"
+  note was about an env var that never did anything. The `GR_CONF_*` var stays as documentation.
+- **RF left on:** #33 PANIC now cancels pending standalone relaunches (`ProcessManager.cancel_pending_relaunches`,
+  also in `shutdown`); #6 `_abort_run` goes ABORTED FIRST, stops everything `is_live` (twice), and `_fire_step`
+  re-checks the run under the lock + stops a launch that completed into a dead run; #10 `stop()` during
+  STARTING waits for the spawn (`_spawned`) and `start()` kills what it spawned; #12 a manager `_shutdown_flag`
+  checked after every restart/settle sleep; #11 an operator stop cancels `_relaunch_task` and
+  `ProcessManager.start` re-checks it after the pre-command.
+- **Hot relaunch:** #2 `set_params` records `_live_applied`, `relaunch()` bakes it onto the args
+  (`agent/cmdargs.overlay_live_params`) or stands down if the schema is unreadable; #5 `hold_now` stamps
+  **`"skipped:hold"`** (distinct from the fault sentinel `"skipped"`) so resync never bakes a fast-forwarded
+  ramp top; #4 `_fire_step` DEFERS a tune while `tune_ready` says the socket isn't bound within
+  `CTRL_BIND_GRACE_S` (new knob, 30 s), replayed fires are floored past `now`, the auto trigger passes a fresh
+  `restart_at`; #18 `_RestartDeferred` (quiet retry / 409) when `spec=None` and a non-fallback dest was tuned;
+  #16 `restart_run` dry-runs plan + guards + reconstruction in the FIRST lock (`_plan_restart`) and refuses a
+  hand-started task instead of pre-stopping it; #15 a faulted task is no longer "owned" for arm guard A0.
+- **Never recovered / undetected:** #3 `apply_sequences` keeps the whole `Sequence` (recovery policy!); #21
+  (client) drift fingerprints include the policy + auto-restart flag; #24 agent `PlanItem` recovery fields;
+  #13/#14 `_scan_task_health` returns if the process it read is no longer the RUNNING one (`_scan_stale`) and
+  `stop()` cancels a CRASHED watcher only in its delay (`_in_restart_delay`); #7 (scripts) all 30 adopters
+  `stop.set()` before `tb.stop()`; #17 an un-fired future STOP counts for `has_future_stop`; #31 a faulted run
+  never parks into HOLDING.
+- **Runaway:** #19 `txhealth.watch_flowgraph` prints **`HEALTH state=transmitting`**, the watchdog stamps
+  `transmitting_at`, and the healthy-settle requires it for a script using `watch_flowgraph`
+  (`expects_tx_marker`/`task_transmitting_confirmed`); #20 a tripped run is never re-selected under budget 0;
+  #28 a PENDING-only run claim is waited out (`tasks_pending_launch_by_active_runs` → `set_pending_query`,
+  `_wait_out_run_claim`), #27 window-B launches count as claims.
+- **Operability:** #9 `ProcessManager.device_free` gates launches while the boot pre-image holds the SDR;
+  #8 `PREIMAGE_TIMEOUT_S<=0` disables; #25 `HEALTH_POLL_S<=0` disables; #23 `uhd.log` rotated per run +
+  pruned; #30 empty `replace_args` keeps the configured command; #22 (scripts) the L2C `m>=n` branch refuses;
+  #32 the doc's `owned_task_names` corrected. Shared arg helpers: `agent/cmdargs.py`.
+- **Open (critic, not fixed):** x410 is outside the detection stack; `_reconcile_on_startup` aborts an active
+  auto run on an agent restart without a morning-after alarm; `HEALTH_FAULT_PATTERNS` substring precision;
+  wall-clock steps; a full "0 = disable" knob sweep. **Rollout:** OTA-push 1.31.1 (the GR pin included);
+  rebuild the client bundle; the scripts' `stop.set()` + marker changes deploy with the library.
+
 ## Current state — RF-fault RECOVERY (Phase 3b — STANDALONE task auto-restart): COMPLETE (1.31.0, capability `task-auto-restart`) (branch `claude/system-familiarization-f5mezz`, cross-repo)
 The task-level half of §7.1's Knob A: a task run **on its own** (not inside a run) that RF-faults is
 relaunched by the agent **with the exact parameters it faulted under**, no operator present — but ONLY
