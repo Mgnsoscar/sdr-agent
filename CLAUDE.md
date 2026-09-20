@@ -90,6 +90,8 @@ between quantities. Safety **limits** are dBm ceilings on stage boundaries; the 
 is always dBm so one stage ceiling gauges every signal. `resolve()` folds all this at a
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
+## MERGED TO `main` (all three repos, fast-forward, 1.32.0) — field rollout: OTA every unit's agent FIRST, then deploy the library; rebuild the client bundle from 1.32.0. Nothing in the RF-fault arc has run on real hardware yet (mock scripts + fake gnuradio + the headless unit only).
+
 ## Current state — SECOND adversarial review of the RF-fault arc: 30 findings FIXED (1.32.0, capability `paramkit-is-elapsed`) (branch `claude/system-familiarization-f5mezz`, cross-repo)
 Seven parallel reviewers re-reviewed the §14f fixes + the §14g work; record **`docs/rf-fault-recovery.md` §14h**.
 Suite 668 → 702 (`tests/test_review_fixes_2.py`, 31); scripts 112 → 114; client 1179 → 1185. Two HIGHs:
@@ -792,9 +794,9 @@ ritual. Two root causes, both fixed:
   11-column, 4-row `log-table` (base density + both law views + realized SDR gain/atten + live params +
   derived readouts + fixed PRN/freq) — the "only three time columns" symptom gone.
 - **Field rollout note:** OTA-push 1.23.0; on each unit's first 1.23.0 boot the library migrates
-  automatically (no re-deploy). NOT YET merged to `main` / pushed to field — awaiting owner go-ahead
-  (field-critical); the client bundle must be rebuilt from 1.23.0 (`deploy/build_bundle.sh`) + re-staged
-  into `sdr-client/bundles/` for the "Update agent…"/"Provision unit" flows to ship it.
+  automatically (no re-deploy). Merged to `main` with the rest of the branch at 1.32.0 (owner
+  go-ahead given); the client bundle must be rebuilt from the released agent (`deploy/build_bundle.sh`)
+  + re-staged into `sdr-client/bundles/` for the "Update agent…"/"Provision unit" flows to ship it.
 
 ## Current state — co-timed steps: a power step fires before RF-on (no gate-open blip): COMPLETE (branch `claude/sdr-logging-export-wvrni4`, agent-only)
 Owner report: a sequence launches a duration task with a fixed `--power` (RF off, muted pre-roll),
