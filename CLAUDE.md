@@ -59,7 +59,8 @@ view it with `screenshot.py --tab calibration`.
 - **Capabilities + version:** a new client-visible feature adds a string to
   `AGENT_CAPABILITIES` and bumps `AGENT_VERSION` (both in `agent/config.py`); `test_meta_endpoint.py`
   asserts the capability set. The client feature-gates on these exact strings. Current version is
-  in `config.py` (`1.36.5`: live-tune underflow mitigations — an identical attenuator set is not re-sent on
+  in `config.py` (`1.36.6`: a CRASH of a run-driven task is the run's fault — coupled via `_flag_rf_fault`
+  with a crash detail, behaviour only; `1.36.5`: live-tune underflow mitigations — an identical attenuator set is not re-sent on
   a tune, transmit tasks at `TASK_NICE` −5 / active-set one-shots at `ONESHOT_NICE` 10, behaviour only; `1.36.4`: the exported log-table's `Event` column shows a run's RF faults / restarts —
   `SequenceRun.incidents` + `StepFire.note`, behaviour only; `1.36.3`: sustained TX underflows are an RF fault — heavy reports ≥ `UNDERFLOW_FAULT_RATE`
   200/s covering `UNDERFLOW_FAULT_S` 4 s, behaviour only; `1.36.1`: a late task rejoins its schedule at the CURRENT level — a pile-up of
@@ -97,6 +98,20 @@ is always dBm so one stage ceiling gauges every signal. `resolve()` folds all th
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
 ## MERGED TO `main` (all three repos, fast-forward, 1.34.0) — field rollout: OTA every unit's agent FIRST, then deploy the library; rebuild the client bundle from 1.34.0. Nothing in the RF-fault arc has run on real hardware yet (mock scripts + fake gnuradio + the headless unit only).
+
+## Current state — a CRASH of a run-driven task is the run's fault (1.36.6, no capability) (branch `claude/system-familiarization-f5mezz`, agent-only)
+Owner report: an L1C sequence's script died a second after `rf on` (`usb tx2 transfer status:
+LIBUSB_TRANSFER_NO_DEVICE` — the B206 dropped off the bus, most likely a USB power brownout at 75.5 dB gain); the
+task read CRASHED but the sequence kept reading RUNNING, no alert, no Restart. `_watch` coupled a non-zero exit into
+the run ONLY when the log tail matched a halt signature (`_is_rf_fault_exit`); any other crash fired a plain
+`CrashEvent` + the task's `restart_on_crash` supervisor and the run never heard. Record: `docs/rf-fault-recovery.md`
+§14p. Now a non-intentional non-zero exit of a task an active run is DRIVING (`_run_claim_kind() == "driven"`) goes
+through the SAME `_flag_rf_fault` with `_crash_detail(code)` = `process crashed (exit N) — <last meaningful log
+line>` (alarm, snapshot, `run.fault` → Restart / auto policy, the §14n incident + Event row, the run-log line), and
+the crash-restart supervisor stands down (the run policy relaunches at the reconstructed level). A standalone task, a
+pending-only claim, or a failing owned-query keep the old crash path. `AGENT_VERSION 1.36.5 → 1.36.6`. Tests:
+`tests/test_run_owned_crash.py` (5, incl. LIVE: a run's real process SIGKILLed → `run.fault`, incident, resync restart).
+Suite 746 → 751.
 
 ## Current state — LIVE-TUNE underflow mitigations (1.36.5, no capability) (branch `claude/system-familiarization-f5mezz`, agent-only)
 Owner report: the P-code task at 61.38 MS/s is stable until a parameter is tuned; a `--power` tune (each ramp point)

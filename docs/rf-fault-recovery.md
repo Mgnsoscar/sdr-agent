@@ -1893,6 +1893,55 @@ still re-send and a launch always does; a failed set is not remembered; `_set_ni
 priority, ignores 0, swallows a PermissionError; LIVE: a launched task reads nice −5 (as root) and an
 active-set one-shot prints nice 10. Suite 741 → 746.
 
+## 14p. A CRASH of a run-driven task is the run's fault (`AGENT_VERSION 1.36.6`, no capability)
+
+**Owner report (2026-09-21):** an L1C sequence armed, launched muted, went on air, and a second after
+the `rf on` tune the script died:
+
+```
+terminate reached from thread id: 7fff09fbf160Got std::runtime_error
+EnvironmentError: IOError: usb tx2 transfer status: LIBUSB_TRANSFER_NO_DEVICE
+```
+
+The task read CRASHED on the Tasks tab, but the sequence kept reading RUNNING — no alert, no Restart
+button, its later tunes going to a dead task. **Why:** `_watch`'s non-zero-exit branch coupled an exit
+into the owning run ONLY when the log tail matched a halt signature (`_is_rf_fault_exit`: the
+done-watcher marker / `vmcircbuf` / `boost::interprocess`); every other crash fired the plain
+`CrashEvent` (a feed line) and went to the task's own `restart_on_crash` supervisor. Nothing told the
+run. The whole detection arc was written around the halted-but-alive flowgraph; the plain crash of a
+task inside a run — a UHD/USB error, a script bug — was a gap.
+
+**Change (`process_manager._watch`):** after the rf-fault check, a non-zero, non-intentional exit of a
+task an active run is DRIVING (`_run_claim_kind() == "driven"`: the owned-query lists it and it is not a
+pending-only claim) goes through the SAME `_flag_rf_fault` as a halt, with a detail from the new
+`_crash_detail(code)` — `process crashed (exit −6) — EnvironmentError: IOError: usb tx2 transfer
+status: LIBUSB_TRANSFER_NO_DEVICE` (the exit code + the last meaningful log line, ≤ 200 chars) — so
+the loud `TaskHealthEvent`, the snapshot, the run coupling (`run.fault` → the Restart button, the
+auto policy, the §14n incident + Event row) and the `⚠ RF FAULT` run-log line all fire. The generic
+crash-restart supervisor stands down for a run-driven task (as it already did for an rf-fault exit:
+the run policy relaunches at the reconstructed level; a raw relaunch at the launch args would be a
+wrong-level double-transmit). A STANDALONE task, a task a run has merely not yet launched
+(pending-only), or a failing owned-query (never couple blindly) keep the crash path exactly as before
+— `CrashEvent` + `restart_on_crash`.
+
+**About the crash itself.** `LIBUSB_TRANSFER_NO_DEVICE` means the B206 dropped off the USB bus
+mid-stream — a second after the gate opened at **75.5 dB** gain. The P-code run at the same 61.38 MS/s
+never did that, at 3.25 dB. A bus-powered B200mini's PA current rises with TX gain, so the likeliest
+cause is a USB power brownout at RF-on (the Pi 5's USB ports share a budget; a marginal cable/hub
+does the same). Check `dmesg` for a `USB disconnect` / `reset SuperSpeed USB device` at the fault
+instant; a powered hub or the full 5 V/5 A Pi supply is the usual fix. After such a drop the device
+re-enumerates and reloads its FPGA image (~10 s), so an immediate Restart may fail to open it — that
+failure is a coupled fault too (review fix W4), so the run stays restartable.
+
+Tests: `tests/test_run_owned_crash.py` — a run-driven crash (a fake `−6` exit with the USB tail):
+CRASHED + `rf_fault` with the exact detail, the hook coupled, no supervisor relaunch, a `task_health`
+event and no `crash` event; a standalone crash keeps the crash path (a `crash` event, the supervisor
+relaunches); a pending-only claim and a failing query keep it too; the detail without a log / with a
+long line; and LIVE through the runner's wiring (`set_fault_hook` / `set_owned_query` /
+`set_pending_query`): the real script driven by a RUNNING run is SIGKILLed → `run.fault` reads
+`process crashed (exit −9)…`, the incident is recorded, the run stays RUNNING, and a resync
+`restart_run` relaunches it with its note. Suite 746 → 751.
+
 ## 14. Open items
 
 - ~~Retrieve the archived `run_<ts>.log` from the affected unit + `df /dev/shm` /

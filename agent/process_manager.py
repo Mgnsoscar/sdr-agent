@@ -910,8 +910,19 @@ class ManagedProcess:
                 if not self._stop_requested:
                     await self._maybe_auto_restart_standalone()
                 return
-            else:
-                await self._fire_crash_event(code)
+            if self._run_claim_kind() == "driven":
+                # A task a RUN is driving CRASHED (a UHD/USB error, a script bug — anything that is
+                # not a halt signature): to the run it is exactly as silent as a halted flowgraph, so
+                # it is coupled as the run's fault (docs/rf-fault-recovery.md §14p) — the loud
+                # TaskHealthEvent, the snapshot, run.fault → the Restart button / the auto policy, the
+                # export's Event row — instead of a plain CrashEvent the run never hears about (the
+                # run then kept reading RUNNING while its tunes went to a dead task). The generic
+                # crash-restart supervisor stands down for the same reason as above: the run policy
+                # relaunches at the reconstructed level; a raw relaunch at the launch args would be a
+                # wrong-level double-transmit.
+                await self._flag_rf_fault(await self._crash_detail(code))
+                return
+            await self._fire_crash_event(code)
 
             if not self.config.restart_on_crash:
                 return
@@ -1254,6 +1265,24 @@ class ManagedProcess:
             return max(0.0, (datetime.now(timezone.utc) - t).total_seconds())
         except (TypeError, ValueError):
             return None
+
+    async def _crash_detail(self, code: Optional[int]) -> str:
+        """The fault detail for a run-owned crash: the exit code + the last meaningful log line (the
+        UHD/USB error, the traceback's last line), so the alarm, the run and the export say WHY."""
+        last = ""
+        try:
+            lines = await self.log.tail(40)
+        except Exception:      # noqa: BLE001
+            lines = []
+        for ln in reversed(lines):
+            t = str(ln).strip()
+            if t and not t.startswith("─") and not t.startswith("-") and not t.startswith("="):
+                last = t
+                break
+        if len(last) > 200:
+            last = last[:197] + "…"
+        detail = f"process crashed (exit {code})"
+        return f"{detail} — {last}" if last else detail
 
     async def _is_rf_fault_exit(self) -> bool:
         """True if this task's exit is (or corroborates) an RF fault: health already flagged, or the
