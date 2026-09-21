@@ -1846,6 +1846,53 @@ fault couples the incident + the log line, a resync restart notes the relaunch, 
 shows fault → restart in order with the gate 0 then 1; replay + auto notes; a give-up incident.
 Suite 732 → 741.
 
+## 14o. Live-tune underflow mitigations (`AGENT_VERSION 1.36.5`, no capability)
+
+**Owner report (2026-09-21, 1.36.3/4):** the P-code task at 61.38 MS/s "is stable as long as you don't
+tune any parameters"; during a ramp it occasionally underflows hard enough to RF-fault (§14m) and be
+auto-restarted. "The P-code script underflows when I tune the power. Is this possible to mitigate?"
+
+**What a power tune costs on the unit.** The script's own path is cheap — `apply_live()` folds
+`gain_for_power` (pure Python) and calls `usrp.set_gain` (a few AD9361 register writes) on its
+50 ms control loop; no flowgraph lock, no rebuild. The expensive part is the AGENT's: for a task on a
+chain with a programmable attenuator, `set_params` runs `_gate_precommand` BEFORE the tune is sent,
+which spawns the attenuator one-shot — a fresh Python interpreter that imports `paramkit`, parses
+the schema and opens the serial port — and awaits it, on EVERY point of a ramp, whether or not the
+realization moved the attenuator (SDR-first realization keeps it still across most of a ramp). That
+spawn competes for CPU with the transmitter's producer thread at equal priority on a box that a
+61 MS/s float generator already saturates; the FIFO in front of the sink holds ~2 ms at that rate and
+UHD's send frames ~17 ms, so a momentary stall is an underflow burst.
+
+**Change (agent only, behaviour):**
+
+- **An identical set is not re-sent on a tune.** `ProcessManager._active_last` remembers, per
+  active-component TASK, the `(param, value, consts)` it was last set to SUCCESSFULLY (exit 0);
+  `_apply_active_settings(..., force=False)` — the live-tune path through `_gate_precommand` — skips a
+  set equal to it. A LAUNCH (`cmd=`) always re-sends (the physical position may have changed under
+  the agent — another task, a power cycle — and a launch is not the hot path); a failed / timed-out
+  set forgets the position so the next tune re-sends. Mute (max) and un-mute are different settings
+  and still fire.
+- **Scheduler priority.** `_set_nice(pid, nice)` right after each spawn (before the child creates its
+  threads, so they inherit it): the transmit task at **`TASK_NICE`** (default **−5**, `SDR_TASK_NICE`;
+  a negative value needs root — the agent service runs as root on the units; elsewhere it is logged
+  and ignored) and the awaited active-component one-shot at **`ONESHOT_NICE`** (default **10**,
+  `SDR_ONESHOT_NICE`). CFS weights (−5 ≈ 3× nice 0; 10 ≈ 0.1×) favour the producer thread over the
+  spawn and the agent without starving either — deliberately NOT `SCHED_FIFO`
+  (`gr.enable_realtime_scheduling`), which on a saturated 4-core box could pin the agent's own
+  control loop behind the kernel's 5 % RT throttle. 0 leaves a priority untouched.
+
+**Not done / next levers if it still underflows:** the script's buffering — the FIFO is
+`F_SETPIPE_SZ 1 MB` (≈2 ms at 61 MS/s; root may exceed `pipe-max-size`) and the sink's
+`num_send_frames=512,send_frame_size=16000` (≈17 ms); either could be raised in `gps_l1p_tx.py` to ride
+out a longer stall (not changed blind — untested on the B206). A persistent attenuator process instead
+of a one-shot per set would remove the spawn entirely when the attenuator DOES move.
+
+Tests: `tests/test_tune_underflow_mitigation.py` — a repeated identical tune (and a gate-on tune that
+changes nothing) spawns nothing while a level that moves the attenuator does, once; mute / un-mute
+still re-send and a launch always does; a failed set is not remembered; `_set_nice` sets the
+priority, ignores 0, swallows a PermissionError; LIVE: a launched task reads nice −5 (as root) and an
+active-set one-shot prints nice 10. Suite 741 → 746.
+
 ## 14. Open items
 
 - ~~Retrieve the archived `run_<ts>.log` from the affected unit + `df /dev/shm` /

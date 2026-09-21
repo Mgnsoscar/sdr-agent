@@ -360,6 +360,20 @@ def _last_clock_origin(text: str) -> Optional[float]:
         return None
 
 
+def _set_nice(pid: Optional[int], nice: int, label: str) -> bool:
+    """Best-effort: put a just-spawned process at scheduler niceness `nice` (§14o). Set right after
+    the spawn, before the child creates its threads, so they inherit it. A negative value needs root
+    (PermissionError is logged at debug and ignored); 0 leaves it untouched. Returns True when set."""
+    if not nice or pid is None:
+        return False
+    try:
+        os.setpriority(os.PRIO_PROCESS, int(pid), int(nice))
+        return True
+    except (PermissionError, ProcessLookupError, OSError, AttributeError, ValueError) as exc:
+        logger.debug("could not set niceness %s for '%s' (pid %s): %s", nice, label, pid, exc)
+        return False
+
+
 def _fmt_num(v: float) -> str:
     """A numeric CLI argument value: whole numbers without a trailing .0 so int-typed
     argparse params accept them (e.g. 60.0 → '60', 0.25 → '0.25')."""
@@ -686,6 +700,9 @@ class ManagedProcess:
             env=env,
             start_new_session=True,
         )
+        # Favour the transmitter over everything else on the box (the agent, an attenuator set) —
+        # its producer thread must never be starved into an underflow by a tune (§14o).
+        _set_nice(self._proc.pid, _agentcfg.TASK_NICE, self.config.name)
 
         self._spawned.set()
         if self._stop_requested:
@@ -1302,6 +1319,11 @@ class ProcessManager:
         # Per-task RF-gate bookkeeping: the last-known {power, rf_on} so a live tune that toggles
         # only one of them still positions the attenuators correctly (see _gate_precommand).
         self._gate_state: Dict[str, dict] = {}
+        # Per active-component TASK: the (param, value, consts) it was last set to successfully, so a
+        # tune whose realization lands on the same setting doesn't spawn the one-shot again (§14o —
+        # SDR-first realization keeps the attenuator still across most of a ramp). A launch always
+        # re-sends; a failed/timed-out set forgets it (the physical position is then unknown).
+        self._active_last: Dict[str, tuple] = {}
         # RF-fault DETECTION (Phase 1): the health-watchdog coroutine + the run-coupling hook it
         # (and the exit path) invoke on a confirmed fault (set by the SequenceRunner via lifespan).
         self._health_task: Optional[asyncio.Task] = None
@@ -2117,6 +2139,8 @@ class ProcessManager:
             fh = None
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=fh, stderr=fh, cwd=cfg.working_dir, env=env, start_new_session=True)
+        # A fresh interpreter next to a saturating transmitter: yield to it (§14o).
+        _set_nice(proc.pid, _agentcfg.ONESHOT_NICE, name)
         logger.info("Active-set '%s' (pid=%s): %s", name, proc.pid, cmd)
         code: Optional[int] = None
         try:
@@ -2134,23 +2158,36 @@ class ProcessManager:
             logger.warning("Active-set '%s' exited with code %s", name, code)
         return code
 
-    async def _apply_active_settings(self, settings: List[dict]) -> None:
+    async def _apply_active_settings(self, settings: List[dict], *, force: bool = True) -> None:
         """Fire each active-component set (a one-shot, awaited) so the components are physically in
         position before the transmit emits. Best-effort: a failed/timed-out set is logged, not
-        fatal (the transmit script still clamps its own SDR gain to a safe range)."""
+        fatal (the transmit script still clamps its own SDR gain to a safe range). With
+        ``force=False`` (a live tune) a set identical to the last one SENT to that component is
+        skipped — the component is already there, and the spawn is what starves a saturated
+        transmitter (§14o)."""
         for s in settings or []:
             atask, param, value = s.get("task"), s.get("param"), s.get("value")
             if not atask or param is None or value is None:
                 continue
+            consts = s.get("consts") or {}
+            key = (str(param), _fmt_num(value), tuple(sorted((str(k), str(v)) for k, v in consts.items())))
+            if not force and self._active_last.get(atask) == key:
+                logger.debug("Active component '%s' already at %s=%s — not re-sent", atask, param,
+                             _fmt_num(value))
+                continue
             args = [self._active_flag(atask, param), _fmt_num(value)]
             # Constant params (e.g. the attenuator's serial port) travel on every set — the
             # driving param alone isn't enough for the script to run.
-            for cdest, cval in (s.get("consts") or {}).items():
+            for cdest, cval in consts.items():
                 args += [self._active_flag(atask, cdest), str(cval)]
+            self._active_last.pop(atask, None)          # unknown until the set succeeds
             try:
-                await self._launch_oneshot_wait(atask, args)
+                code = await self._launch_oneshot_wait(atask, args)
             except Exception as exc:                     # never let a set derail the transmit
                 logger.warning("Active component '%s' set failed: %s", atask, exc)
+                continue
+            if code == 0:
+                self._active_last[atask] = key
 
     async def _precommand_active(self, name: str, power: Optional[float],
                                  freq_hz: Optional[float] = None) -> None:
@@ -2197,11 +2234,12 @@ class ProcessManager:
                 f = _tune_log.freq_hz_of(self._script_spec(name), {fd: vals.get(fd)})
                 if f is not None:
                     st["freq_hz"] = f
+        force = cmd is not None                          # a launch always re-sends (§14o)
         if gate is not None and not st["rf_on"]:
-            await self._apply_active_settings(self._mute_settings(name, st.get("freq_hz")))
+            await self._apply_active_settings(self._mute_settings(name, st.get("freq_hz")), force=force)
         else:
             await self._apply_active_settings(
-                self.active_settings(name, st["power"], st.get("freq_hz")))
+                self.active_settings(name, st["power"], st.get("freq_hz")), force=force)
 
     async def restart(self, name: str, request: Optional[StartRequest] = None,
                       source: str = "manual") -> ProcessStatus:

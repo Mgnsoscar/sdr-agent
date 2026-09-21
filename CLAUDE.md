@@ -59,7 +59,8 @@ view it with `screenshot.py --tab calibration`.
 - **Capabilities + version:** a new client-visible feature adds a string to
   `AGENT_CAPABILITIES` and bumps `AGENT_VERSION` (both in `agent/config.py`); `test_meta_endpoint.py`
   asserts the capability set. The client feature-gates on these exact strings. Current version is
-  in `config.py` (`1.36.4`: the exported log-table's `Event` column shows a run's RF faults / restarts —
+  in `config.py` (`1.36.5`: live-tune underflow mitigations — an identical attenuator set is not re-sent on
+  a tune, transmit tasks at `TASK_NICE` −5 / active-set one-shots at `ONESHOT_NICE` 10, behaviour only; `1.36.4`: the exported log-table's `Event` column shows a run's RF faults / restarts —
   `SequenceRun.incidents` + `StepFire.note`, behaviour only; `1.36.3`: sustained TX underflows are an RF fault — heavy reports ≥ `UNDERFLOW_FAULT_RATE`
   200/s covering `UNDERFLOW_FAULT_S` 4 s, behaviour only; `1.36.1`: a late task rejoins its schedule at the CURRENT level — a pile-up of
   deferred tunes collapses per parameter, power before RF-on; behaviour only; `1.36.0`: stacked sequences —
@@ -96,6 +97,20 @@ is always dBm so one stage ceiling gauges every signal. `resolve()` folds all th
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
 ## MERGED TO `main` (all three repos, fast-forward, 1.34.0) — field rollout: OTA every unit's agent FIRST, then deploy the library; rebuild the client bundle from 1.34.0. Nothing in the RF-fault arc has run on real hardware yet (mock scripts + fake gnuradio + the headless unit only).
+
+## Current state — LIVE-TUNE underflow mitigations (1.36.5, no capability) (branch `claude/system-familiarization-f5mezz`, agent-only)
+Owner report: the P-code task at 61.38 MS/s is stable until a parameter is tuned; a `--power` tune (each ramp point)
+occasionally underflows into an RF fault. The script's tune path is cheap (a pure-Python fold + `usrp.set_gain`); the
+cost is the AGENT's `_gate_precommand`, which spawned the attenuator one-shot (a fresh interpreter importing paramkit +
+opening the serial port) before EVERY power tune at the transmitter's own priority, even when the realization left the
+attenuator where it was. Record: `docs/rf-fault-recovery.md` §14o. Now (1) `ProcessManager._active_last` remembers per
+active-component TASK the `(param, value, consts)` last set successfully and `_apply_active_settings(force=False)` — the
+live-tune path — skips an identical set (a launch `force=True` always re-sends; a failed/timed-out set forgets it; mute
+vs set are distinct); (2) `_set_nice(pid, nice)` right after each spawn: transmit tasks at **`TASK_NICE`** (−5,
+`SDR_TASK_NICE`, needs root — best-effort elsewhere), active-set one-shots at **`ONESHOT_NICE`** (10,
+`SDR_ONESHOT_NICE`); deliberately CFS niceness, not `SCHED_FIFO`. Not done: the script's FIFO (1 MB ≈ 2 ms at 61 MS/s)
+/ `num_send_frames` buffering, a persistent attenuator process. `AGENT_VERSION 1.36.4 → 1.36.5`. Tests:
+`tests/test_tune_underflow_mitigation.py` (5, incl. LIVE niceness as root). Suite 741 → 746.
 
 ## Current state — the EXPORTED log-table shows a run's faults + restarts (1.36.4, no capability) (branch `claude/system-familiarization-f5mezz`, agent-only)
 Owner report: a plan run whose P-code task RF-faulted (underflows during a ramp) and was auto-restarted + resynced a

@@ -430,7 +430,7 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # two never double-transmit on the single TX channel (an owned-query gates it). Gated by the master
 # kill-switch AUTO_RESTART_ENABLED. Adds capability `task-auto-restart` (the client gates its
 # "Auto-restart on fault" checkbox on it); opt-in per task (default False = today's behaviour).
-AGENT_VERSION = "1.36.4"
+AGENT_VERSION = "1.36.5"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -684,6 +684,17 @@ HEALTH_POLL_S        = float(os.environ.get("SDR_HEALTH_POLL_S", "2.0"))
 # lost the tune again on exactly those launches (re-review finding W3). A tune this run no longer
 # owns is dropped, never deferred (finding W2), so a long grace cannot leak into a successor run.
 CTRL_BIND_GRACE_S    = float(os.environ.get("SDR_CTRL_BIND_GRACE_S", "180.0"))
+
+# CPU scheduling around a LIVE TUNE (docs/rf-fault-recovery.md §14o). A 61 MS/s generator on a Pi 5
+# runs near CPU saturation, and a `--power` tune used to spawn the attenuator one-shot — a fresh Python
+# interpreter importing paramkit and opening the serial port — on EVERY point of a ramp, at the same
+# priority as the transmitter's producer thread: enough to starve the sample stream for a moment and
+# underflow (§14m then faults it). Now a transmit task is launched at TASK_NICE (negative = favoured
+# by the scheduler; needs root, best-effort otherwise) and the awaited active-component set at
+# ONESHOT_NICE (positive = yields to the transmitter), and a set identical to the last one sent to that
+# component is not re-sent on a tune (a launch always re-sends). 0 leaves a priority untouched.
+TASK_NICE    = int(os.environ.get("SDR_TASK_NICE", "-5"))
+ONESHOT_NICE = int(os.environ.get("SDR_ONESHOT_NICE", "10"))
 
 # Curated fault signatures the log-scan matches (case-insensitive, substring). The authoritative one
 # is the Layer-1 done-watcher marker (paramkit.txhealth.FAULT_MARKER) — a script emits it the instant
