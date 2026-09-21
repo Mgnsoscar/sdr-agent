@@ -490,6 +490,20 @@ class StepFire(BaseModel):
     # A ramp point DEFERRED past the Hold (paused_fires): how long its level is held before the next
     # point — the ramp's dwell — so proceed keeps the last level's hold before off-air. None otherwise.
     dwell_s: Optional[float] = None
+    # A free-text mark the exported log-table shows in its Event column for this fire — the synthetic
+    # RESTART relaunch (docs/rf-fault-recovery.md §14n). "" for an ordinary scheduled fire.
+    note: str = ""
+
+
+class RunIncident(BaseModel):
+    """A durable mark on a run's record beyond its scheduled fires (docs/rf-fault-recovery.md §14n):
+    an RF fault (the radio was dropped), a restart that produced no relaunch, an auto-restart that
+    gave up. Appended by the runner, persisted with the run, rendered by the exported log-table as
+    an Event row — so a recovered run's export shows what happened, not "fine all along"."""
+    kind: str                          # "rf_fault" | "restart" | "gave_up"
+    at: str                            # ISO-8601 UTC of the event
+    task: str = ""                     # the task concerned ("" = the run as a whole)
+    detail: str = ""
 
 
 class SequenceRun(BaseModel):
@@ -540,6 +554,9 @@ class SequenceRun(BaseModel):
     fault: str = ""                    # "" = healthy; else the faulted task + reason
     fault_task: str = ""               # the specific task name that faulted (a run may own several)
     fault_at: str = ""                 # ISO-8601 of detection
+    # Every fault / relaunch-less restart / give-up this run went through, in order (§14n). A restart
+    # that DID relaunch marks its synthetic start fire instead (StepFire.note). Never cleared.
+    incidents: list[RunIncident] = []
     # Unattended auto-restart (docs/rf-fault-recovery.md §7.1/§14d — Phase 3). The recovery policy is
     # resolved on the client (a plan overrides its sequences) and stamped here at arm; the agent's tick
     # auto-fires restart_run when policy == "auto" and the budget (config.AUTO_RESTART_BUDGET) remains.

@@ -1803,6 +1803,49 @@ the 1.36.2 reading (the sparse report then faults on its own), so the knob is wh
 Suite 728 → 732. The 1.36.2 field run did confirm the rest of the path on hardware: the fault, the
 auto-drop and the auto-restart relaunch all fired as designed.
 
+## 14n. The exported log-table shows the run's faults and restarts (`AGENT_VERSION 1.36.4`, no capability)
+
+**Owner report (2026-09-21, 1.36.3):** the P-code task at 61.38 MS/s is stable until a parameter is
+tuned; during a ramp it occasionally underflows hard enough to RF-fault (§14m), and the run's
+auto-restart + resync brought it back every time ("works very good"). But the spreadsheet exported
+from such a plan run "read as if everything was fine all along". Three reasons, all in the data:
+`restart_run` clears `run.fault`/`fault_task`/`fault_at` on success (the fault is a transient field,
+§5.3); the relaunch is an ordinary synthetic `start` fire at the SAME level the task had, so
+`run_table`'s row-per-change dedupe swallowed it; and the table walked only fired start/tune steps —
+nothing else on the run said what had happened. (The text run log had the `RESTART (mode) — …` line
+but, as it turned out, no fault line at all — the fault went to the SSE event only.)
+
+**Change:**
+
+- **`models.RunIncident`** `{kind, at, task, detail}` and **`SequenceRun.incidents`** — a durable,
+  never-cleared list the runner appends to: `rf_fault` in `on_task_fault` (both the first fault and a
+  second task's fault in an already-faulted run), `restart` from `restart_run` ONLY when the task was
+  scheduled OFF and no relaunch was made, `gave_up` from `_auto_restart_gaveup`. Persisted with the
+  run; a pre-1.36.4 record loads with `[]`.
+- **`StepFire.note`** — the synthetic relaunch fire carries `RESTART (resync)` / `RESTART (replay),
+  off-air shifted +Ns` / `AUTO-RESTART (mode)` (the unattended trigger passes `reset_budget=False`).
+  A restart that relaunches marks its fire, not a second incident.
+- **`run_table.build_task_table(..., incidents=)`** — a trailing **`Event`** column (always last, so
+  the client's Time-column localisation, which passes `cols[1:]` through, is undisturbed; no client
+  change). The fires and this task's incidents (task-less incidents attach to every task) form ONE
+  timeline sorted by instant. An incident is a **dead row**: the parameters stay at their last known
+  values but every power quantity, the SDR gain and the attenuation are blank and the RF gate reads
+  0 — the process was dropped, nothing was on air. A fire with a `note` always gets a row, even at an
+  unchanged level (the dedupe compares the body WITHOUT the Event cell and never skips a noted row), so
+  the export shows the outage's start, the relaunch, and its level.
+- **The text run log** gains `⚠ RF FAULT — <task>: <detail> — N pending step(s) skipped; RF dropped`
+  (via a small `_annotate` helper) so the log, the feed and the export tell the same story.
+
+Tests: `tests/test_run_export_events.py` — the Event column is last and blank on ordinary rows; a
+fault is a dead row at its instant (blank quantities / gain / attenuation, RF 0, params kept, the
+on-air offset filled) and the relaunch note forces a row at the unchanged level, after which the
+ramp's rows are plain again; no incidents/notes → the rows are as before (a no-op tune still adds
+none); incidents are scoped to the task and a give-up / a relaunch-less restart are dead rows; the
+model round-trips and an old record defaults; through the REAL runner (`_mk` + LIVE_SCRIPT): a
+fault couples the incident + the log line, a resync restart notes the relaunch, `build_log_table`
+shows fault → restart in order with the gate 0 then 1; replay + auto notes; a give-up incident.
+Suite 732 → 741.
+
 ## 14. Open items
 
 - ~~Retrieve the archived `run_<ts>.log` from the affected unit + `df /dev/shm` /

@@ -430,7 +430,7 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # two never double-transmit on the single TX channel (an owned-query gates it). Gated by the master
 # kill-switch AUTO_RESTART_ENABLED. Adds capability `task-auto-restart` (the client gates its
 # "Auto-restart on fault" checkbox on it); opt-in per task (default False = today's behaviour).
-AGENT_VERSION = "1.36.3"
+AGENT_VERSION = "1.36.4"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list

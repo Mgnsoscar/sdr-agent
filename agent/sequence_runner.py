@@ -39,8 +39,8 @@ from . import ramp
 from . import cmdargs as _cmdargs
 from .log_manager import LogManager
 from .models import (
-    ArmSequenceRequest, CreateSequenceRequest, ProceedRequest, RestartRequest, Sequence,
-    SequenceRun, SequenceState, SequenceStep, StepAction, StepFire, StepOverride,
+    ArmSequenceRequest, CreateSequenceRequest, ProceedRequest, RestartRequest, RunIncident,
+    Sequence, SequenceRun, SequenceState, SequenceStep, StepAction, StepFire, StepOverride,
     SequenceWebhook, TaskHealth,
 )
 from .process_manager import ProcessManager, _POWER_FLAGS
@@ -626,6 +626,10 @@ class SequenceRunner:
                     # its pending steps are skipped and the alarm is raised so the operator knows.
                     run.fault = f"{run.fault}; {task_name}: {detail}"
                     self._extra_faulted.setdefault(run.id, set()).add(task_name)
+                    run.incidents.append(RunIncident(kind="rf_fault", at=_utcnow_iso(),
+                                                     task=task_name, detail=detail))
+                    self._annotate(run, f"⚠ RF FAULT — {task_name}: {detail} — {skipped} pending "
+                                        f"step(s) skipped; RF dropped (a second fault in this run)")
                     logger.warning("Run %s: a SECOND task '%s' RF-faulted while '%s' is faulted — "
                                    "skipped %d pending step(s); recovered only by its own task "
                                    "auto-restart (%s)", run.id, task_name, run.fault_task, skipped, detail)
@@ -636,6 +640,10 @@ class SequenceRunner:
                 run.fault = detail
                 run.fault_task = task_name
                 run.fault_at = _utcnow_iso()
+                run.incidents.append(RunIncident(kind="rf_fault", at=run.fault_at,
+                                                 task=task_name, detail=detail))
+                self._annotate(run, f"⚠ RF FAULT — {task_name}: {detail} — {skipped} pending step(s) "
+                                    f"skipped; RF dropped")
                 logger.warning("Run %s: task '%s' RF-faulted — skipped %d pending step(s) (%s)",
                                run.id, task_name, skipped, detail)
                 self._persist_runs()
@@ -1125,7 +1133,8 @@ class SequenceRunner:
             spec, artifact = self._manager.tune_log_context(task)
             realize = self._manager.power_realizer(task)
             tables.append(run_table.build_task_table(
-                task, list(run.steps), spec, artifact, realize, on_air_at=run.on_air_at))
+                task, list(run.steps), spec, artifact, realize, on_air_at=run.on_air_at,
+                incidents=list(run.incidents)))
         return {
             "run_id": run.id,
             "sequence_id": run.sequence_id,
@@ -1458,7 +1467,16 @@ class SequenceRunner:
                     run.on_air_end = new_on_air_end.isoformat()
                     self._off_air_marked.discard(run.id)     # let the off-air marker fire at the new end
                 if relaunch is not None:
+                    # The export's Event column reads this off the fire (docs/rf-fault-recovery.md §14n).
+                    relaunch.note = (f"{'AUTO-' if not reset_budget else ''}RESTART ({mode})"
+                                     + (f", off-air shifted +{downtime:.0f}s"
+                                        if mode == "replay" and downtime else ""))
                     run.steps = list(run.steps) + [relaunch]
+                else:
+                    run.incidents.append(RunIncident(
+                        kind="restart", at=now.isoformat(), task=task,
+                        detail=f"{'auto-' if not reset_budget else ''}{mode}: {task} is scheduled OFF now "
+                               f"— no relaunch; its next START brings it up"))
                 run.steps.sort(key=lambda f: _parse(f.fire_at))
                 run.fault = ""
                 run.fault_task = ""
@@ -2321,6 +2339,10 @@ class SequenceRunner:
                 if run.auto_restart_count < budget:
                     run.auto_restart_count = budget
                     self._persist_runs()
+        async with self._lock:
+            run.incidents.append(RunIncident(kind="gave_up", at=_utcnow_iso(),
+                                             task=run.fault_task, detail=reason))
+            self._persist_runs()
         rl = self._run_logs.get(run.id)
         if rl is not None:
             rl.annotate(f"AUTO-RESTART GAVE UP — {reason}; awaiting operator")
@@ -2847,6 +2869,16 @@ class SequenceRunner:
             self._persist_runs()
 
     # ── Webhook helper ──────────────────────────────────────────────────────────
+
+    def _annotate(self, run: SequenceRun, line: str) -> None:
+        """Append a line to the run's text log if it is open (best-effort, never raises)."""
+        rl = self._run_logs.get(run.id)
+        if rl is None:
+            return
+        try:
+            rl.annotate(line)
+        except Exception as exc:                          # noqa: BLE001 — the log never breaks a run
+            logger.debug("run log annotate failed for %s: %s", run.id, exc)
 
     async def _fire(self, run: SequenceRun, kind: str, detail: str = "") -> None:
         payload = SequenceWebhook(

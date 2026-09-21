@@ -59,7 +59,8 @@ view it with `screenshot.py --tab calibration`.
 - **Capabilities + version:** a new client-visible feature adds a string to
   `AGENT_CAPABILITIES` and bumps `AGENT_VERSION` (both in `agent/config.py`); `test_meta_endpoint.py`
   asserts the capability set. The client feature-gates on these exact strings. Current version is
-  in `config.py` (`1.36.3`: sustained TX underflows are an RF fault — heavy reports ≥ `UNDERFLOW_FAULT_RATE`
+  in `config.py` (`1.36.4`: the exported log-table's `Event` column shows a run's RF faults / restarts —
+  `SequenceRun.incidents` + `StepFire.note`, behaviour only; `1.36.3`: sustained TX underflows are an RF fault — heavy reports ≥ `UNDERFLOW_FAULT_RATE`
   200/s covering `UNDERFLOW_FAULT_S` 4 s, behaviour only; `1.36.1`: a late task rejoins its schedule at the CURRENT level — a pile-up of
   deferred tunes collapses per parameter, power before RF-on; behaviour only; `1.36.0`: stacked sequences —
   arm guard A is task-aware — capability `sequence-stacking`; `1.35.0`: plan-level anchoring replica — Phase: plan editor redesign — capability
@@ -95,6 +96,22 @@ is always dBm so one stage ceiling gauges every signal. `resolve()` folds all th
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
 ## MERGED TO `main` (all three repos, fast-forward, 1.34.0) — field rollout: OTA every unit's agent FIRST, then deploy the library; rebuild the client bundle from 1.34.0. Nothing in the RF-fault arc has run on real hardware yet (mock scripts + fake gnuradio + the headless unit only).
+
+## Current state — the EXPORTED log-table shows a run's faults + restarts (1.36.4, no capability) (branch `claude/system-familiarization-f5mezz`, agent-only)
+Owner report: a plan run whose P-code task RF-faulted (underflows during a ramp) and was auto-restarted + resynced a
+couple of times exported a spreadsheet that read "fine all along" — `restart_run` clears the fault fields, the
+synthetic relaunch is an ordinary `start` fire at the SAME level (deduped away), and `run_table` walked only fired
+start/tune steps. Record: `docs/rf-fault-recovery.md` §14n. Now `models.RunIncident{kind,at,task,detail}` +
+`SequenceRun.incidents` (never cleared, persisted; `rf_fault` from `on_task_fault` — both branches —, `restart` only
+when `restart_run` made NO relaunch (task scheduled OFF), `gave_up` from `_auto_restart_gaveup`) and `StepFire.note`
+on the synthetic relaunch (`RESTART (resync)` / `RESTART (replay), off-air shifted +Ns` / `AUTO-RESTART (mode)` when
+`reset_budget=False`). `run_table.build_task_table(..., incidents=)` appends a trailing **`Event`** column (always
+LAST — the client's `_localize_table` passes `cols[1:]` through, no client change): fires + this task's incidents
+(task-less ones attach to every task) form one timeline; an incident is a DEAD row (params kept, every power
+quantity / SDR gain / attenuation blank, RF gate 0); a noted fire always gets a row (the dedupe compares the body
+without the Event cell). The text run log gains `⚠ RF FAULT — <task>: <detail> — N pending step(s) skipped; RF
+dropped` (`_annotate` helper) — it had NO fault line before. `build_log_table` passes `run.incidents`.
+`AGENT_VERSION 1.36.3 → 1.36.4`. Tests: `tests/test_run_export_events.py` (9). Suite 732 → 741.
 
 ## Current state — sustained TX UNDERFLOWS are an RF fault (1.36.3, no capability) (branch `claude/system-familiarization-f5mezz`, agent-only)
 Owner test on 1.36.1: an independent GPS L1 P task at a deliberately too-heavy configuration logged

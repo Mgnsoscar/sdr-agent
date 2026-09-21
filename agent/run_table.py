@@ -13,7 +13,7 @@ per unit into a sheet of an .xlsx workbook.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from . import tune_log
@@ -162,6 +162,10 @@ def _columns(spec: dict, artifact: Optional[dict], laws: list, by_dest: dict,
     for p in all_params:                             # then fixed params as constant columns
         if _plain(p) and not p.get("live"):
             _emit(p)
+    # What happened beyond the schedule (docs/rf-fault-recovery.md §14n): an RF fault, a restart
+    # (the relaunch fire's note), an auto-restart giving up. "" on an ordinary row. Always LAST, so
+    # the client's Time-column localisation (which passes cols[1:] through) is undisturbed.
+    cols.append(_Col("Event", "event"))
     return cols
 
 
@@ -171,7 +175,7 @@ def _hdr(name: str, unit: str) -> str:
 
 def _row_values(cols: List[_Col], effective: dict, by_dest: dict, artifact: Optional[dict],
                 realize: Optional[Callable], freq_hz: Optional[float],
-                rf_gate: Optional[dict] = None) -> list:
+                rf_gate: Optional[dict] = None, *, dead: bool = False) -> list:
     resolver = tune_log._make_resolver(by_dest, effective)
     base = tune_log._num(effective.get("power"))
     # RF output gate off ⇒ MUTED: nothing is emitting, so blank every power quantity and report the
@@ -180,8 +184,13 @@ def _row_values(cols: List[_Col], effective: dict, by_dest: dict, artifact: Opti
     if rf_gate is not None:
         gd = rf_gate.get("dest") or rf_gate.get("name")
         rf_off = not _rf.is_on(effective.get(gd, rf_gate.get("default")))
+    # dead ⇒ the task's process is GONE (an RF fault dropped it, a restart found it scheduled off):
+    # nothing is emitting and no device state was commanded — blank every power/device cell and
+    # report the RF gate closed, keep the parameters as the last known state.
+    if dead:
+        rf_off = True
     real = None
-    if realize is not None:
+    if realize is not None and not dead:
         try:
             real = (realize(None, freq_hz, rf_on=False) if rf_off
                     else (realize(base, freq_hz) if base is not None else None))
@@ -214,7 +223,10 @@ def _row_values(cols: List[_Col], effective: dict, by_dest: dict, artifact: Opti
             out.append(_fnum((real or {}).get("atten_db")))
         elif c.kind == "rf":
             val = effective.get(c.ref)
-            out.append(1 if (isinstance(val, str) and val.strip().lower() == "on") or val is True else 0)
+            out.append(0 if dead else
+                       (1 if (isinstance(val, str) and val.strip().lower() == "on") or val is True else 0))
+        elif c.kind == "event":
+            out.append("")                           # filled by the caller
         elif c.kind == "param":
             out.append(_fnum(tune_log._num(effective.get(c.ref)))
                        if tune_log._num(effective.get(c.ref)) is not None else effective.get(c.ref))
@@ -225,12 +237,33 @@ def _row_values(cols: List[_Col], effective: dict, by_dest: dict, artifact: Opti
     return out
 
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _incident_row(inc: Any) -> tuple:
+    """(event text, dead) for a RunIncident (or a dict / namespace shaped like one)."""
+    kind = str(getattr(inc, "kind", "") or "")
+    detail = str(getattr(inc, "detail", "") or "")
+    if kind == "rf_fault":
+        return (f"RF FAULT — {detail}" if detail else "RF FAULT"), True
+    if kind == "gave_up":
+        return (f"AUTO-RESTART GAVE UP — {detail}" if detail else "AUTO-RESTART GAVE UP"), True
+    if kind == "restart":
+        return (f"RESTART — {detail}" if detail else "RESTART"), True
+    return (f"{kind.upper()} — {detail}" if detail else kind.upper()), True
+
+
 def build_task_table(task_name: str, steps: list, spec: Optional[dict], artifact: Optional[dict],
                      realize: Optional[Callable] = None, *, freq_hz: Optional[float] = None,
-                     on_air_at: Optional[str] = None) -> dict:
+                     on_air_at: Optional[str] = None, incidents: Optional[list] = None) -> dict:
     """Reconstruct one task's per-change table. ``steps`` is the run's fired StepFire list (any
     order); ``realize(power_dbm, freq_hz)`` returns ``{'sdr_gain_db', 'atten_db'}`` (or None).
-    ``on_air_at`` (T0, an ISO instant) backs the signed 'On-air offset [s]' column.
+    ``on_air_at`` (T0, an ISO instant) backs the signed 'On-air offset [s]' column. ``incidents``
+    are the run's RunIncidents (an RF fault, a relaunch-less restart, a give-up): each becomes an
+    Event row at its instant with the task DEAD (blank power/device cells, RF 0); a fire carrying a
+    ``note`` (the synthetic RESTART relaunch) puts it in the Event column and always gets a row, even
+    at an unchanged level — so a recovered run's export shows the outage and the recovery
+    (docs/rf-fault-recovery.md §14n).
     Returns ``{'task', 'columns': [str], 'rows': [[...]]}`` — a row only where a value changed."""
     spec = spec or {}
     params = spec.get("params", []) or []
@@ -242,31 +275,49 @@ def build_task_table(task_name: str, steps: list, spec: Optional[dict], artifact
     fired = [s for s in steps if getattr(s, "task_name", None) == task_name
              and getattr(s, "fired_actual", None) and not str(getattr(s, "fired_actual")).startswith("skipped")
              and getattr(s, "action", None) in ("start", "run", "tune")]
-    fired.sort(key=lambda s: str(s.fired_actual))
+    # One timeline: the fires at their actual instants + this task's incidents at theirs.
+    events: List[tuple] = [(str(s.fired_actual), "fire", s) for s in fired]
+    for inc in incidents or []:
+        itask = str(getattr(inc, "task", "") or "")
+        if itask and itask != task_name:
+            continue
+        events.append((str(getattr(inc, "at", "") or ""), "incident", inc))
+
+    def _when(e):
+        dt = _parse_iso(e[0])
+        return (dt is None, dt or _EPOCH, e[0])
+    events.sort(key=_when)
     cols = _columns(spec, artifact, laws, by_dest, has_realize=realize is not None)
 
     rows: List[list] = []
     effective: dict = {}
     last: Optional[list] = None
     freq_dest = spec.get("calibration_freq_param")
-    for s in fired:
-        if s.action in ("start", "run"):
-            effective.update(_args_to_params(list(getattr(s, "args", []) or []), flag_to_dest))
-        if getattr(s, "params", None):
-            effective.update(dict(s.params))
+    for when, kind, obj in events:
+        dead = False
+        if kind == "incident":
+            event, dead = _incident_row(obj)
+        else:
+            s = obj
+            if s.action in ("start", "run"):
+                effective.update(_args_to_params(list(getattr(s, "args", []) or []), flag_to_dest))
+            if getattr(s, "params", None):
+                effective.update(dict(s.params))
+            event = str(getattr(s, "note", "") or "")
         # Realize each row at the carrier in effect on THAT row (the script's CAL_FREQ_PARAM,
         # scaled to Hz) — the frequency the script folded its gain at — so the SDR gain /
         # attenuation columns reproduce what the unit actually commanded.
         row_freq = tune_log.freq_hz_of(spec, effective) if freq_dest else None
         values = _row_values(cols, effective, by_dest, artifact, realize,
-                             row_freq if row_freq is not None else freq_hz, rf_gate)
-        body = values[1:]                            # everything but Time
-        if last is not None and body == last:
+                             row_freq if row_freq is not None else freq_hz, rf_gate, dead=dead)
+        body = values[1:-1]                          # everything but Time and Event
+        if not event and last is not None and body == last:
             continue                                 # nothing changed → no new row
         last = body
         # Fill Time + the on-air offset AFTER the change check (both vary every fire, so filling
         # them before would defeat the row-per-change dedupe — body still holds their placeholders).
-        values[0] = _hhmmss(str(s.fired_actual))
-        values[1] = _fnum(_offset_s(str(s.fired_actual), on_air_at), 3)
+        values[0] = _hhmmss(when)
+        values[1] = _fnum(_offset_s(when, on_air_at), 3)
+        values[-1] = event
         rows.append(values)
     return {"task": task_name, "columns": [c.header for c in cols], "rows": rows}
