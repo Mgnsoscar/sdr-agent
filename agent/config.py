@@ -430,7 +430,7 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # two never double-transmit on the single TX channel (an owned-query gates it). Gated by the master
 # kill-switch AUTO_RESTART_ENABLED. Adds capability `task-auto-restart` (the client gates its
 # "Auto-restart on fault" checkbox on it); opt-in per task (default False = today's behaviour).
-AGENT_VERSION = "1.36.7"
+AGENT_VERSION = "1.36.8"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -695,6 +695,24 @@ CTRL_BIND_GRACE_S    = float(os.environ.get("SDR_CTRL_BIND_GRACE_S", "180.0"))
 # component is not re-sent on a tune (a launch always re-sends). 0 leaves a priority untouched.
 TASK_NICE    = int(os.environ.get("SDR_TASK_NICE", "-5"))
 ONESHOT_NICE = int(os.environ.get("SDR_ONESHOT_NICE", "10"))
+
+# RF SAFETY around the active components (docs/rf-fault-recovery.md §14q).
+# ACTIVE_SET_STRICT — a launch or tune that OPENS the RF gate is REFUSED when an attenuator set fails
+# or times out: the script clamps its own SDR gain to a ceiling that assumes the attenuator is where
+# the agent put it, so an attenuator of unknown position (re-enumerated at 0 dB after a USB reset,
+# its serial port gone) makes that ceiling tens of dB hot. A MUTE that fails is logged, never refused
+# (there is nothing safer to fall back to). 0 restores the old best-effort launch.
+# MUTE_ON_FAULT — an RF fault, a crash or a stop of a calibrated task drives its attenuators to max,
+# so the "RF dropped" the alarm claims is physical: a killed process leaves the radio's TX LO on and
+# its leakage rides through an attenuator left at the transmit setting. Skipped while another task is
+# live on the unit (the chain is shared).
+# RESET_SDR_ON_FAULT — after such a fault, when no task is live, the SDR is opened and closed once
+# (uhd_usrp_probe, bounded by RESET_SDR_TIMEOUT_S) so UHD's teardown disables the TX chain the crash
+# left enabled; a relaunch meanwhile waits on the device gate, as for the boot pre-image.
+ACTIVE_SET_STRICT   = _env_flag("SDR_ACTIVE_SET_STRICT", True)
+MUTE_ON_FAULT       = _env_flag("SDR_MUTE_ON_FAULT", True)
+RESET_SDR_ON_FAULT  = _env_flag("SDR_RESET_SDR_ON_FAULT", True)
+RESET_SDR_TIMEOUT_S = float(os.environ.get("SDR_RESET_SDR_TIMEOUT_S", "15"))
 
 # Curated fault signatures the log-scan matches (case-insensitive, substring). The authoritative one
 # is the Layer-1 done-watcher marker (paramkit.txhealth.FAULT_MARKER) — a script emits it the instant

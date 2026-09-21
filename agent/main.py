@@ -154,6 +154,7 @@ async def lifespan(app: FastAPI):
     # RF-fault DETECTION (Phase 1): when the health watchdog confirms a task fault, couple it into
     # the owning run (stamp run.fault, stop tuning the dead task, emit sequence_rf_fault).
     _manager.set_fault_hook(_runner.on_task_fault)
+    _manager.set_active_hook(_runner.on_active_set)
     # RF-fault RECOVERY (Phase 3b): the owned-query lets a standalone task's Auto-restart-on-fault skip
     # a task a run currently owns or is about to launch (that fault is the run policy's to recover — no
     # double-transmit); the launch hook relaunches through the full path (repositions the attenuator).

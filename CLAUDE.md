@@ -59,7 +59,8 @@ view it with `screenshot.py --tab calibration`.
 - **Capabilities + version:** a new client-visible feature adds a string to
   `AGENT_CAPABILITIES` and bumps `AGENT_VERSION` (both in `agent/config.py`); `test_meta_endpoint.py`
   asserts the capability set. The client feature-gates on these exact strings. Current version is
-  in `config.py` (`1.36.7`: the export ends where the signal did — a fired STOP and a run abort are dead
+  in `config.py` (`1.36.8`: RF safety around the attenuator — `ACTIVE_SET_STRICT` refuses an RF-on launch/tune
+  over a failed set, `MUTE_ON_FAULT` mutes on fault/crash/stop, `RESET_SDR_ON_FAULT` probe, behaviour only; `1.36.7`: the export ends where the signal did — a fired STOP and a run abort are dead
   `STOP` / `ABORTED — reason` rows, behaviour only; `1.36.6`: a CRASH of a run-driven task is the run's fault — coupled via `_flag_rf_fault`
   with a crash detail, behaviour only; `1.36.5`: live-tune underflow mitigations — an identical attenuator set is not re-sent on
   a tune, transmit tasks at `TASK_NICE` −5 / active-set one-shots at `ONESHOT_NICE` 10, behaviour only; `1.36.4`: the exported log-table's `Event` column shows a run's RF faults / restarts —
@@ -99,6 +100,27 @@ is always dBm so one stage ceiling gauges every signal. `resolve()` folds all th
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
 ## MERGED TO `main` (all three repos, fast-forward, 1.34.0) — field rollout: OTA every unit's agent FIRST, then deploy the library; rebuild the client bundle from 1.34.0. Nothing in the RF-fault arc has run on real hardware yet (mock scripts + fake gnuradio + the headless unit only).
+
+## Current state — RF SAFETY around the attenuator (1.36.8, no capability) (branch `claude/system-familiarization-f5mezz`, agent-only)
+Owner report on the auto-restarted L1C run (three USB-drop crashes, §14p): "when it came back … the power was waaaay
+higher than it should have been" (identical −70 dBm / 75.5 dB banners each time) and "the rf-faulted task keeps
+transmitting the LO leakage if I don't go and manually stop the task". Both are the ATTENUATOR: the pre-command
+positioned it BEST-EFFORT (a failed/timed-out set was a log line and the launch went ahead at a calibrated gain over
+an attenuator of unknown position — a USB event that kills the B206 can re-enumerate a USB-serial attenuator too),
+and nothing ever drove it to max on a fault/crash/stop (a killed UHD process leaves the TX LO on; it leaks through the
+transmit setting). Record: `docs/rf-fault-recovery.md` §14q. Now: **`ACTIVE_SET_STRICT`** (on) — `_gate_precommand`
+RAISES `RF gate refused — the attenuator's position is unknown: …` when a set fails/times out and the gate is (to be)
+ON: a launch → `⚠ start FAILED` + W4 fault coupling; an RF-on tune → no RPC (gate stays closed); a failing MUTE is
+never refused. `_apply_active_settings(force, strict, task, kind)` returns the failures and annotates EVERY sent set
+into the driving run's log via `ProcessManager.set_active_hook` → `SequenceRunner.on_active_set` (`⚙ atten_set
+--attenuation 31.75 → ok` / `⚠ … FAILED (exit 1|timed out)` / `(mute)`). **`MUTE_ON_FAULT`** (on) — `mute_chain(name)`
+after a watchdog fault, an rf-fault exit or a run-driven crash (`ManagedProcess._after_fault` → the manager's
+`_after_fault` hook) and on every `ProcessManager.stop` (stopped ⇒ muted), skipped while another task is live.
+**`RESET_SDR_ON_FAULT`** (on, `RESET_SDR_TIMEOUT_S` 15) — a detached, bounded `uhd_usrp_probe` open/close after a
+fault when no task is live, holding `device_free` (a relaunch waits) so UHD's teardown disables the crashed TX chain
+(expected, not hardware-verified; the mute is the certain part). `AGENT_VERSION 1.36.7 → 1.36.8`. Tests:
+`tests/test_rf_gate_safety.py` (9) + `test_tune_underflow_mitigation` updated. Suite 755 → 764. Open: a stable
+`/dev/serial/by-id` path for the attenuator; the agent can't read the attenuator back.
 
 ## Current state — a CRASH of a run-driven task is the run's fault (1.36.6, no capability) (branch `claude/system-familiarization-f5mezz`, agent-only)
 Owner report: an L1C sequence's script died a second after `rf on` (`usb tx2 transfer status:

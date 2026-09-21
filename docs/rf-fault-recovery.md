@@ -1957,6 +1957,65 @@ long line; and LIVE through the runner's wiring (`set_fault_hook` / `set_owned_q
 `process crashed (exit −9)…`, the incident is recorded, the run stays RUNNING, and a resync
 `restart_run` relaunches it with its note. Suite 746 → 751.
 
+## 14q. RF safety around the attenuator: a strict gate, mute on fault/stop, a post-fault radio reset (`AGENT_VERSION 1.36.8`, no capability)
+
+**Owner report (2026-09-21, 1.36.7):** the L1C sequence armed with `auto` recovery. The B206 dropped
+its USB transfer three times (`LIBUSB_TRANSFER_ERROR` ×2, then `NO_DEVICE`); each crash was coupled
+(§14p), auto-restarted and resynced, and the budget tripped on the third — the run log reads
+exactly as designed. Two things were wrong on the air: **"when it came back subsequent times after
+the first crash, the power was waaaay higher than it should have been"**, although every launch
+banner shows the same −70 dBm target and the same 75.50 dB SDR gain; and **"the rf-faulted task keeps
+transmitting the LO leakage if I don't go and manually stop the task"**.
+
+**Reading.** Both are the attenuator, the one element of the chain the script's own gain clamp
+knows nothing about. (1) The agent positions the attenuator before every RF-on launch/tune
+**best-effort**: `_apply_active_settings` logged a failed or timed-out one-shot and the launch went
+ahead — at a calibrated 75.5 dB over an attenuator of unknown position. The USB event that killed the
+B206 is exactly the kind that also resets a USB-serial attenuator (re-enumerated, its port renamed,
+its power-on default loaded), and nothing in the run log said whether the set had worked; a
+30 dB-hotter relaunch is what an attenuator at 0 dB instead of ~32 dB gives. (2) A killed UHD
+process never runs its teardown, so the AD9361's TX chain and LO stay ENABLED; the LO leakage then
+rides through an attenuator left at the transmit setting. Nothing drove it to max on a fault, a
+crash or even a stop — only a fresh open of the device (or the attenuator) changes anything.
+
+**Change (agent only, behaviour):**
+
+- **`ACTIVE_SET_STRICT`** (default on, `SDR_ACTIVE_SET_STRICT=0` restores best-effort): a launch or a
+  tune that leaves/turns the RF gate ON is **refused** when any attenuator set fails or times out —
+  `_gate_precommand` raises `RF gate refused — the attenuator's position is unknown: atten_set
+  --attenuation 31.75: exit 1 …`. A refused launch is a `⚠ start FAILED` in the run log, coupled as
+  the run's fault (W4 — Restart / the auto policy try again, the budget trips loudly); a refused
+  RF-on tune never sends its RPC (the gate stays closed). A MUTE that fails is logged, never refused.
+- **The run log records every attenuator command** — `ProcessManager.set_active_hook` →
+  `SequenceRunner.on_active_set` annotates each active run that drives the task:
+  `⚙ atten_set --attenuation 31.75 → ok`, `⚠ atten_set --attenuation 31.75 FAILED (exit 1)`,
+  `… FAILED (timed out)`, `… (mute) → ok`. Identical skipped sets (§14o) are not noted.
+- **`MUTE_ON_FAULT`** (default on): `ProcessManager.mute_chain(name)` drives the task's attenuators to
+  max after a watchdog fault (`_scan_task_health`, after the auto-drop), after an rf-fault exit or a
+  run-driven crash (`_watch` → `ManagedProcess._after_fault` → the manager hook), and on **every
+  `ProcessManager.stop`** (stopped ⇒ muted) — unless another task is live on the unit (the chain is
+  shared) or the task has no calibrated actives. Best-effort, annotated like any set.
+- **`RESET_SDR_ON_FAULT`** (default on, bounded by **`RESET_SDR_TIMEOUT_S`** 15 s): after a fault, when
+  no task is live, the SDR is opened and closed once via the existing `uhd_usrp_probe` pre-image
+  (`_reset_radio`, detached, one at a time) so UHD's teardown disables the TX chain the crash left
+  enabled; it holds `device_free` meanwhile so a relaunch WAITS instead of colliding (the boot
+  pre-image's rule), hard-bounded like it. **Expected, not verified on hardware** — the B2xx teardown
+  deactivates the codec chains on a clean close; the mute above is the certain part.
+
+**Not done / open:** the attenuator's serial port should be addressed by a stable path
+(`/dev/serial/by-id/…`) so a re-enumeration cannot rename it; a persistent attenuator process; the
+agent still cannot READ the attenuator back (the script sets, it doesn't query) — a confirmed set
+means "the command was accepted", not "the wiper is there".
+
+Tests: `tests/test_rf_gate_safety.py` — a failed set refuses an RF-on launch (nothing spawned) and a
+timed-out one too, the knob restores best-effort; a failing mute is not refused while the RF-on tune
+after it is (no RPC) and the next successful set lets it through; every set is annotated with its
+exact outcome and the runner routes the note to the run driving the task only; the chain is muted on
+a watchdog fault, on a run-driven crash and on a stop, not while another task is live or with the
+knob off; the post-fault reset holds the device gate, is skipped while a task is live and with the
+knob off. `test_tune_underflow_mitigation` updated (a failed set on an RF-on tune is now refused).
+Suite 755 → 764.
+
 ## 14. Open items
 
 - ~~Retrieve the archived `run_<ts>.log` from the affected unit + `df /dev/shm` /
@@ -1968,6 +2027,9 @@ long line; and LIVE through the runner's wiring (`set_fault_hook` / `set_owned_q
 - ~~Confirm the Pi 5 image's current `/dev/shm` size, `vm.max_map_count`, and `ulimit -n`~~ — DONE:
   8.3 GB / 1,048,576 / 1024.
 - **Verify the §14f #4 deferral on hardware** with the owner's reboot test after the OTA to 1.36.0.
+- **Verify §14q on hardware:** a failed attenuator set now refuses the launch (look for `⚠ atten_set …
+  FAILED` in the run log — that is the answer to "why was it hotter"); a fault/stop must leave the analyzer
+  clean (mute), and the post-fault probe should kill the LO leakage on a unit without an attenuator.
 - **Verify §14m on hardware (1.36.3):** the overloaded L1P configuration should read RF FAULT within
   ~5 s and be stopped (with Auto-restart on: relaunched once, then tripped); a healthy task with the odd
   sparse report must stay OK — the 1.36.2 false positive.

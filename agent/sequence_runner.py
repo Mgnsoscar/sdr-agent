@@ -2873,6 +2873,19 @@ class SequenceRunner:
 
     # ── Webhook helper ──────────────────────────────────────────────────────────
 
+    def on_active_set(self, task_name: str, line: str) -> None:
+        """The ProcessManager's active-set annotator (§14q): every attenuator command issued for
+        `task_name` — and whether it worked — lands in the run log of each active run that drives
+        or will launch the task. Synchronous, never raises."""
+        try:
+            for run in list(self._runs.values()):
+                if run.state not in _ACTIVE_STATES:
+                    continue
+                if any(s.task_name == task_name for s in run.steps):
+                    self._annotate(run, f"   {line}")
+        except Exception as exc:                          # noqa: BLE001
+            logger.debug("active-set annotation failed for '%s': %s", task_name, exc)
+
     def _annotate(self, run: SequenceRun, line: str) -> None:
         """Append a line to the run's text log if it is open (best-effort, never raises)."""
         rl = self._run_logs.get(run.id)

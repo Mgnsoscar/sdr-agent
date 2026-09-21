@@ -527,6 +527,9 @@ class ManagedProcess:
         # is a faithful reproduction, not a bare ManagedProcess.start that skips those. Set by the
         # ProcessManager; None in isolation → fall back to a direct self.start.
         self._launch_hook = None
+        # (name) -> awaitable: the manager's after-fault work (mute the chain, reset the radio) —
+        # called right after _flag_rf_fault on the exit paths (§14q). None in isolation.
+        self._after_fault_hook = None
         # The last StartRequest this task was launched with, so a standalone auto-restart reproduces
         # the EXACT parameters it faulted with (the Run… form may launch with custom args). None = a
         # bare start (the task's configured command). Its per-launch auto_restart_on_fault override
@@ -897,6 +900,7 @@ class ManagedProcess:
             # (no double-alarm). An ordinary crash keeps the existing CrashEvent path.
             if await self._is_rf_fault_exit():
                 await self._flag_rf_fault(self.health_detail or "flowgraph halted (non-zero exit)")
+                await self._after_fault()
                 # An RF fault does NOT go through the generic crash-restart supervisor: recovery is
                 # owned by the run's recovery policy (SequenceRunner.restart_run / the Phase-3 unattended
                 # trigger), which reconstructs the crash-time level and re-instates the schedule. Letting
@@ -921,6 +925,7 @@ class ManagedProcess:
                 # relaunches at the reconstructed level; a raw relaunch at the launch args would be a
                 # wrong-level double-transmit.
                 await self._flag_rf_fault(await self._crash_detail(code))
+                await self._after_fault()
                 return
             await self._fire_crash_event(code)
 
@@ -1266,6 +1271,15 @@ class ManagedProcess:
         except (TypeError, ValueError):
             return None
 
+    async def _after_fault(self) -> None:
+        """Hand the manager the after-fault work (mute the chain, reset the radio — §14q). Best-effort."""
+        if self._after_fault_hook is None:
+            return
+        try:
+            await self._after_fault_hook(self.config.name)
+        except Exception as exc:   # noqa: BLE001 — never let it break the exit path
+            logger.warning("after-fault work failed for '%s': %s", self.config.name, exc)
+
     async def _crash_detail(self, code: Optional[int]) -> str:
         """The fault detail for a run-owned crash: the exit code + the last meaningful log line (the
         UHD/USB error, the traceback's last line), so the alarm, the run and the export say WHY."""
@@ -1365,6 +1379,11 @@ class ProcessManager:
         self._launch_hook = None
         # Tasks claimed ONLY by a not-yet-fired launch (see ManagedProcess._wait_out_run_claim).
         self._pending_query = None
+        # (task, line) -> None: the SequenceRunner's run-log annotator for every active-component set
+        # (what was commanded and whether it worked) — the export/run log then says so (§14q).
+        self._active_hook = None
+        # The detached post-fault radio reset, kept so it isn't garbage-collected mid-flight.
+        self._reset_task: Optional[asyncio.Task] = None
         # Set FIRST in shutdown(): every sleeping relaunch checks it before spawning (review fix #12).
         self._shutdown_flag = asyncio.Event()
         # CLEARED while the boot pre-image (uhd_usrp_probe) holds the SDR; a task launch waits on it
@@ -1379,17 +1398,86 @@ class ProcessManager:
         self._tx_marker_scripts: Dict[str, bool] = {}
         for proc in self._procs.values():
             proc._shutdown_flag = self._shutdown_flag
+            proc._after_fault_hook = self._after_fault
 
     def _make_proc(self, cfg: TaskConfig) -> ManagedProcess:
         proc = ManagedProcess(
             cfg, LogManager(self._log_root, cfg.name), self._dispatcher, self._unit_id
         )
         proc._fault_hook = self._fault_hook
+        proc._after_fault_hook = self._after_fault
         proc._owned_query = self._owned_query
         proc._pending_query = self._pending_query
         proc._launch_hook = self._launch_hook
         proc._shutdown_flag = self._shutdown_flag
         return proc
+
+    def set_active_hook(self, hook) -> None:
+        """Register the run-log annotator (task_name, line) -> None for active-component sets (§14q)."""
+        self._active_hook = hook
+
+    def _note_active(self, task: str, line: str) -> None:
+        if self._active_hook is None or not task:
+            return
+        try:
+            self._active_hook(task, line)
+        except Exception as exc:   # noqa: BLE001 — annotation never breaks a set
+            logger.debug("active-set note failed for '%s': %s", task, exc)
+
+    async def _after_fault(self, name: str) -> None:
+        """After a task RF-faulted / crashed (§14q): mute its chain so the dead radio's LO leakage is
+        attenuated, then reset the radio (detached, bounded) so the TX chain the crash left enabled is
+        disabled by UHD's teardown. A relaunch waits on the device gate meanwhile."""
+        await self.mute_chain(name, reason="fault")
+        self._start_reset_radio(name)
+
+    async def mute_chain(self, name: str, *, reason: str = "") -> None:
+        """Drive `name`'s active components to MUTE (every attenuator at max) — after a fault, a
+        crash or a stop — unless another task is live on the unit (the chain is shared) or the task
+        has no calibrated actives. Best-effort: a failed mute is logged and annotated, never raised."""
+        if not _agentcfg.MUTE_ON_FAULT:
+            return
+        others = [o for o in self._procs if o != name and self.is_live(o)]
+        if others:
+            logger.info("Not muting '%s' chain (%s): %s still live", name, reason, ", ".join(others))
+            return
+        st = self._gate_state.get(name) or {}
+        try:
+            settings = self._mute_settings(name, st.get("freq_hz"))
+        except Exception as exc:   # noqa: BLE001
+            logger.debug("mute settings unavailable for '%s': %s", name, exc)
+            return
+        if not settings:
+            return
+        await self._apply_active_settings(settings, force=True, strict=False, task=name, kind="mute")
+
+    def _start_reset_radio(self, name: str) -> None:
+        """Kick the detached post-fault radio reset (RESET_SDR_ON_FAULT), one at a time."""
+        if not _agentcfg.RESET_SDR_ON_FAULT or _agentcfg.RESET_SDR_TIMEOUT_S <= 0:
+            return
+        if self._reset_task is not None and not self._reset_task.done():
+            return
+        self._reset_task = asyncio.create_task(self._reset_radio(name), name=f"reset-radio-{name}")
+
+    async def _reset_radio(self, name: str) -> None:
+        """Open + close the SDR once (uhd_usrp_probe) so a crashed task's TX chain is disabled by
+        UHD's teardown — the LO a killed process leaves running otherwise leaks until the next open.
+        Skipped while any task is live (it would collide on the device); holds the device gate so a
+        relaunch waits instead of colliding; hard-bounded like the boot pre-image (never hangs)."""
+        if any(self.is_live(o) for o in self._procs):
+            logger.info("Post-fault SDR reset skipped: a task is live")
+            return
+        t = _agentcfg.RESET_SDR_TIMEOUT_S
+        self.device_free.clear()
+        try:
+            result = await asyncio.wait_for(_sysmon.pre_image_sdr(t), timeout=t + 10)
+            logger.info("Post-fault SDR reset after '%s': %s", name, result)
+        except asyncio.TimeoutError:
+            logger.warning("Post-fault SDR reset did not return within its bound; continuing")
+        except Exception as exc:   # noqa: BLE001
+            logger.warning("Post-fault SDR reset failed: %s", exc)
+        finally:
+            self.device_free.set()
 
     def set_fault_hook(self, hook) -> None:
         """Register the run-coupling callback (task_name, detail) -> awaitable, invoked when a task
@@ -1659,6 +1747,7 @@ class ProcessManager:
         except Exception as exc:   # noqa: BLE001
             logger.warning("auto-drop-RF stop failed for '%s': %s", proc.config.name, exc)
             return
+        await self._after_fault(proc.config.name)          # mute the chain, reset the radio (§14q)
         # True-wedge path: the process is now DEAD (stop() awaited its exit). A standalone
         # auto-restart-on-fault task relaunches — DETACHED, so the ~restart_delay_s settle can't stall
         # the watchdog from scanning other tasks. _maybe_auto_restart_standalone awaits the old watcher
@@ -1908,6 +1997,8 @@ class ProcessManager:
     async def stop(self, name: str, source: str = "manual") -> ProcessStatus:
         proc = self._get(name)
         await proc.stop()
+        # stopped ⇒ muted: the chain is left safe whatever the radio does next (§14q).
+        await self.mute_chain(name, reason=f"stop ({source})")
         status = proc.status()
         if source == "manual":
             await self._fire_task_event("task_stopped", status)
@@ -2187,13 +2278,16 @@ class ProcessManager:
             logger.warning("Active-set '%s' exited with code %s", name, code)
         return code
 
-    async def _apply_active_settings(self, settings: List[dict], *, force: bool = True) -> None:
+    async def _apply_active_settings(self, settings: List[dict], *, force: bool = True,
+                                     strict: bool = False, task: str = "",
+                                     kind: str = "set") -> List[str]:
         """Fire each active-component set (a one-shot, awaited) so the components are physically in
-        position before the transmit emits. Best-effort: a failed/timed-out set is logged, not
-        fatal (the transmit script still clamps its own SDR gain to a safe range). With
-        ``force=False`` (a live tune) a set identical to the last one SENT to that component is
-        skipped — the component is already there, and the spawn is what starves a saturated
-        transmitter (§14o)."""
+        position before the transmit emits. With ``force=False`` (a live tune) a set identical to the
+        last one SENT to that component is skipped — the component is already there, and the spawn
+        is what starves a saturated transmitter (§14o). Every set actually sent is annotated into the
+        owning run log(s) via the active hook with its outcome (§14q). Returns the list of FAILURES
+        (a description each); with ``strict`` the caller refuses to open the RF gate on any."""
+        failures: List[str] = []
         for s in settings or []:
             atask, param, value = s.get("task"), s.get("param"), s.get("value")
             if not atask or param is None or value is None:
@@ -2204,19 +2298,31 @@ class ProcessManager:
                 logger.debug("Active component '%s' already at %s=%s — not re-sent", atask, param,
                              _fmt_num(value))
                 continue
-            args = [self._active_flag(atask, param), _fmt_num(value)]
+            flag = self._active_flag(atask, param)
+            args = [flag, _fmt_num(value)]
             # Constant params (e.g. the attenuator's serial port) travel on every set — the
             # driving param alone isn't enough for the script to run.
             for cdest, cval in consts.items():
                 args += [self._active_flag(atask, cdest), str(cval)]
+            what = f"{atask} {flag} {_fmt_num(value)}" + (" (mute)" if kind == "mute" else "")
             self._active_last.pop(atask, None)          # unknown until the set succeeds
             try:
                 code = await self._launch_oneshot_wait(atask, args)
             except Exception as exc:                     # never let a set derail the transmit
                 logger.warning("Active component '%s' set failed: %s", atask, exc)
+                failures.append(f"{what}: {exc}")
+                self._note_active(task, f"⚠ {what} FAILED: {exc}")
                 continue
             if code == 0:
                 self._active_last[atask] = key
+                self._note_active(task, f"⚙ {what} → ok")
+            else:
+                outcome = "timed out" if code is None else f"exit {code}"
+                failures.append(f"{what}: {outcome}")
+                self._note_active(task, f"⚠ {what} FAILED ({outcome})")
+        if failures and strict:
+            logger.error("RF gate refused for '%s': %s", task, "; ".join(failures))
+        return failures
 
     async def _precommand_active(self, name: str, power: Optional[float],
                                  freq_hz: Optional[float] = None) -> None:
@@ -2226,7 +2332,7 @@ class ProcessManager:
         is physically in position first. Best-effort: a failed/timed-out set is logged, not
         fatal (the transmit script still clamps its own SDR gain to a safe range). A no-op for
         a task without active components or without an absolute power (relative-gain mode)."""
-        await self._apply_active_settings(self.active_settings(name, power, freq_hz))
+        await self._apply_active_settings(self.active_settings(name, power, freq_hz), task=name)
 
     def _rf_gate(self, name: str) -> Optional[dict]:
         """The task's RF output-gate param dict (or None) from its cached argspec."""
@@ -2265,10 +2371,18 @@ class ProcessManager:
                     st["freq_hz"] = f
         force = cmd is not None                          # a launch always re-sends (§14o)
         if gate is not None and not st["rf_on"]:
-            await self._apply_active_settings(self._mute_settings(name, st.get("freq_hz")), force=force)
-        else:
-            await self._apply_active_settings(
-                self.active_settings(name, st["power"], st.get("freq_hz")), force=force)
+            await self._apply_active_settings(self._mute_settings(name, st.get("freq_hz")),
+                                              force=force, task=name, kind="mute")
+            return
+        # The gate is (or is about to be) OPEN: the attenuator MUST be where the realization put it.
+        strict = bool(_agentcfg.ACTIVE_SET_STRICT)
+        failures = await self._apply_active_settings(
+            self.active_settings(name, st["power"], st.get("freq_hz")),
+            force=force, strict=strict, task=name)
+        if failures and strict:
+            raise RuntimeError(
+                "RF gate refused — the attenuator's position is unknown: " + "; ".join(failures)
+                + " (the launch/tune was not sent; SDR_ACTIVE_SET_STRICT=0 restores best-effort)")
 
     async def restart(self, name: str, request: Optional[StartRequest] = None,
                       source: str = "manual") -> ProcessStatus:

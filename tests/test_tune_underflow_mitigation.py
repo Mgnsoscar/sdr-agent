@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import pytest                                                        # noqa: E402
 from agent import process_manager as pm                              # noqa: E402
 from agent.models import ProcessState, StartRequest, TaskConfig        # noqa: E402
 import test_active_freq_consistency as A                              # noqa: E402  (_mgr/_capture/_atten_at)
@@ -74,8 +75,9 @@ def test_a_failed_set_is_not_remembered(tmp_path, monkeypatch):
     monkeypatch.setattr(mgr, "_launch_oneshot_wait", flaky)
     asyncio.run(mgr.start("tx", StartRequest(args=["--freq", "1575.42", "--power", "-30"],
                                              replace_args=True), source="sequence"))
-    asyncio.run(mgr.set_params("tx", {"power": -60.0}))               # exits 1 → position unknown
-    asyncio.run(mgr.set_params("tx", {"power": -60.0}))               # so it is sent again
+    with pytest.raises(RuntimeError):                                 # exits 1 → the RF-on tune is REFUSED (§14q)
+        asyncio.run(mgr.set_params("tx", {"power": -60.0}))
+    asyncio.run(mgr.set_params("tx", {"power": -60.0}))               # position unknown → sent again, ok
     assert len(fired) == 3 and fired[-1] == fired[-2]
     asyncio.run(mgr.set_params("tx", {"power": -60.0}))               # now remembered
     assert len(fired) == 3
