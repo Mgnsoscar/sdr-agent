@@ -240,7 +240,7 @@ def build_task_table(task_name: str, steps: list, spec: Optional[dict], artifact
     rf_gate = _rf.gate(params)                        # the RF output gate (muted power ⇒ blank cells)
 
     fired = [s for s in steps if getattr(s, "task_name", None) == task_name
-             and getattr(s, "fired_actual", None) and str(getattr(s, "fired_actual")) != "skipped"
+             and getattr(s, "fired_actual", None) and not str(getattr(s, "fired_actual")).startswith("skipped")
              and getattr(s, "action", None) in ("start", "run", "tune")]
     fired.sort(key=lambda s: str(s.fired_actual))
     cols = _columns(spec, artifact, laws, by_dest, has_realize=realize is not None)

@@ -1667,12 +1667,54 @@ Run it again without a reboot → normal transmission. The first launch after bo
    waiting for the control socket". And the **co-timed edge**: if the socket appears between a
    deferred power point and its co-timed `rf on` within one tick, the gate opens at the launch power
    for one tick — hold back a task's remaining co-timed tunes once one is deferred.
+   **→ Both addressed by §14l (1.36.1):** a pile-up is one co-timed batch, power before RF-on, and
+   the run log names how late the task came up and how many points it skipped.
 3. **Pre-roll vs. measured launch time.** Record each task's launch-to-bind time; warn at arm when a
    sequence's lead-in is shorter than the task's worst observed cold start; lengthen the client's
    default lead-in for an RF-gated launch (10 s was not enough here).
 4. **Persistent journald** on the units (`mkdir -p /var/log/journal`) — provisioning.
 5. Cosmetic: the chirp banner's `power (achieved on grid)` is the SDR alone with the attenuator at
    rest (`power_for_gain` without `applied_db`) — misleading on an attenuator chain.
+
+## 14l. A late task rejoins its schedule at the CURRENT level (`AGENT_VERSION 1.36.1`, no capability)
+
+**Owner test (2026-09-21, fleet on 1.36.0):** a plan whose warm-up was deliberately far too short for
+the L2C full loop (a 736 MB build, ≈20 s on the Pi). The §14f #4 deferral did its job — the on-air
+tunes waited for the control socket and `HEALTH state=transmitting` appeared — but the run log then
+showed every point the ramp had passed while the task was building fired within two seconds
+(−81.5, −79.5, −77.5, −75.5, −73.5 dBm/Hz between 13:36:19 and 13:36:21), with the `rf on` landing
+between the first and the second: the task swept through every missed level with the gate open, and
+the co-timed edge noted in §14k bit exactly as predicted. Owner: *"if there's been multiple fires of
+the same parameter, it doesn't need to fire them all when it jumps back in."*
+
+**Change (`sequence_runner._collapse_piled_tunes`, called by `_tick` before firing):**
+
+- The due TUNES of one (run, task) with two or more members form a **batch** once `tune_ready`
+  says the task is ready (or its bind grace is spent). While it is still binding the group is left
+  alone — the pile-up keeps deferring and keeps growing until the moment it can be applied.
+- Per **parameter set** (the tune's `params` keys) only the **latest** point survives; the earlier
+  ones are stamped **`"skipped:superseded"`** and persisted. A different parameter (`bw` beside
+  `power`, the `rf` gate) is its own set and survives.
+- The survivors are **re-timed to the batch's latest fire instant** and sorted by `_due_sort_key`
+  (a STOP first, then `_co_time_rank`: power 0 → neutral 1 → RF-on 2), so the gate opens **at the
+  level the schedule is at now** — the stale-launch-power blip of the co-timed edge is gone.
+- One run-log line per batch: `⏭ <task> came up N s late — M superseded power point(s) skipped;
+  rejoining the schedule at its current level` (N counted from the earliest missed fire).
+- **The new sentinel's consumers:** `_counts_at_cutoff` counts `skipped:superseded` for **resync**
+  (the schedule's position, like a fault-skipped fire) and never for replay (it never transmitted);
+  the restart re-instatement re-instates only `"skipped"` (unchanged); `_tune_target_stale`,
+  `_fire_instant`, `_tasks_owned_by_active_runs`, `_maybe_complete` already treat any `skipped*` as
+  not-fired/done. `run_table` now filters **every** `skipped*` sentinel (it compared `!= "skipped"`,
+  so a `skipped:hold` / `skipped:stale` step could export a phantom last row — a latent bug).
+- Launches/stops, a task with a single due tune, and a run whose task is still binding are ordered
+  exactly as before.
+
+Tests: `tests/test_deferred_tune_collapse.py` — the batch deterministically (per-parameter
+collapse; a foreign STOP keeps its instant and goes first; power → bw → RF-on), a lone tune and a
+still-binding task left untouched, the sentinel's consumers incl. the export, and a LIVE run over
+the 2 s-bind script with a 0.5 s pre-roll: the overrun points are superseded, RF-on fires after the
+first power point that did fire, the schedule continues to −50, the log names the skip. Suite
+714 → 718. Still open from §14k: the arm-time pre-roll check and persistent journald.
 
 ## 14. Open items
 

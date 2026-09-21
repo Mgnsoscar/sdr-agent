@@ -1576,10 +1576,12 @@ class SequenceRunner:
         if not step.fired_actual:
             return False                                 # never fired / re-instated / pending
         if step.fired_actual.startswith("skipped"):
-            # Only a FAULT-skipped fire ("skipped") ever counts, and only for resync (the schedule's
-            # position). A hold_now fast-forward skip ("skipped:hold") was never meant to transmit —
-            # counting it relaunched at the ramp TOP the operator skipped past (review fix #5).
-            if step.fired_actual != "skipped" or not include_skipped:
+            # Only a FAULT-skipped fire ("skipped") — or a point a late task's pile-up collapse
+            # superseded ("skipped:superseded", the schedule's position it rejoined past) — ever
+            # counts, and only for resync (the schedule's position). A hold_now fast-forward skip
+            # ("skipped:hold") was never meant to transmit — counting it relaunched at the ramp TOP
+            # the operator skipped past (review fix #5); a stale drop ("skipped:stale") never fires.
+            if step.fired_actual not in ("skipped", "skipped:superseded") or not include_skipped:
                 return False
         return _parse(step.fire_at) <= cutoff
 
@@ -1995,8 +1997,10 @@ class SequenceRunner:
         # task (run 1's STOP co-timed with run 2's START, the tightest arm-guard packing) must stop
         # the old process before the new launch — else the START is refused "already RUNNING" and
         # the STOP then kills the task run 2 believes it launched (re-review finding C2).
-        due.sort(key=lambda rs: (_parse(rs[1].fire_at), 0 if rs[1].action == "stop" else 1,
-                                 self._co_time_rank(rs[1])))
+        # A task that comes up LATE (its tunes were deferred until its control socket bound) rejoins
+        # its schedule at the CURRENT level: a pile-up of due tunes is collapsed per parameter to
+        # the latest point and fired as one co-timed batch (owner ask, 2026-09-21; see the method).
+        due = await self._collapse_piled_tunes(due, now)
         for run, step in due:
             await self._fire_step(run, step)
 
@@ -2449,6 +2453,90 @@ class SequenceRunner:
             if str(a) in flags and i + 1 < len(args):
                 val = args[i + 1]
         return _rf.is_on(val) if val is not None else False
+
+    def _due_sort_key(self, rs: tuple, at: Optional[datetime] = None) -> tuple:
+        """The firing order of due steps: by fire instant (``at`` overrides it for a re-timed batch),
+        a STOP before any launch at the same instant (re-review finding C2), then the co-time rank
+        (power before RF-on)."""
+        step = rs[1]
+        return (at or _parse(step.fire_at), 0 if step.action == "stop" else 1, self._co_time_rank(step))
+
+    async def _collapse_piled_tunes(self, due: List[tuple], now: datetime) -> List[tuple]:
+        """Order the due fires — and let a task that comes up LATE rejoin its schedule at the CURRENT
+        level instead of replaying every level it missed (owner ask, 2026-09-21; the field incident's
+        actual mechanism, `docs/rf-fault-recovery.md` §14k/§14l).
+
+        A tune due before the freshly launched script has bound its control socket is deferred tick
+        by tick (review fix #4), so a slow first launch (a cold B206 open, the L2C full-loop build)
+        piles up several due tunes of one task. Fired in schedule order they sweep the task through
+        every missed level within a second or two, with the RF-on landing somewhere in the middle.
+        Once the task IS ready (or its bind grace is spent) a pile-up is treated as ONE batch:
+
+        * per parameter set only the LAST point survives — the earlier ones are stamped
+          ``"skipped:superseded"`` (never transmitted: replay ignores them; resync counts them as
+          the schedule's position, like a fault-skipped fire);
+        * the survivors are re-timed to the batch's latest fire instant and fired in co-time-rank
+          order — a power point before the RF-on — so the gate opens at the level the schedule is
+          at now, never at a stale one.
+
+        A task with a single due tune, one still waiting for its socket (still deferred, so the
+        pile-up keeps growing until it is ready), and every launch/stop are ordered exactly as before.
+        The run log gets one line per collapsed batch naming how late the task came up."""
+        groups: Dict[tuple, List[tuple]] = {}
+        for rs in due:
+            if rs[1].action == "tune":
+                groups.setdefault((rs[0].id, rs[1].task_name), []).append(rs)
+        probe = getattr(self._manager, "tune_ready", None)
+        sort_at: Dict[int, datetime] = {}
+        drop: set = set()
+        notes: List[tuple] = []
+        for (_rid, task), members in groups.items():
+            if len(members) < 2:
+                continue
+            if callable(probe):
+                try:
+                    ready, within_grace = probe(task)
+                except Exception:                                # noqa: BLE001
+                    ready, within_grace = True, False
+                if not ready and within_grace:
+                    continue                                     # still binding: keep deferring
+            by_keys: Dict[frozenset, List[tuple]] = {}
+            for rs in members:
+                by_keys.setdefault(frozenset((rs[1].params or {}).keys()), []).append(rs)
+            superseded: List[StepFire] = []
+            survivors: List[tuple] = []
+            for same in by_keys.values():
+                same.sort(key=lambda rs: _parse(rs[1].fire_at))  # stable: co-timed keep list order
+                for rs in same[:-1]:
+                    superseded.append(rs[1])
+                    drop.add(id(rs[1]))
+                survivors.append(same[-1])
+            batch_at = max(_parse(rs[1].fire_at) for rs in survivors)
+            for rs in survivors:
+                sort_at[id(rs[1])] = batch_at
+            if superseded:
+                notes.append((members[0][0], task, superseded))
+        if drop:
+            async with self._lock:
+                for rs in due:
+                    run, step = rs
+                    if (id(step) in drop and step.fired_actual is None
+                            and run.state in (SequenceState.ARMED, SequenceState.RUNNING)):
+                        step.fired_actual = "skipped:superseded"
+                self._persist_runs()
+            for run, task, superseded in notes:
+                rl = self._run_logs.get(run.id)
+                if rl is None:
+                    continue
+                earliest = min(_parse(s.fire_at) for s in superseded)
+                late = max(0.0, (now - earliest).total_seconds())
+                names = sorted({str(k) for s in superseded for k in (s.params or {}).keys()})
+                rl.annotate(f"   ⏭ {task} came up {late:.0f} s late — {len(superseded)} superseded "
+                            f"{'/'.join(names) or 'tune'} point(s) skipped; rejoining the schedule at "
+                            f"its current level")
+        kept = [rs for rs in due if id(rs[1]) not in drop]
+        kept.sort(key=lambda rs: self._due_sort_key(rs, sort_at.get(id(rs[1]))))
+        return kept
 
     def _co_time_rank(self, step: StepFire) -> int:
         """Tie-break among steps that fire at the SAME instant: a step that SETS POWER (0) fires

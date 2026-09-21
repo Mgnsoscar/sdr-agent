@@ -59,8 +59,9 @@ view it with `screenshot.py --tab calibration`.
 - **Capabilities + version:** a new client-visible feature adds a string to
   `AGENT_CAPABILITIES` and bumps `AGENT_VERSION` (both in `agent/config.py`); `test_meta_endpoint.py`
   asserts the capability set. The client feature-gates on these exact strings. Current version is
-  in `config.py` (`1.36.0`: stacked sequences — arm guard A is task-aware — capability
-  `sequence-stacking`; `1.35.0`: plan-level anchoring replica — Phase: plan editor redesign — capability
+  in `config.py` (`1.36.1`: a late task rejoins its schedule at the CURRENT level — a pile-up of
+  deferred tunes collapses per parameter, power before RF-on; behaviour only; `1.36.0`: stacked sequences —
+  arm guard A is task-aware — capability `sequence-stacking`; `1.35.0`: plan-level anchoring replica — Phase: plan editor redesign — capability
   `plan-item-anchors`; `1.19.0`: edit-while-holding — Phase 3c — `POST …/proceed` honours
   `ProceedRequest.steps` behind `sequence-hold-edit`; `1.18.0`: Fast-Forward-to-Hold — Phase 3b —
   `POST …/hold-now` behind `sequence-hold-now`; `1.17.0`: the Hold-step HOLDING runtime — Phase 1 —
@@ -93,6 +94,30 @@ is always dBm so one stage ceiling gauges every signal. `resolve()` folds all th
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
 ## MERGED TO `main` (all three repos, fast-forward, 1.34.0) — field rollout: OTA every unit's agent FIRST, then deploy the library; rebuild the client bundle from 1.34.0. Nothing in the RF-fault arc has run on real hardware yet (mock scripts + fake gnuradio + the headless unit only).
+
+## Current state — a LATE task rejoins its schedule at the CURRENT level (1.36.1, no capability) (branch `claude/system-familiarization-f5mezz`, agent-only)
+Owner test on the updated fleet (1.36.0): a plan with a deliberately too-short warm-up on the L2C full loop
+(736 MB build, ~20 s). The §14f #4 deferral worked — the on-air tunes waited for the control socket — but then
+every tune that had piled up while the task was building fired within two seconds (−81.5 → −73.5 dBm/Hz in
+five steps), with the RF-on landing between the first and the second. Owner: "if there's been multiple fires
+of the same parameter, it doesn't need to fire them all when it jumps back in." Now `_tick` routes the due
+list through **`_collapse_piled_tunes(due, now)`** (record: `docs/rf-fault-recovery.md` §14l): the due TUNES
+of one (run, task) with ≥ 2 members form a batch ONCE the task is ready or its bind grace is spent
+(`tune_ready`; still binding → left alone, the pile-up keeps deferring); per parameter set only the LATEST
+point survives, the earlier ones are stamped **`"skipped:superseded"`** (a new sentinel: never transmitted —
+`_counts_at_cutoff` counts it for RESYNC like a fault-skipped fire (the schedule's position) and never for
+replay; the restart re-instatement, `_tune_target_stale`, `_fire_instant`, `_tasks_owned_by_active_runs` and
+`_maybe_complete` treat it like every other skip; `run_table` now drops EVERY `skipped*` sentinel — before, a
+`skipped:hold`/`:stale` step could export a phantom last row); the survivors are re-timed to the batch's
+latest fire instant and sorted by `_due_sort_key` (stop first, then `_co_time_rank`: power → neutral →
+RF-on), so the gate opens at the level the schedule is at NOW, never at a stale one; the run log gets ONE
+line per batch (`⏭ <task> came up N s late — M superseded power point(s) skipped; rejoining the schedule at
+its current level`). Launches/stops and a task with a single due tune are ordered exactly as before.
+`AGENT_VERSION 1.36.0 → 1.36.1`. Tests: `tests/test_deferred_tune_collapse.py` (the batch deterministically:
+per-parameter collapse, a foreign stop first, power before bw before RF-on; a lone tune / a still-binding task
+untouched; the sentinel's consumers incl. the export; and LIVE over the slow-bind script — the overrun points
+are superseded, RF-on fires after the first power point that did fire, the schedule continues, the log says
+so). Suite 714 → 718.
 
 ## Current state — the field incident's ROOT CAUSE is CONFIRMED (2026-09-21, docs only; no code, no version)
 The unit (`broadcaster-1`, agent 1.27.2) became reachable; its logs + the owner's controlled reproduction
