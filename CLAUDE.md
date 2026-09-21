@@ -94,6 +94,25 @@ representative frequency for scalar read-outs and publishes the full artifact fo
 
 ## MERGED TO `main` (all three repos, fast-forward, 1.34.0) — field rollout: OTA every unit's agent FIRST, then deploy the library; rebuild the client bundle from 1.34.0. Nothing in the RF-fault arc has run on real hardware yet (mock scripts + fake gnuradio + the headless unit only).
 
+## Current state — the field incident's ROOT CAUSE is CONFIRMED (2026-09-21, docs only; no code, no version)
+The unit (`broadcaster-1`, agent 1.27.2) became reachable; its logs + the owner's controlled reproduction
+(reboot → same plan → identical silent failure; re-run without reboot → works) REFUTE the `vmcircbuf`
+theory the whole RF-fault arc was written around. The truth: a **tune-before-bind race on the first launch
+after a reboot** — the cold launch took ≈10.5 s (B206 image load + imports) against the 10 s muted pre-roll,
+the agent's on-air `power` + `rf on` tunes were sent ≈0.5 s before `fm_chirp_tx.py` bound its control socket,
+agent 1.27.2 dropped them with only a `logger.error` (no run-log annotation; the journal was volatile),
+and the script stages a power tune while muted → the gate never opened; the radio streamed zeros for 9.5 min
+with a healthy process. The tell was the task's banner being copied into the run log AFTER `ON AIR (T0)`
+(`_tick`: collect → fires → on-air marker). The `vmcircbuf_prefs::get :info:` line is GR INFO output on
+every launch (five healthy runs carry it); `/dev/shm` 1 %, `ipcs -m` empty, `max_map_count` 1,048,576.
+**Already fixed by §14f #4 (1.31.1)** — the `tune_ready` deferral (`CTRL_BIND_GRACE_S`) — plus the
+`⚠ tune … FAILED` annotation, the P0 boot pre-image and `HEALTH state=transmitting`; NOT yet verified on
+hardware (run the reboot test after the OTA). P0's shared-memory work bought nothing for this incident
+(harmless, kept). Record: **`docs/rf-fault-recovery.md` §14k**; the supervisor one-pager
+`docs/incident-fm-chirp-vmcircbuf.md` was rewritten. Deferred by the owner: gate-tune read-back → RF fault,
+a deferral annotation + the co-timed edge, an arm-time pre-roll check + longer default lead-in, persistent
+journald. The DESIGN section below ("Field incident: … `vmcircbuf`") is the design-time reading.
+
 ## Current state — STACKED sequences: arm guard A is task-aware (1.36.0, capability `sequence-stacking`) (branch `claude/system-familiarization-f5mezz`, cross-repo)
 Owner decision (plan-editor round 3): "right now the rule should allow stacking of sequences — the only user is
 me, and I know what's compatible" (a fully task-aware rule is the eventual goal). Before, `sequence_runner.arm`'s
@@ -516,6 +535,7 @@ alarm + a fault-time resource/backend/UHD-log snapshot (which reads the P0 env w
 design + phasing in `docs/rf-fault-recovery.md`.
 
 ## Current state — RF-fault detection & sequence recovery: DESIGN — P0–P2 BUILT (1.29.0); P3 pending (branch `claude/system-familiarization-f5mezz`, cross-repo)
+*(Design-time reading — REFUTED 2026-09-21, see the top section + `docs/rf-fault-recovery.md` §14k.)*
 Field incident: an `fm_chirp` `--power` sweep (Pi 5) hit a GNU Radio **`vmcircbuf`** (shared-memory
 buffer) error **at startup** but the script did NOT exit, so the agent showed the task RUNNING while the
 SDR sent nothing; recovery was a manual plan-rebuild + eyeballed ramp position. Root cause + fix are

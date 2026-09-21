@@ -1,6 +1,10 @@
 # RF-fault detection & sequence recovery — design
 
-**Status:** DESIGN (approved in principle; build pending owner go-ahead)
+**Status:** BUILT (P0–P3b, 1.27.4 → 1.36.0). **Root cause CONFIRMED 2026-09-21 — read §14k first.**
+The `vmcircbuf` theory this document was written around (§1–§3.6) is **refuted** by the unit's own
+logs and a controlled reproduction: the incident was a **tune-before-bind race on the first launch
+after a reboot** (the "started after on-air" miss that §3.7 anticipated as a separate item), fixed by
+the tune deferral of §14f #4. §1–§3 are kept as the design-time record.
 **Author:** engineering, with the unit owner
 **Date:** 2026-09-18
 **Branch:** `claude/system-familiarization-f5mezz` (all three repos)
@@ -13,6 +17,12 @@
 ---
 
 ## 1. TL;DR
+
+> **Correction (2026-09-21, §14k):** the transmit script did NOT hit a buffer error and the unit did
+> not "stop" transmitting — it never started. The agent's on-air tunes (`power` + `rf on`) were sent
+> ~0.5 s before the freshly launched script had bound its control socket (a ~10.5 s cold first launch
+> against a 10 s pre-roll); agent 1.27.2 dropped them silently, and the script's gate never opened.
+> The paragraph below is the design-time reading.
 
 During a field test a **power sweep** (a `--power` ramp up then down over 23 minutes on one unit)
 **silently stopped radiating** a few minutes in. The transmit script hit a GNU Radio `vmcircbuf`
@@ -49,15 +59,21 @@ Everything is capability-gated and respects the `argspec.py`/`ramp.py` byte-iden
 - **What was ramped:** `--power` and the `--rf` on/off gate **only** — no bandwidth/shape change.
 - **Symptom:** a `vm circ buff …` line in the task log; **the script kept running**, the task
   showed *running*, the SDR emitted nothing. The operator noticed ~5 min in by the spectrum.
+  *(§14k: that line is `vmcircbuf_prefs::get :info: …` — a GNU Radio INFO message this unit prints on
+  every launch, present in five successful runs. Not the fault.)*
 - **When it failed:** at **flowgraph startup** (confirmed by the owner). It is **intermittent** —
   the *same* signal ran cleanly for **3 hours** the day before, and this class of failure has
-  occurred before.
+  occurred before. *(§14k: "intermittent" = the FIRST launch after a reboot; a warm relaunch works.)*
 - **Recovery (as it happened):** stop the sequence → author a new plan → estimate the ramp
   position → re-run. Slow, manual, and visibly improvised.
 
 ---
 
 ## 3. Root cause of the `vmcircbuf` failure
+
+> **Retained as the design-time hypothesis — REFUTED by §14k.** None of the mechanisms in §3.3 were
+> in play (`/dev/shm` 1 % used, no leaked SysV segments, `vm.max_map_count` 1,048,576, no allocation
+> error in any log). §3.7, written as a "separate" first-launch cost, describes the actual incident.
 
 ### 3.1 What `vmcircbuf` is
 
@@ -99,6 +115,9 @@ Note the default `mmap_shm_open` backend **`shm_unlink`s each object immediately
 self-cleaning on process death — **simple orphan build-up is unlikely with that backend**. Orphan
 accumulation (mechanism B) is real only if a leakier backend (`sysv_shm`) is selected. **We cannot
 pin the exact mechanism without the error line** — the log was not retrievable at design time.
+
+**RESOLVED (§14k):** none of A–D. The log line was informational; the fault was the on-air tunes
+being sent before the script's control socket existed.
 
 **This uncertainty is itself the point:** the reason we cannot root-cause it now is the same reason
 we are building detection — the error scrolled past unread and nothing captured the machine's state
@@ -1562,14 +1581,112 @@ on `--restart` with the restarted origin; 0 = unset), the client gate test (`is_
 `paramkit-clock-origin`; a script using all three markers needs all three capabilities). Agent 707 → 711;
 scripts 114 → 116; client 1185.
 
+## 14k. ROOT CAUSE CONFIRMED (2026-09-21) — a tune-before-bind race on the first launch after boot; not `vmcircbuf`
+
+The unit (`broadcaster-1`, Pi 5 + B206 mini, **agent 1.27.2** at the time, pre-P0 scripts) became
+reachable on 2026-09-21. Its logs plus a controlled reproduction settle the mechanism. The
+supervisor's one-pager (`docs/incident-fm-chirp-vmcircbuf.md`) was rewritten accordingly.
+
+### Evidence retrieved
+
+- **Task log** `logs/Sweep/run_20260918T092150Z.log` (the file is named at ROTATION, i.e. the next
+  launch; the run itself was 09:09:50 → 09:19:32 UTC): the script's banner (`RF : OFF (muted)`,
+  `power (target) −156.63`, `→ gain 0.00`) followed by exactly one line —
+  `vmcircbuf_prefs::get :info: /tmp/.config/gnuradio/prefs/vmcircbuf_default_factory failed to open:
+  bad true, fail true, eof true` — and nothing else. That is the expected output of a healthy run at
+  that script version: nothing prints after the banner (tune acknowledgements go over the control
+  socket), and the `vmcircbuf` line is GR's INFO message printed from inside `tb.start()` when no
+  backend pref file exists (the unit's `gnuradio-config-info --prefs` has `[log] log_level = info`,
+  `log_file = stdout`; the pre-P0 service set no `HOME`, so GR's `appdata_path()` fell back to
+  `/tmp`). `grep -l` finds the identical line in **five successful runs**.
+- **Readouts:** `df /dev/shm` 8.3 GB / 400 KB used (1 %); `vm.max_map_count` 1,048,576; `ipcs -m`
+  empty; `ulimit -n` 1024. No allocation error anywhere → every §3.3 mechanism (A–D) is out.
+- **Sequence run log** `logs/_sequences/seq_4a5b15d4/run_20260918T092121Z.log`: armed 07:13:31;
+  `[09:09:50] ▶ start Sweep` (`--rf off`, the muted 10 s pre-roll); `[09:10:00] ◈ Sweep • Power`
+  (−91 dBm/Hz, the ramp's first point) then `[09:10:00] ◈ Sweep • RF on`; `[09:10:01] ON AIR (T0)`;
+  **then** the task's banner lines (`Sweep: …`, incl. `RF : OFF (muted)` and the vmcircbuf line);
+  then a ramp point every 20 s up to −35 dBm/Hz at 09:19:20; `[09:19:32] aborted: cancelled by
+  operator`. No `⚠` annotation of any kind.
+- **Journal:** empty for that day — Raspberry Pi OS keeps journald in RAM by default; the unit had
+  been rebooted. The agent logs only to stdout → journald, so the agent-side record was lost.
+
+### The timing argument (why the banner's position is the clue)
+
+`SequenceRunner._tick` runs, in order: `rl.collect()` (copy any NEW task-log lines into the run log)
+→ fire the due steps (their blocks) → `_emit_on_air` (`ON AIR (T0)`). The banner landed in the run
+log AFTER `ON AIR (T0)`, so at the `collect()` of the tick that fired the two on-air tunes the banner
+did not yet exist in the task log. In `fm_chirp_tx.py` the control socket is bound
+(`script.live_control(args)`, line 636) two lines after the banner is flushed (line 634). Hence the
+two tunes (sent ≈09:10:00.6–1.0, each after its attenuator pre-command) went out while the script
+was still starting up: **the launch took ≈10.5 s from spawn (09:09:50) to the banner, against a
+10 s pre-roll.** The script's own start-up (Python + GNU Radio imports, the B206 open incl. the
+firmware/FPGA image load after a power-cycle, the clock-rate change, the buffer + 6753-tap filter)
+is what filled those seconds; UHD's "loading image" lines were invisible because every script sets
+`UHD_LOG_CONSOLE_LEVEL=off` and 1.27.2 had no UHD file log.
+
+### What agent 1.27.2 did with a tune sent too early
+
+`_ctrl_rpc` → `socket.connect(path)` on a not-yet-existing socket → `RuntimeError("task does not
+expose live parameters (or isn't ready yet)")` → `_fire_step`'s `except Exception` → `logger.error`
+**only** (the journal). The tune's block had already been written to the run log BEFORE the RPC, and
+the `⚠ tune … FAILED: …` annotation did not exist until 1.31.1. **So the run log is byte-identical
+whether the tune got through or not.** Both on-air tunes — the −91 dBm/Hz power point and `rf on` —
+were lost. Every later ramp point found the socket bound and was accepted, but the script STAGES a
+power change while muted (`apply_change("power")`: with `state["rf_on"]` False the new gain is kept
+in `state` and never sent to the radio), so the gate never opened. The radio streamed zeros for
+9.5 min while the process, its control thread and the run log all looked healthy. The Phase-2 note
+"the control-socket-bind race silently drops the tune" (§14c) described this exact path without
+knowing it was the incident.
+
+### Reproduction (owner, 2026-09-21)
+
+Reboot the unit → schedule the same plan → identical log, no RF, ever, though every tune "fires".
+Run it again without a reboot → normal transmission. The first launch after boot is the slow one.
+
+### What fixed it, and when
+
+- **§14f #4 (1.31.1, 2026-09-20):** `_fire_step` DEFERS a tune while `ProcessManager.tune_ready`
+  reports the socket file absent and the process younger than `CTRL_BIND_GRACE_S` (180 s); the next
+  tick retries; the `due` sort keeps the power point before `rf on`. Written for the restart relaunch,
+  it covers the cold first launch by construction. **Not yet verified on hardware** — run the reboot
+  test after the OTA.
+- **§14f (1.31.1):** a tune that still fails is annotated `⚠ tune <task> FAILED: <reason>` in the
+  run log; **#19:** `HEALTH state=transmitting` is printed once `tb.start()` returns.
+- **P0 (1.27.4):** `pre_image_sdr()` at boot loads the B206 image so the first launch is warm; the
+  per-launch `uhd_<ts>.log` records how long the open took.
+- **What P0's shared-memory work bought for THIS incident: nothing.** The sweep, the ceilings, the
+  backend pref file are harmless and stay; they addressed a mechanism that was never in play.
+
+### Gaps that remain (deliberately deferred by the owner, 2026-09-21)
+
+1. **Accepted ≠ applied.** The sequence path sends `wait=0`; a tune the script's control thread
+   accepts but its main loop never drains (a wedge inside `tb.start()`, or a dropped-then-deferred
+   gate tune applied late) is invisible. Fix: after a gate tune, read `get_params()["applied"]` back
+   ~1 s later and couple an RF fault when the gate isn't on.
+2. **The deferral is silent** (the block just carries its later stamp) — annotate "deferred N s,
+   waiting for the control socket". And the **co-timed edge**: if the socket appears between a
+   deferred power point and its co-timed `rf on` within one tick, the gate opens at the launch power
+   for one tick — hold back a task's remaining co-timed tunes once one is deferred.
+3. **Pre-roll vs. measured launch time.** Record each task's launch-to-bind time; warn at arm when a
+   sequence's lead-in is shorter than the task's worst observed cold start; lengthen the client's
+   default lead-in for an RF-gated launch (10 s was not enough here).
+4. **Persistent journald** on the units (`mkdir -p /var/log/journal`) — provisioning.
+5. Cosmetic: the chirp banner's `power (achieved on grid)` is the SDR alone with the attenuator at
+   rest (`power_for_gain` without `applied_db`) — misleading on an attenuator chain.
+
 ## 14. Open items
 
-- Retrieve the archived `run_<ts>.log` from the affected unit + `df /dev/shm` /
-  `cat /proc/sys/vm/max_map_count` / `ipcs -m` / the GR backend → **confirm the exact mechanism** and
-  finalize §3.3.
-- Confirm the deployed GNU Radio version's exact `vmcircbuf` factory override name
-  (`GR_CONF_VMCIRCBUF_DEFAULT_FACTORY` vs. an older form) with `gnuradio-config-info --prefs`, and
-  which compiled default it falls to under `GR_DONT_LOAD_PREFS=1`.
-- Confirm the Pi 5 image's current `/dev/shm` size, `vm.max_map_count`, and `ulimit -n`.
+- ~~Retrieve the archived `run_<ts>.log` from the affected unit + `df /dev/shm` /
+  `cat /proc/sys/vm/max_map_count` / `ipcs -m` / the GR backend → confirm the exact mechanism~~ —
+  **DONE 2026-09-21, §14k**: not `vmcircbuf` at all.
+- ~~Confirm the deployed GNU Radio version's exact `vmcircbuf` factory override name~~ — DONE: GR 3.10
+  on the unit (`gnuradio-config-info --prefs` lists no vmcircbuf entry at all; it reads the pref FILE,
+  §14f #1); `[log] log_level = info` is why the INFO line prints.
+- ~~Confirm the Pi 5 image's current `/dev/shm` size, `vm.max_map_count`, and `ulimit -n`~~ — DONE:
+  8.3 GB / 1,048,576 / 1024.
+- **Verify the §14f #4 deferral on hardware** with the owner's reboot test after the OTA to 1.36.0.
+- Follow-ups deliberately deferred by the owner (2026-09-21), see §14k "gaps": gate-tune read-back
+  → RF fault; arm-time pre-roll check + a longer default lead-in; persistent journald; a deferral
+  annotation in the run log; the co-timed deferral edge.
 - Decide `SequenceState.FAULTED` (terminal) vs. an `rf_fault` field on a still-`RUNNING` run.
 - Multi-unit per-item `run_id` resolution for plan-level restart.
