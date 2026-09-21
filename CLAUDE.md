@@ -59,7 +59,8 @@ view it with `screenshot.py --tab calibration`.
 - **Capabilities + version:** a new client-visible feature adds a string to
   `AGENT_CAPABILITIES` and bumps `AGENT_VERSION` (both in `agent/config.py`); `test_meta_endpoint.py`
   asserts the capability set. The client feature-gates on these exact strings. Current version is
-  in `config.py` (`1.35.0`: plan-level anchoring replica — Phase: plan editor redesign — capability
+  in `config.py` (`1.36.0`: stacked sequences — arm guard A is task-aware — capability
+  `sequence-stacking`; `1.35.0`: plan-level anchoring replica — Phase: plan editor redesign — capability
   `plan-item-anchors`; `1.19.0`: edit-while-holding — Phase 3c — `POST …/proceed` honours
   `ProceedRequest.steps` behind `sequence-hold-edit`; `1.18.0`: Fast-Forward-to-Hold — Phase 3b —
   `POST …/hold-now` behind `sequence-hold-now`; `1.17.0`: the Hold-step HOLDING runtime — Phase 1 —
@@ -92,6 +93,24 @@ is always dBm so one stage ceiling gauges every signal. `resolve()` folds all th
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
 ## MERGED TO `main` (all three repos, fast-forward, 1.34.0) — field rollout: OTA every unit's agent FIRST, then deploy the library; rebuild the client bundle from 1.34.0. Nothing in the RF-fault arc has run on real hardware yet (mock scripts + fake gnuradio + the headless unit only).
+
+## Current state — STACKED sequences: arm guard A is task-aware (1.36.0, capability `sequence-stacking`) (branch `claude/system-familiarization-f5mezz`, cross-repo)
+Owner decision (plan-editor round 3): "right now the rule should allow stacking of sequences — the only user is
+me, and I know what's compatible" (a fully task-aware rule is the eventual goal). Before, `sequence_runner.arm`'s
+guard A refused ANY run whose channel span (lead-in … stop tail) overlapped another active run on the unit
+("one TX channel per unit"). Now it refuses only when the two runs both LAUNCH the same task — a task runs
+once, so that arm could never work (the older guard A0 "task(s) already running" stays as it was). New static
+`_launched_task_names(steps)` = the task names of the START/RUN steps (fires or defs); the guard intersects the
+new run's launches with each active run's `steps` + `window_b_steps`, skips a run with no shared launch (they may
+stack — a tune-only run stacks on anything), and refuses an overlapping shared launch with the old message shape
+("cannot arm: on-air window overlaps run <id> … and both launch task(s) 'tx' — a task runs once; this run would
+occupy the channel …, counting its launch lead-in … and its stop tail …; leave a gap (sequences launching
+different tasks may stack)"). `AGENT_VERSION 1.35.0 → 1.36.0`, capability `sequence-stacking` (the client's plan
+editor marks a stacked pair AMBER and notes when a unit's cached `/info` lacks it — an older agent still refuses
+the overlap, so OTA before arming a stacked plan). `argspec`/`ramp` untouched. Tests: `tests/test_arm_guards.py`
+(`test_sequences_launching_different_tasks_may_stack`: a second task, a one-shot and a tune-only run all stack over
+a running `tx` window; a second `tx` launch in the window is refused naming the task and arms once moved past
+it) + `test_meta_endpoint`. Suite 713 → 714; client 1212 → 1214.
 
 ## Current state — plan REPLICA carries the client's plan-level anchors (1.35.0, capability `plan-item-anchors`) (branch `claude/system-familiarization-f5mezz`, cross-repo)
 The client's PLAN EDITOR was redesigned (see `sdr-client/CLAUDE.md`, spec `sdr-client/docs/plan-editor-mockup.html`):

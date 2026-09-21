@@ -430,7 +430,7 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # two never double-transmit on the single TX channel (an owned-query gates it). Gated by the master
 # kill-switch AUTO_RESTART_ENABLED. Adds capability `task-auto-restart` (the client gates its
 # "Auto-restart on fault" checkbox on it); opt-in per task (default False = today's behaviour).
-AGENT_VERSION = "1.35.0"
+AGENT_VERSION = "1.36.0"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -587,6 +587,7 @@ AGENT_CAPABILITIES = [
                                          # script takes/reports the ABSOLUTE instant its timeline began, so a
                                          # restart lands exactly, whatever the launch latency (1.34.0). Same gate.
     "plan-item-anchors",                 # PlanItem.id + on/off_air_anchor* + expanded, SequenceStep.anchor_item
+    "sequence-stacking",                 # runs launching DIFFERENT tasks may overlap on a unit (arm guard A is task-aware)
                                          # (plan-level anchoring — the plan editor redesign, 1.35.0): the unit's
                                          # plan REPLICA round-trips a plan item anchored to another item / step;
                                          # storage only, the client compiles anchors to absolute times at arm.

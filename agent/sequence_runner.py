@@ -462,6 +462,19 @@ class SequenceRunner:
         return min(leads, default=0.0)
 
     @staticmethod
+    def _launched_task_names(steps) -> set:
+        """The tasks a run LAUNCHES (a START / one-shot RUN step) — fires or step defs alike. A
+        tune / ramp / stop on a task launched elsewhere does not count: such a run may stack."""
+        out: set = set()
+        for st in steps or []:
+            action = getattr(st, "action", None)
+            action = str(getattr(action, "value", action) or "").lower()
+            name = getattr(st, "task_name", "") or ""
+            if action in ("start", "run") and name:
+                out.add(name)
+        return out
+
+    @staticmethod
     def _channel_end(on_air_end: Optional[datetime], fires: List[StepFire]) -> Optional[datetime]:
         """When a run RELEASES the TX channel: its on-air end or its last scheduled fire,
         whichever is later. A stop-anchored tail (the STOP that lands 1 s after off-air,
@@ -1034,27 +1047,38 @@ class SequenceRunner:
                     "cannot arm: task(s) already running on this unit: "
                     + ", ".join(f"'{t}'" for t in already))
 
-            # A. Don't arm a run whose channel span overlaps another armed/running/holding
-            # run on this unit — overlapping windows would both drive the single TX channel
-            # and produce confusing "device busy" crashes instead of a clean rejection.
+            # A. Don't arm a run that would LAUNCH a task another armed/running/holding run on
+            # this unit also launches while their channel spans overlap: a task runs ONCE, so the
+            # later START would collide with it ("device busy") at fire time instead of a clean
+            # rejection here. Runs that launch DIFFERENT tasks may STACK (overlap) on the unit —
+            # a tune-only run over another run's task, a non-radio one-shot beside a transmitter:
+            # the owner decides what is compatible (owner decision; a task-aware "uses the radio"
+            # rule is the next step, capability `sequence-stacking`).
             # The span runs from the earliest fire (the launch lead-in before on-air) to
             # the LAST fire or on_air_end, whichever is later (the STOP tail after off-air),
-            # so two back-to-back windows need a gap of lead-in + tail between them.
+            # so two back-to-back windows of ONE task need a gap of lead-in + tail between them.
             # A HOLDING run is open-ended (spans to +∞), so a new arm can't overlap it.
             new_start = earliest_fire
             new_end = None if open_ended else self._channel_end(on_air_end, steps)
+            new_launch = self._launched_task_names(eff_steps)
             for other in self._runs.values():
                 if other.state not in _ACTIVE_STATES:
                     continue
+                shared = new_launch & (self._launched_task_names(other.steps)
+                                       | self._launched_task_names(other.window_b_steps or []))
+                if not shared:
+                    continue                          # different tasks: the runs may stack
                 o_start, o_end = self._active_span(other)
                 if _spans_overlap(new_start, new_end, o_start, o_end):
                     win = _fmt_window(o_start, o_end)
                     mine = _fmt_window(new_start, new_end)
+                    names = ", ".join(f"'{t}'" for t in sorted(shared))
                     raise ValueError(
                         f"cannot arm: on-air window overlaps run {other.id} "
-                        f"('{other.sequence_name}', {win}) already on this unit — this run "
-                        f"would occupy the channel {mine}, counting its launch lead-in "
-                        f"before on-air and its stop tail after off-air; leave a gap")
+                        f"('{other.sequence_name}', {win}) already on this unit and both launch "
+                        f"task(s) {names} — a task runs once; this run would occupy the channel "
+                        f"{mine}, counting its launch lead-in before on-air and its stop tail "
+                        f"after off-air; leave a gap (sequences launching different tasks may stack)")
 
             self._runs[run.id] = run
             self._persist_runs()

@@ -240,3 +240,46 @@ def test_a_whole_day_of_disjoint_plans_arms_in_one_go(tmp_path):
             await _arm_window(r, seq, now, 60 + i * 3900, 60 + i * 3900 + 3600)
         assert sorted(x.sequence_name for x in r.list_runs()) == [f"plan{i}" for i in range(4)]
     asyncio.run(scenario())
+
+
+def _oneshot_seq(name, task="atten"):
+    """A one-shot RUN of a (non-radio) task + the stop-anchored step every sequence needs."""
+    return CreateSequenceRequest(
+        name=name,
+        steps=[SequenceStep(anchor="start", offset_s=0.0, action=StepAction.RUN, task_name=task),
+               SequenceStep(anchor="stop", offset_s=0.0, action=StepAction.STOP, task_name=task)])
+
+
+def _tune_only_seq(name, task="tx"):
+    """A sequence that only TUNES a task another run launched (no START / RUN of its own)."""
+    return CreateSequenceRequest(
+        name=name,
+        steps=[SequenceStep(anchor="start", offset_s=5.0, action=StepAction.TUNE, task_name=task,
+                            params={"power": "-40"}),
+               SequenceStep(anchor="stop", offset_s=0.0, action=StepAction.TUNE, task_name=task,
+                            params={"power": "-50"})])
+
+
+def test_sequences_launching_different_tasks_may_stack(tmp_path):
+    """Owner decision (agent 1.36.0, `sequence-stacking`): the overlap guard is TASK-aware — only
+    two runs that both LAUNCH the same task while overlapping are refused (a task runs once).
+    Runs launching different tasks stack on the unit, and so does a run that only TUNES a task
+    another run launched; the owner decides what is compatible."""
+    async def scenario():
+        mgr, r = _runner(tmp_path, ["tx", "tx2", "atten"])
+        s1 = await r.create_sequence(_gated_seq("s1"))                 # launches tx
+        s2 = await r.create_sequence(_gated_seq("s2", task="tx2"))     # launches tx2
+        s3 = await r.create_sequence(_oneshot_seq("s3"))               # one-shot of a non-radio task
+        s4 = await r.create_sequence(_tune_only_seq("s4"))             # only tunes tx
+        s5 = await r.create_sequence(_gated_seq("s5"))                 # launches tx again
+        now = datetime.now(timezone.utc)
+        await _arm_window(r, s1, now, 30, 90)
+        await _arm_window(r, s2, now, 60, 120)                         # overlaps s1: different task → stacks
+        await _arm_window(r, s3, now, 40, 50)                          # inside s1: different task → stacks
+        await _arm_window(r, s4, now, 35, 80)                          # inside s1: tune-only → stacks
+        assert len(r.list_runs()) == 4
+        with pytest.raises(ValueError, match="overlaps run.*both launch task\\(s\\) 'tx'"):
+            await _arm_window(r, s5, now, 60, 120)                     # launches tx while s1 does → refused
+        await _arm_window(r, s5, now, 92, 152)                         # after s1's tail → arms
+        assert len(r.list_runs()) == 5
+    asyncio.run(scenario())
