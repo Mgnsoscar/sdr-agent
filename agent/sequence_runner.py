@@ -2785,6 +2785,9 @@ class SequenceRunner:
         async with self._lock:
             run.state = SequenceState.ABORTED
             run.stopped_actual = _utcnow_iso()
+            # The export shows when the transmission ended and why (docs/rf-fault-recovery.md §14n):
+            # every task still live at this instant gets an ABORTED row.
+            run.incidents.append(RunIncident(kind="aborted", at=run.stopped_actual, detail=reason))
             self._persist_runs()
 
         is_live = getattr(self._manager, "is_live", None) or self._manager.is_running

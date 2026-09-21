@@ -250,7 +250,30 @@ def _incident_row(inc: Any) -> tuple:
         return (f"AUTO-RESTART GAVE UP — {detail}" if detail else "AUTO-RESTART GAVE UP"), True
     if kind == "restart":
         return (f"RESTART — {detail}" if detail else "RESTART"), True
+    if kind == "aborted":
+        return (f"ABORTED — {detail}" if detail else "ABORTED"), True
     return (f"{kind.upper()} — {detail}" if detail else kind.upper()), True
+
+
+def _live_at(steps: list, task_name: str, at_iso: str) -> bool:
+    """True if `task_name` had been launched by a fired start and not stopped by a fired stop when
+    `at_iso` came — i.e. an abort at that instant ended ITS transmission."""
+    at = _parse_iso(at_iso)
+    launched = stopped = None
+    for s in steps:
+        if getattr(s, "task_name", None) != task_name:
+            continue
+        fa = getattr(s, "fired_actual", None)
+        if not fa or str(fa).startswith("skipped"):
+            continue
+        t = _parse_iso(str(fa))
+        if t is None or (at is not None and t > at):
+            continue
+        if s.action in ("start", "run") and (launched is None or t > launched):
+            launched = t
+        elif s.action == "stop" and (stopped is None or t > stopped):
+            stopped = t
+    return launched is not None and (stopped is None or stopped < launched)
 
 
 def build_task_table(task_name: str, steps: list, spec: Optional[dict], artifact: Optional[dict],
@@ -263,7 +286,8 @@ def build_task_table(task_name: str, steps: list, spec: Optional[dict], artifact
     Event row at its instant with the task DEAD (blank power/device cells, RF 0); a fire carrying a
     ``note`` (the synthetic RESTART relaunch) puts it in the Event column and always gets a row, even
     at an unchanged level — so a recovered run's export shows the outage and the recovery
-    (docs/rf-fault-recovery.md §14n).
+    (docs/rf-fault-recovery.md §14n). A fired STOP is a dead "STOP" row and a run abort a dead
+    "ABORTED — reason" row for every task still on air, so the series ends where the signal did.
     Returns ``{'task', 'columns': [str], 'rows': [[...]]}`` — a row only where a value changed."""
     spec = spec or {}
     params = spec.get("params", []) or []
@@ -274,12 +298,17 @@ def build_task_table(task_name: str, steps: list, spec: Optional[dict], artifact
 
     fired = [s for s in steps if getattr(s, "task_name", None) == task_name
              and getattr(s, "fired_actual", None) and not str(getattr(s, "fired_actual")).startswith("skipped")
-             and getattr(s, "action", None) in ("start", "run", "tune")]
-    # One timeline: the fires at their actual instants + this task's incidents at theirs.
+             and getattr(s, "action", None) in ("start", "run", "tune", "stop")]
+    # One timeline: the fires at their actual instants + this task's incidents at theirs. A fired
+    # STOP is a dead row ("STOP"): the transmission ended there. A run-level ABORT (task-less) is
+    # a dead row only for a task that was still on air at that instant.
     events: List[tuple] = [(str(s.fired_actual), "fire", s) for s in fired]
     for inc in incidents or []:
         itask = str(getattr(inc, "task", "") or "")
         if itask and itask != task_name:
+            continue
+        if str(getattr(inc, "kind", "") or "") == "aborted" and \
+                not _live_at(steps, task_name, str(getattr(inc, "at", "") or "")):
             continue
         events.append((str(getattr(inc, "at", "") or ""), "incident", inc))
 
@@ -297,6 +326,8 @@ def build_task_table(task_name: str, steps: list, spec: Optional[dict], artifact
         dead = False
         if kind == "incident":
             event, dead = _incident_row(obj)
+        elif obj.action == "stop":
+            event, dead = (str(getattr(obj, "note", "") or "") or "STOP"), True
         else:
             s = obj
             if s.action in ("start", "run"):

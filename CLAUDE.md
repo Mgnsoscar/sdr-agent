@@ -59,7 +59,8 @@ view it with `screenshot.py --tab calibration`.
 - **Capabilities + version:** a new client-visible feature adds a string to
   `AGENT_CAPABILITIES` and bumps `AGENT_VERSION` (both in `agent/config.py`); `test_meta_endpoint.py`
   asserts the capability set. The client feature-gates on these exact strings. Current version is
-  in `config.py` (`1.36.6`: a CRASH of a run-driven task is the run's fault — coupled via `_flag_rf_fault`
+  in `config.py` (`1.36.7`: the export ends where the signal did — a fired STOP and a run abort are dead
+  `STOP` / `ABORTED — reason` rows, behaviour only; `1.36.6`: a CRASH of a run-driven task is the run's fault — coupled via `_flag_rf_fault`
   with a crash detail, behaviour only; `1.36.5`: live-tune underflow mitigations — an identical attenuator set is not re-sent on
   a tune, transmit tasks at `TASK_NICE` −5 / active-set one-shots at `ONESHOT_NICE` 10, behaviour only; `1.36.4`: the exported log-table's `Event` column shows a run's RF faults / restarts —
   `SequenceRun.incidents` + `StepFire.note`, behaviour only; `1.36.3`: sustained TX underflows are an RF fault — heavy reports ≥ `UNDERFLOW_FAULT_RATE`
@@ -141,7 +142,10 @@ LAST — the client's `_localize_table` passes `cols[1:]` through, no client cha
 quantity / SDR gain / attenuation blank, RF gate 0); a noted fire always gets a row (the dedupe compares the body
 without the Event cell). The text run log gains `⚠ RF FAULT — <task>: <detail> — N pending step(s) skipped; RF
 dropped` (`_annotate` helper) — it had NO fault line before. `build_log_table` passes `run.incidents`.
-`AGENT_VERSION 1.36.3 → 1.36.4`. Tests: `tests/test_run_export_events.py` (9). Suite 732 → 741.
+`AGENT_VERSION 1.36.3 → 1.36.4`. Tests: `tests/test_run_export_events.py` (9). Suite 732 → 741. **1.36.7:** the series ENDS
+where the signal did — a fired STOP is a dead `STOP` row; `_abort_run` records a task-less `RunIncident(kind="aborted",
+at=stopped_actual, detail=reason)` rendered as a dead `ABORTED — reason` row for every task still on air then
+(`run_table._live_at`), never for one its own STOP already ended (+4 tests; suite 751 → 755).
 
 ## Current state — sustained TX UNDERFLOWS are an RF fault (1.36.3, no capability) (branch `claude/system-familiarization-f5mezz`, agent-only)
 Owner test on 1.36.1: an independent GPS L1 P task at a deliberately too-heavy configuration logged

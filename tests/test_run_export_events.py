@@ -194,3 +194,59 @@ def test_give_up_records_an_incident(tmp_path, monkeypatch):
         assert run.incidents[-1].kind == "gave_up"
         assert run.incidents[-1].task == "tx" and "budget exhausted" in run.incidents[-1].detail
     asyncio.run(scenario())
+
+
+# ── the end of the transmission: a fired STOP, a manual abort ──────────────────
+
+def test_a_fired_stop_ends_the_series_with_a_dead_row():
+    steps = [R._launch("on"),
+             R._step("tune", "2026-09-09T09:00:05+00:00", params={"power": -95.0}),
+             R._step("stop", "2026-09-09T09:10:00+00:00")]
+    t = run_table.build_task_table("mock_prn", steps, R._SPEC, R._ART, R._realize,
+                                   on_air_at="2026-09-09T09:00:00+00:00")
+    cols = t["columns"]
+    last = t["rows"][-1]
+    assert last[0] == "09:10:00.000" and last[1] == 600 and last[-1] == "STOP"
+    assert last[cols.index("Spectral density [dBm/Hz]")] is None
+    assert last[cols.index("SDR gain [dB]")] is None
+    assert last[cols.index("RF on")] == 0
+    assert last[cols.index("Sidelobes")] == 2                     # the last known parameters stay
+
+
+def test_an_abort_is_a_dead_row_only_for_a_task_still_on_air():
+    steps = [R._launch("on")]
+    incidents = [_inc("aborted", "2026-09-09T09:03:00+00:00", task="", detail="cancelled by operator")]
+    t = run_table.build_task_table("mock_prn", steps, R._SPEC, R._ART, R._realize, incidents=incidents)
+    assert t["rows"][-1][-1] == "ABORTED — cancelled by operator"
+    assert t["rows"][-1][t["columns"].index("RF on")] == 0
+    # a task its own STOP already ended before the abort gets no ABORTED row
+    stopped = steps + [R._step("stop", "2026-09-09T09:02:00+00:00")]
+    t2 = run_table.build_task_table("mock_prn", stopped, R._SPEC, R._ART, R._realize, incidents=incidents)
+    assert [r[-1] for r in t2["rows"]] == ["", "STOP"]
+
+
+def test_live_at_follows_the_last_launch():
+    steps = [R._step("start", "2026-09-09T09:00:00+00:00"), R._step("stop", "2026-09-09T09:01:00+00:00"),
+             R._step("start", "2026-09-09T09:02:00+00:00")]
+    assert run_table._live_at(steps, "mock_prn", "2026-09-09T09:00:30+00:00") is True
+    assert run_table._live_at(steps, "mock_prn", "2026-09-09T09:01:30+00:00") is False   # between the epochs
+    assert run_table._live_at(steps, "mock_prn", "2026-09-09T09:03:00+00:00") is True    # relaunched
+    assert run_table._live_at(steps, "other", "2026-09-09T09:03:00+00:00") is False
+
+
+def test_cancelling_a_running_run_records_the_abort_and_exports_it(tmp_path, monkeypatch):
+    async def scenario():
+        mgr, runner = T._mk(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        run = _running_run(runner, now, rid="rx")
+        out = await runner.cancel_or_abort("rx")
+        assert out.state == SequenceState.ABORTED
+        inc = out.incidents[-1]
+        assert inc.kind == "aborted" and inc.at == out.stopped_actual
+        assert inc.detail == "cancelled by operator" and inc.task == ""
+        table = runner.build_log_table("rx")["tables"][0]
+        assert table["rows"][-1][-1] == "ABORTED — cancelled by operator"
+        rf_col = table["columns"].index(next(c for c in table["columns"] if c.endswith(" on")))
+        assert table["rows"][-1][rf_col] == 0
+        assert table["rows"][-2][rf_col] == 1                       # it was on air until then
+    asyncio.run(scenario())

@@ -1846,6 +1846,21 @@ fault couples the incident + the log line, a resync restart notes the relaunch, 
 shows fault → restart in order with the gate 0 then 1; replay + auto notes; a give-up incident.
 Suite 732 → 741.
 
+**Follow-up (1.36.7): the series ends where the signal did.** Owner: "the export log should also show
+when the signal is stopped — if I stop the sequence manually, the last row shows it transmitting, but
+never when it stopped transmitting." The table walked start/tune fires only, so a fired STOP was
+invisible, and a manual abort leaves no fire at all (its reason lived only in the run log's closing line
+and the SSE event). Now a fired **STOP** is a dead row with Event `STOP` at its instant (blank power /
+device cells, RF 0, the last parameters kept), and `_abort_run` records a task-less
+`RunIncident(kind="aborted", at=stopped_actual, detail=reason)` — `cancelled by operator`, `max hold
+time (Ns) exceeded`, `agent restarted mid-run`, … — which `build_task_table` renders as a dead
+`ABORTED — reason` row for every task **still on air** at that instant (`_live_at`: a fired start with
+no fired stop after it), never for a task its own STOP had already ended. A one-shot `run` task that
+exits by itself still shows no end (the run holds no exit time for it). Tests in
+`tests/test_run_export_events.py` (+4: the STOP row; the abort row only on a live task; `_live_at`
+across a stop + relaunch; a real `cancel_or_abort` records the incident and the export ends RF 1 → 0
+with the reason). Suite 751 → 755.
+
 ## 14o. Live-tune underflow mitigations (`AGENT_VERSION 1.36.5`, no capability)
 
 **Owner report (2026-09-21, 1.36.3/4):** the P-code task at 61.38 MS/s "is stable as long as you don't
