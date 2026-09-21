@@ -1716,6 +1716,70 @@ the 2 s-bind script with a 0.5 s pre-roll: the overrun points are superseded, RF
 first power point that did fire, the schedule continues to −50, the log names the skip. Suite
 714 → 718. Still open from §14k: the arm-time pre-roll check and persistent journald.
 
+## 14m. Sustained TX underflows are an RF fault (`AGENT_VERSION 1.36.2`, no capability)
+
+**Owner test (2026-09-21, fleet on 1.36.1):** an independent GPS L1 P task launched at a configuration
+chosen to overload the Pi (61.38 MHz sample rate). The task log filled with one GNU Radio line per
+window — `usrp_sink :error: In the last 750 ms, 7187 underflows occurred.` — for the whole run, the
+spectrum analyzer showed the signal breaking up, and the agent reported the task RUNNING / health OK
+throughout: *"it still says that it's running fine, even though the spectrum analyzer is going crazy."*
+
+**Why it was invisible.** The lines DO reach `current.log` (GR's logger writes to the task's stdout /
+stderr, which the agent merges) and the watchdog DOES scan them every `HEALTH_POLL_S`, but the scan
+matched only the three `HEALTH_FAULT_PATTERNS` (the done-watcher marker, `vmcircbuf`,
+`boost::interprocess`). An underflow is not a halt: the flowgraph is alive, the script's `tb.wait()`
+never returns, no marker prints, the process never exits. `TaskHealth.STALLED` had been reserved for
+"sustained underflow / degraded" in Phase 1 and never wired. The L1P script is a FIFO stager (no
+done-watcher, §14b) — but a done-watcher would not have seen this either.
+
+**What it does on air.** Every underflow is a gap in the sample stream: the radio emits the signal in
+bursts with silence between them. That is worse than a silent radio for the band (the bursts splatter)
+and useless for the test, so the owner chose to treat it as a **fault**, with the ordinary auto-drop and
+the ordinary restart policies (decisions: fault, not a degraded state · auto-restart allowed · 4 s).
+
+**Change (`process_manager`, behaviour only):**
+
+- `_underflow_reports(text)` parses every GR report in a scan's new bytes as `(window_ms, count)`
+  (`in the last N ms, M underflow(s) occurred`, case-insensitive; the exact gr-uhd `usrp_sink_impl`
+  phrasing).
+- `ManagedProcess._underflow_fault_detail(text)` keeps a per-process **streak**: a report continues the
+  streak when the previous one was seen within `UNDERFLOW_GAP_S` (3 s, floored to 1.5 polls), else it
+  starts a new one; the streak's length is the **sum of the reported windows** — each line covers "the
+  last N ms" of real transmit time, so the measure is the same at any poll cadence, and a late scan that
+  reads several lines at once is judged the same as three prompt ones. Once the streak covers
+  **`UNDERFLOW_FAULT_S`** (default **4 s**, i.e. the 6th consecutive 750 ms report; 0 disables) it
+  returns the detail — `sustained TX underflows: 6 reports over 4.5 s (~9,900 underflows/s) — the host
+  cannot keep the sample stream full at this configuration (sample rate / generator load), so the radio
+  is emitting bursts with gaps between them` — and `_scan_task_health` flags it through the SAME
+  `_flag_rf_fault` as a signature hit: `health=rf_fault` + that detail (the client's fault dialog prints
+  it as the headline), the §6.3 snapshot (its log tail carries the lines), the `task_health` event, the
+  run coupling (`on_task_fault` → `run.fault`, the run's Restart / auto policy), the auto-drop RF stop,
+  and the standalone `_maybe_auto_restart_standalone` relaunch.
+- `start()` resets the streak, so a relaunch is judged afresh. A short burst (a settling transient at
+  launch, a single hiccup) never reaches the threshold; a streak broken by a quiet gap starts over.
+- **Auto-restart on this fault** (owner: "I'd like it to auto-restart") relaunches the SAME
+  configuration, which underflows again, faults again ~4–6 s in, and trips the budget loudly
+  (`fault_restart_giving_up` / the run's `sequence_rf_fault` re-fire) — a fail-safe for a transient
+  host stall, not a cure for a configuration the Pi cannot sustain. That is the accepted behaviour.
+- Knobs: `SDR_UNDERFLOW_FAULT_S` (4.0; 0 disables), `SDR_UNDERFLOW_GAP_S` (3.0). `TaskHealth.STALLED`
+  stays reserved (its comment no longer claims underflow is unhandled). No capability: the client
+  already renders `health=rf_fault` + the detail; an older client shows the red pill and the detail
+  text. `argspec`/`ramp` untouched.
+
+**Not done:** the x410 engine is outside the detection stack (its `*_channel.py` scripts log through
+the same GR sink, so the scan would catch it on a unit that runs the agent there — unverified); a rate
+threshold (N underflows per window) — every report is a gap, so the count is diagnostic, not a
+criterion.
+
+Tests: `tests/test_underflow_fault.py` — the parser on the exact GR line (plural / singular / foreign
+lines); a 6-report streak faults through the scan (health, the detail text, the snapshot, the hook, the
+auto-drop, the SSE event); a 3-report burst does not and clean text leaves it; a streak accumulates
+across scans; a 10 s gap resets it; the knob at 0 disables it; a signature hit still wins; `start()`
+resets the streak (over a real subprocess); and LIVE over the real health loop (poll 0.3 s) with a
+script printing the GR lines — the task faults with the underflow detail and is stopped, and an
+auto-restart-on-fault task is relaunched with its exact `StartRequest`, faults again and trips its
+budget. Suite 718 → 728.
+
 ## 14. Open items
 
 - ~~Retrieve the archived `run_<ts>.log` from the affected unit + `df /dev/shm` /
@@ -1727,6 +1791,8 @@ first power point that did fire, the schedule continues to −50, the log names 
 - ~~Confirm the Pi 5 image's current `/dev/shm` size, `vm.max_map_count`, and `ulimit -n`~~ — DONE:
   8.3 GB / 1,048,576 / 1024.
 - **Verify the §14f #4 deferral on hardware** with the owner's reboot test after the OTA to 1.36.0.
+- **Verify §14m on hardware:** re-run the owner's overloaded L1P configuration on 1.36.2 — the task
+  should read RF FAULT within ~5 s and be stopped; with Auto-restart on, relaunched once and tripped.
 - Follow-ups deliberately deferred by the owner (2026-09-21), see §14k "gaps": gate-tune read-back
   → RF fault; arm-time pre-roll check + a longer default lead-in; persistent journald; a deferral
   annotation in the run log; the co-timed deferral edge.

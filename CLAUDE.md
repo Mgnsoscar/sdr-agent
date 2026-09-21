@@ -59,7 +59,8 @@ view it with `screenshot.py --tab calibration`.
 - **Capabilities + version:** a new client-visible feature adds a string to
   `AGENT_CAPABILITIES` and bumps `AGENT_VERSION` (both in `agent/config.py`); `test_meta_endpoint.py`
   asserts the capability set. The client feature-gates on these exact strings. Current version is
-  in `config.py` (`1.36.1`: a late task rejoins its schedule at the CURRENT level — a pile-up of
+  in `config.py` (`1.36.2`: sustained TX underflows are an RF fault — `UNDERFLOW_FAULT_S` 4 s, behaviour
+  only; `1.36.1`: a late task rejoins its schedule at the CURRENT level — a pile-up of
   deferred tunes collapses per parameter, power before RF-on; behaviour only; `1.36.0`: stacked sequences —
   arm guard A is task-aware — capability `sequence-stacking`; `1.35.0`: plan-level anchoring replica — Phase: plan editor redesign — capability
   `plan-item-anchors`; `1.19.0`: edit-while-holding — Phase 3c — `POST …/proceed` honours
@@ -94,6 +95,24 @@ is always dBm so one stage ceiling gauges every signal. `resolve()` folds all th
 representative frequency for scalar read-outs and publishes the full artifact for runtime re-fold.
 
 ## MERGED TO `main` (all three repos, fast-forward, 1.34.0) — field rollout: OTA every unit's agent FIRST, then deploy the library; rebuild the client bundle from 1.34.0. Nothing in the RF-fault arc has run on real hardware yet (mock scripts + fake gnuradio + the headless unit only).
+
+## Current state — sustained TX UNDERFLOWS are an RF fault (1.36.2, no capability) (branch `claude/system-familiarization-f5mezz`, agent-only)
+Owner test on 1.36.1: an independent GPS L1 P task at a deliberately too-heavy configuration logged
+`usrp_sink :error: In the last 750 ms, ~7000 underflows occurred.` every window while the agent kept reporting
+it RUNNING / health OK — the lines reach `current.log` and the watchdog scans them, but the scan matched only the
+three `HEALTH_FAULT_PATTERNS` (a halt signature; an underflowing flowgraph is alive). Owner decisions: a FAULT
+(the radio emits bursts with gaps — splatter, worse than silence), auto-restart allowed, threshold 4 s. Record:
+`docs/rf-fault-recovery.md` §14m. `process_manager._underflow_reports(text)` parses the GR line into
+`(window_ms, count)`; `ManagedProcess._underflow_fault_detail(text)` keeps a per-process streak (a report within
+`UNDERFLOW_GAP_S` 3 s / 1.5 polls of the previous continues it; the length is the SUM of the reported windows, so
+the measure is poll-cadence-independent) and returns the detail once it covers **`UNDERFLOW_FAULT_S`** (4 s = the
+6th consecutive 750 ms report; `SDR_UNDERFLOW_FAULT_S`, 0 disables); `_scan_task_health` then goes through the
+SAME `_flag_rf_fault` as a signature hit (health + detail — the client dialog's headline —, snapshot, event, run
+coupling, auto-drop RF, the standalone auto-restart). `start()` resets the streak. An auto-restart relaunches the
+same configuration, faults again and trips its budget loudly — accepted (a fail-safe, not a cure). `TaskHealth.
+STALLED` stays reserved. `AGENT_VERSION 1.36.1 → 1.36.2`; no client change (it already renders `rf_fault` + the
+detail). Tests: `tests/test_underflow_fault.py` (parser; streak/burst/accumulate/gap/knob-0/signature-wins;
+`start()` resets; LIVE over the real health loop: fault + stop, and auto-restart → relaunch → trip). Suite 718 → 728.
 
 ## Current state — a LATE task rejoins its schedule at the CURRENT level (1.36.1, no capability) (branch `claude/system-familiarization-f5mezz`, agent-only)
 Owner test on the updated fleet (1.36.0): a plan with a deliberately too-short warm-up on the L2C full loop

@@ -22,7 +22,7 @@ class TaskHealth(str, Enum):
     fault cannot be a ProcessState value without racing the exit machine; it is this field instead.
     Phase 1 only ever sets OK and RF_FAULT; STALLED/UNKNOWN are reserved for the follow-ups."""
     OK       = "ok"
-    STALLED  = "stalled"     # sustained underflow / degraded (reserved; not set in Phase 1)
+    STALLED  = "stalled"     # degraded (reserved; sustained underflow is an RF_FAULT since 1.36.2, §14m)
     RF_FAULT = "rf_fault"    # the flowgraph halted / a GR buffer fault — dead-but-alive
     UNKNOWN  = "unknown"
 

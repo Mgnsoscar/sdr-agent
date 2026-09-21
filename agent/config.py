@@ -430,7 +430,7 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # two never double-transmit on the single TX channel (an owned-query gates it). Gated by the master
 # kill-switch AUTO_RESTART_ENABLED. Adds capability `task-auto-restart` (the client gates its
 # "Auto-restart on fault" checkbox on it); opt-in per task (default False = today's behaviour).
-AGENT_VERSION = "1.36.1"
+AGENT_VERSION = "1.36.2"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -696,6 +696,19 @@ HEALTH_FAULT_PATTERNS = [
     "vmcircbuf",                # the GNU Radio circular-buffer subsystem error
     "boost::interprocess",      # the POSIX-shm allocation failure GR raises under the hood
 ]
+
+# Sustained TX UNDERFLOWS (docs/rf-fault-recovery.md §14m). GNU Radio's USRP sink logs
+# `usrp_sink :error: In the last 750 ms, N underflows occurred.` once per window for as long as the
+# host cannot keep the sample stream full (a sample rate / generator load the Pi can't sustain); the
+# radio then emits bursts with gaps between them — a splattering, useless transmission the script never
+# notices (its flowgraph is fine, the task keeps reading RUNNING). The watchdog scan sums the windows of
+# an UNBROKEN streak of those reports and, once they cover this many seconds, flags the task RF-FAULTED
+# exactly like a halted flowgraph (loud alarm, snapshot, auto-drop RF, run coupling, the restart
+# policies — an auto-restart relaunches the same configuration and its budget trips loudly). 0 disables.
+# A streak is broken when no report has been seen for more than UNDERFLOW_GAP_S (floored to 1.5 polls),
+# so a short burst at launch or one hiccup never trips it.
+UNDERFLOW_FAULT_S = float(os.environ.get("SDR_UNDERFLOW_FAULT_S", "4.0"))
+UNDERFLOW_GAP_S   = float(os.environ.get("SDR_UNDERFLOW_GAP_S", "3.0"))
 
 # ── RF-fault RECOVERY (Phase 3 — unattended auto-restart) ────────────────────────
 # When a run armed with restart_policy "auto" faults, the SequenceRunner tick auto-fires restart_run.

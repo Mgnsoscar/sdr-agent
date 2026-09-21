@@ -336,6 +336,17 @@ def _freq_from_command(cmd, spec: Optional[dict]) -> Optional[float]:
     return _tune_log.freq_hz_of(spec, {dest: last} if last is not None else {})
 
 
+# GNU Radio's USRP sink underflow report (gr-uhd `usrp_sink_impl`, one line per report window):
+#   usrp_sink :error: In the last 750 ms, 7187 underflows occurred.
+# Captures (window_ms, underflow_count). Matched on the scanned log text (stdout+stderr merged).
+_UNDERFLOW_RE = re.compile(r"in the last\s+(\d+)\s*ms,\s*(\d+)\s+underflows?\s+occurred", re.IGNORECASE)
+
+
+def _underflow_reports(text: str) -> List[tuple]:
+    """Every GR underflow report in `text`, in order, as (window_ms, count) pairs."""
+    return [(int(m.group(1)), int(m.group(2))) for m in _UNDERFLOW_RE.finditer(text)]
+
+
 def _last_clock_origin(text: str) -> Optional[float]:
     """The value of the LAST `CLOCK origin=<unix seconds>` marker in `text`, or None."""
     m = None
@@ -538,6 +549,12 @@ class ManagedProcess:
         # REPORTED it (txhealth.CLOCK_MARKER, read by the watchdog scan). A restart bakes it back so a
         # time-dependent script resumes exactly, whatever the launch latency (§14j). None = not reported.
         self.clock_origin: Optional[float] = None
+        # Sustained-underflow streak (§14m): the last scan instant that carried a GR underflow report,
+        # and the streak's covered window / report / underflow totals. Reset on every start.
+        self._uf_last: Optional[float] = None
+        self._uf_ms: int = 0
+        self._uf_reports: int = 0
+        self._uf_count: int = 0
         # Live-parameter values applied to THIS run by set_params ({dest: value}), so a standalone
         # auto-restart relaunches at the LIVE state (a muted / lowered task comes back muted / lowered),
         # not the launch request (review fix #2). Cleared on start.
@@ -573,6 +590,7 @@ class ManagedProcess:
         self._spawned.clear()
         self.transmitting_at = None
         self.clock_origin = None
+        self._reset_underflow_streak()
         self._live_applied = {}
         self._live_applied_at = {}
         self.state = ProcessState.STARTING
@@ -969,6 +987,41 @@ class ManagedProcess:
             snapshot         = snapshot,
         )
         asyncio.create_task(self._dispatcher.fire(event))
+
+    def _reset_underflow_streak(self) -> None:
+        self._uf_last = None
+        self._uf_ms = self._uf_reports = self._uf_count = 0
+
+    def _underflow_fault_detail(self, text: str) -> Optional[str]:
+        """Feed one scan's new log text to the sustained-underflow detector (§14m).
+
+        A GR underflow report continues the current streak when the previous one was seen within the
+        gap (UNDERFLOW_GAP_S, floored to 1.5 polls), else it starts a new streak. The streak's length is
+        the SUM of the reported windows (each line covers "the last N ms" — real transmit time, whatever
+        the poll cadence). Returns the fault detail once an unbroken streak covers UNDERFLOW_FAULT_S
+        (0 = never), else None. Lines are the only timing source (GR stamps none), so two bursts that
+        land in ONE scan read as one streak — a scan spans ~one poll, so that is a bounded error."""
+        reports = _underflow_reports(text)
+        if not reports:
+            return None
+        now = _monotonic()
+        gap = max(_agentcfg.UNDERFLOW_GAP_S, 1.5 * _agentcfg.HEALTH_POLL_S)
+        if self._uf_last is None or now - self._uf_last > gap:
+            self._uf_ms = self._uf_reports = self._uf_count = 0     # a new streak
+        self._uf_last = now
+        for window_ms, count in reports:
+            self._uf_ms += max(0, window_ms)
+            self._uf_reports += 1
+            self._uf_count += max(0, count)
+        limit_s = _agentcfg.UNDERFLOW_FAULT_S
+        if limit_s <= 0 or self._uf_ms < limit_s * 1000.0:
+            return None
+        covered = self._uf_ms / 1000.0
+        rate = self._uf_count / covered if covered > 0 else 0.0
+        return (f"sustained TX underflows: {self._uf_reports} reports over {covered:.1f} s "
+                f"(~{rate:,.0f} underflows/s) — the host cannot keep the sample stream full at this "
+                f"configuration (sample rate / generator load), so the radio is emitting bursts with "
+                f"gaps between them")
 
     async def _flag_rf_fault(self, detail: str) -> None:
         """Mark this task RF-faulted (dead-but-alive, docs/rf-fault-recovery.md §5.3): set health,
@@ -1515,12 +1568,16 @@ class ProcessManager:
         if origin is not None:
             proc.clock_origin = origin
         hit = next((p for p in _agentcfg.HEALTH_FAULT_PATTERNS if p.lower() in low), None)
-        if hit is None:
+        # A sustained streak of GR underflow reports is a fault too (§14m): the flowgraph is alive but
+        # the radio is emitting bursts with gaps — as useless (and worse for the band) as silence.
+        detail = (f"log signature: {hit}" if hit is not None
+                  else proc._underflow_fault_detail(text))
+        if detail is None:
             return
         if self._scan_stale(proc, p0):
             return
-        logger.warning("Task '%s' RF fault detected (matched %r)", proc.config.name, hit)
-        await proc._flag_rf_fault(f"log signature: {hit}")
+        logger.warning("Task '%s' RF fault detected (%s)", proc.config.name, detail)
+        await proc._flag_rf_fault(detail)
         # Re-check after the (slow: snapshot + event + run coupling) flag: if the process exited
         # meanwhile, its exit path owns the rest — stop()ing here cancelled that path mid-flight and
         # lost the alarm/coupling (review fixes #13/#14).
