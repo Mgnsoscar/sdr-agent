@@ -430,7 +430,7 @@ AGENT_PORT    = int(os.environ.get("SDR_AGENT_PORT", "8765"))
 # two never double-transmit on the single TX channel (an owned-query gates it). Gated by the master
 # kill-switch AUTO_RESTART_ENABLED. Adds capability `task-auto-restart` (the client gates its
 # "Auto-restart on fault" checkbox on it); opt-in per task (default False = today's behaviour).
-AGENT_VERSION = "1.36.2"
+AGENT_VERSION = "1.36.3"
 
 # Feature flags this agent's HTTP surface supports, reported by GET /info so the
 # client can light features up (or say "needs a newer agent") from an explicit list
@@ -698,17 +698,24 @@ HEALTH_FAULT_PATTERNS = [
 ]
 
 # Sustained TX UNDERFLOWS (docs/rf-fault-recovery.md §14m). GNU Radio's USRP sink logs
-# `usrp_sink :error: In the last 750 ms, N underflows occurred.` once per window for as long as the
-# host cannot keep the sample stream full (a sample rate / generator load the Pi can't sustain); the
-# radio then emits bursts with gaps between them — a splattering, useless transmission the script never
-# notices (its flowgraph is fine, the task keeps reading RUNNING). The watchdog scan sums the windows of
-# an UNBROKEN streak of those reports and, once they cover this many seconds, flags the task RF-FAULTED
-# exactly like a halted flowgraph (loud alarm, snapshot, auto-drop RF, run coupling, the restart
-# policies — an auto-restart relaunches the same configuration and its budget trips loudly). 0 disables.
-# A streak is broken when no report has been seen for more than UNDERFLOW_GAP_S (floored to 1.5 polls),
-# so a short burst at launch or one hiccup never trips it.
-UNDERFLOW_FAULT_S = float(os.environ.get("SDR_UNDERFLOW_FAULT_S", "4.0"))
-UNDERFLOW_GAP_S   = float(os.environ.get("SDR_UNDERFLOW_GAP_S", "3.0"))
+# `usrp_sink :error: In the last N ms, M underflows occurred.` whenever underflows happened and at least
+# 750 ms passed since its previous report — so N is the time SINCE THAT REPORT, not a fixed window:
+# a stream the host cannot keep full (a sample rate / generator load the Pi can't sustain) reports every
+# ~750 ms with thousands of underflows each, while a healthy stream with the odd hiccup (a launch
+# transient, a parameter rebuild) reports once per tens of seconds with a handful. The first ships the
+# signal in bursts with gaps — splatter, worse for the band than silence — and the script never notices
+# (its flowgraph is fine, the task keeps reading RUNNING). The watchdog scan therefore judges each report
+# by its RATE (M / N): a report at or above UNDERFLOW_FAULT_RATE underflows per second is HEAVY and its
+# window counts; a lighter one is ignored (a long light window ends the streak — the stream was fine for
+# it). Once the heavy windows of an unbroken streak cover UNDERFLOW_FAULT_S seconds the task is flagged
+# RF-FAULTED exactly like a halted flowgraph (loud alarm, snapshot, auto-drop RF, run coupling, the
+# restart policies — an auto-restart relaunches the same configuration and its budget trips loudly).
+# Observed on the Pi 5 / B206: ~10,000/s at a broken 61 MS/s launch; ~3/s on a healthy one (18 in 6 s,
+# owner: "not worth stopping the task for"). A streak is also broken when no heavy report has been seen
+# for more than UNDERFLOW_GAP_S (floored to 1.5 polls). UNDERFLOW_FAULT_S <= 0 disables the detector.
+UNDERFLOW_FAULT_S    = float(os.environ.get("SDR_UNDERFLOW_FAULT_S", "4.0"))
+UNDERFLOW_FAULT_RATE = float(os.environ.get("SDR_UNDERFLOW_FAULT_RATE", "200.0"))
+UNDERFLOW_GAP_S      = float(os.environ.get("SDR_UNDERFLOW_GAP_S", "3.0"))
 
 # ── RF-fault RECOVERY (Phase 3 — unattended auto-restart) ────────────────────────
 # When a run armed with restart_policy "auto" faults, the SequenceRunner tick auto-fires restart_run.

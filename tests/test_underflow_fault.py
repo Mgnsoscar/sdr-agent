@@ -4,13 +4,20 @@ GNU Radio's USRP sink logs `usrp_sink :error: In the last 750 ms, N underflows o
 window while the host cannot keep the sample stream full; the flowgraph is alive, the task reads
 RUNNING, and the radio emits bursts with gaps (the owner's spectrum analyzer "going crazy" on a
 deliberately too-heavy L1P configuration). Nothing matched those lines before. Now the watchdog scan
-sums the windows of an unbroken streak and flags the task through the ordinary `_flag_rf_fault` path
-once they cover UNDERFLOW_FAULT_S (4 s): alarm, snapshot, auto-drop RF, run coupling, and — the owner's
-choice — the standalone auto-restart, whose budget trips loudly when the relaunch underflows again.
+judges each report by its RATE (GR's "last N ms" is the time since its previous report, not a fixed
+window — the first field build summed those windows and faulted healthy tasks on ONE report covering
+17–33 s with a handful of underflows, 1.36.2): a report at or above UNDERFLOW_FAULT_RATE (200/s) is
+heavy and its window counts, a lighter one is ignored (a long light window ends the streak), and once
+an unbroken streak's heavy windows cover UNDERFLOW_FAULT_S (4 s) the task is flagged through the ordinary
+`_flag_rf_fault` path: alarm, snapshot, auto-drop RF, run coupling, and — the owner's choice — the
+standalone auto-restart, whose budget trips loudly when the relaunch underflows again.
 
 Covers:
   * the GR line parser (the exact field format, singular/plural, foreign lines);
-  * a streak covering the threshold faults through the scan (health, detail, hook, auto-drop, event);
+  * a heavy streak covering the threshold faults through the scan (health, detail, hook, auto-drop, event);
+  * the owner's false positives — one sparse report over 17–33 s — never fault, however many; light
+    reports don't count and a long light window resets the streak; the rate knob at 0 restores the
+    window-sum reading (so the knob is what separates the two);
   * a short burst does not; a streak accumulates across scans; a gap resets it; 0 disables it;
   * start() resets the streak so a relaunch is judged afresh;
   * LIVE: the real health loop over a script printing the GR lines faults + stops it, and an
@@ -78,14 +85,81 @@ def test_a_sustained_streak_faults_and_drops_rf(tmp_path):
         await mgr._scan_task_health(proc)
         await asyncio.sleep(0.05)
         assert proc.health == TaskHealth.RF_FAULT.value
-        assert proc.health_detail.startswith("sustained TX underflows: 6 reports over 4.5 s")
-        assert "underflows/s" in proc.health_detail
+        assert proc.health_detail.startswith("sustained TX underflows: 6 heavy reports over 4.5 s")
+        assert "at ~10,000 underflows/s (limit 200/s)" in proc.health_detail
         assert proc._resource_snapshot is not None                 # the §6.3 snapshot, as for any fault
         assert hook_calls and hook_calls[0][0] == "tx"             # coupled into an owning run
         assert proc.state != ProcessState.RUNNING                  # RF auto-dropped
         got = q.get_nowait()
         assert got["type"] == "task_health" and got["health"] == "rf_fault"
         assert "underflow" in got["detail"]
+    asyncio.run(scenario())
+
+
+SPARSE = ("usrp_sink :error: In the last 17300 ms, 18 underflows occurred.\n"
+          "usrp_sink :error: In the last 32800 ms, 66 underflows occurred.\n"
+          "usrp_sink :error: In the last 21300 ms, 60 underflows occurred.\n").encode()
+
+
+def test_a_sparse_report_over_a_long_window_never_faults(tmp_path):
+    """The field false positive (1.36.2): GR's window is the time since its previous report, so ONE
+    report covering 17–33 s with a handful of underflows is a healthy stream with a hiccup — the owner's
+    "18 underflows in 6 seconds is not worth stopping the task for". Never a fault, however many."""
+    async def scenario():
+        mgr, proc = _mgr(tmp_path)
+        proc.log.current.write_bytes(b"banner\n" + SPARSE * 20)      # 70 s of "sparse" per copy, x20
+        await mgr._scan_task_health(proc)
+        assert proc.health == TaskHealth.OK.value and proc._fault_alarmed is False
+        assert proc.state == ProcessState.RUNNING
+        assert proc._uf_ms == 0 and proc._uf_reports == 0           # nothing counted at all
+    asyncio.run(scenario())
+
+
+def test_light_reports_do_not_count_and_a_long_light_window_resets(tmp_path):
+    async def scenario():
+        mgr, proc = _mgr(tmp_path)
+        light = LINE.format(n=5).encode()                             # 5 in 750 ms = 6.7/s: light
+        # heavy, light, heavy, light, heavy: the light ones are ignored, 3 heavy = 2.25 s
+        proc.log.current.write_bytes(_burst(1) + light + _burst(1) + light + _burst(1))
+        await mgr._scan_task_health(proc)
+        assert proc.health == TaskHealth.OK.value
+        assert proc._uf_reports == 3 and proc._uf_ms == 2250
+        # a light report whose window spans the gap proves the stream was fine: the streak is over
+        with open(proc.log.current, "ab") as fh:
+            fh.write(b"usrp_sink :error: In the last 5000 ms, 40 underflows occurred.\n" + _burst(3))
+        await mgr._scan_task_health(proc)
+        assert proc.health == TaskHealth.OK.value                    # 3 heavy after the reset = 2.25 s
+        assert proc._uf_reports == 3
+        with open(proc.log.current, "ab") as fh:
+            fh.write(_burst(3))                                       # 6 heavy → 4.5 s
+        await mgr._scan_task_health(proc)
+        assert proc.health == TaskHealth.RF_FAULT.value
+    asyncio.run(scenario())
+
+
+def test_the_rate_knob_is_what_separates_sparse_from_heavy(tmp_path, monkeypatch):
+    """With the rate limit at 0 every report is heavy and the sparse report's 17.3 s window alone
+    covers the threshold — the 1.36.2 reading; the default limit is what keeps it from faulting."""
+    monkeypatch.setattr(pm._agentcfg, "UNDERFLOW_FAULT_RATE", 0.0)
+    async def scenario():
+        mgr, proc = _mgr(tmp_path)
+        proc.log.current.write_bytes(b"usrp_sink :error: In the last 17300 ms, 18 underflows occurred.\n")
+        await mgr._scan_task_health(proc)
+        assert proc.health == TaskHealth.RF_FAULT.value
+        assert "1 heavy reports over 17.3 s" in proc.health_detail
+    asyncio.run(scenario())
+
+
+def test_a_report_exactly_at_the_rate_limit_is_heavy(tmp_path, monkeypatch):
+    monkeypatch.setattr(pm._agentcfg, "UNDERFLOW_FAULT_RATE", 200.0)
+    async def scenario():
+        mgr, proc = _mgr(tmp_path)
+        at = LINE.format(n=150).encode()                              # 150 / 0.75 s = 200/s: heavy
+        below = LINE.format(n=149).encode()                           # 198.7/s: light
+        proc.log.current.write_bytes(at * 5 + below * 5)
+        await mgr._scan_task_health(proc)
+        assert proc._uf_reports == 5 and proc._uf_ms == 3750
+        assert proc.health == TaskHealth.OK.value
     asyncio.run(scenario())
 
 
@@ -114,7 +188,7 @@ def test_the_streak_accumulates_across_scans(tmp_path):
             fh.write(_burst(3))                                     # 3 + 3 → 4.5 s covered
         await mgr._scan_task_health(proc)
         assert proc.health == TaskHealth.RF_FAULT.value
-        assert "6 reports over 4.5 s" in proc.health_detail
+        assert "6 heavy reports over 4.5 s" in proc.health_detail
     asyncio.run(scenario())
 
 

@@ -1780,6 +1780,29 @@ script printing the GR lines — the task faults with the underflow detail and i
 auto-restart-on-fault task is relaunched with its exact `StartRequest`, faults again and trips its
 budget. Suite 718 → 728.
 
+**Field follow-up (2026-09-21, 1.36.2 → 1.36.3): the criterion is a RATE, not a window sum.** The
+owner ran 1.36.2 and healthy tasks were stopped: the activity feed showed `sustained TX underflows:
+1 reports over 17.3 s (~0 underflows/s)`, `… over 32.8 s (~2 underflows/s)`, `… over 21.3 s (~3
+underflows/s)` — a fault, an auto-drop and an auto-restart each time, on "18 underflows in 6 seconds",
+which the owner rightly called "not worth stopping the task for". The 1.36.2 reading was wrong about
+GR: `usrp_sink` does NOT report fixed 750 ms windows. It reports whenever underflows happened AND at
+least 750 ms passed since its previous report, and "in the last N ms" is the time SINCE THAT REPORT.
+A saturated stream therefore reports every ~750 ms with thousands of underflows each; a healthy
+stream with a launch transient or a parameter-rebuild hiccup reports ONCE with a window of tens of
+seconds and a handful — and 1.36.2 summed that window as tens of seconds of underflowing. Now each
+report is judged by its rate M/N: at or above **`UNDERFLOW_FAULT_RATE`** (default **200 underflows/s**;
+`SDR_UNDERFLOW_FAULT_RATE`) it is HEAVY and its window counts toward the streak; below it the report
+is ignored, and a light report whose window is at least the gap ends the streak (the stream was
+demonstrably fine for that long). The threshold sits between the two observed cases — ~3/s on the
+healthy runs, ~10,000/s on the broken 61 MS/s launch — and is the knob to tune from field data; the
+4 s of heavy windows and the gap rule are unchanged. The detail now reads `sustained TX underflows:
+6 heavy reports over 4.5 s at ~10,000 underflows/s (limit 200/s) — …`. Tests: the three screenshot
+reports (×20) never fault and count nothing; interleaved light reports don't count and a 5 s light
+window resets; a report exactly at the limit is heavy, one below is not; the rate knob at 0 restores
+the 1.36.2 reading (the sparse report then faults on its own), so the knob is what separates the two.
+Suite 728 → 732. The 1.36.2 field run did confirm the rest of the path on hardware: the fault, the
+auto-drop and the auto-restart relaunch all fired as designed.
+
 ## 14. Open items
 
 - ~~Retrieve the archived `run_<ts>.log` from the affected unit + `df /dev/shm` /
@@ -1791,8 +1814,9 @@ budget. Suite 718 → 728.
 - ~~Confirm the Pi 5 image's current `/dev/shm` size, `vm.max_map_count`, and `ulimit -n`~~ — DONE:
   8.3 GB / 1,048,576 / 1024.
 - **Verify the §14f #4 deferral on hardware** with the owner's reboot test after the OTA to 1.36.0.
-- **Verify §14m on hardware:** re-run the owner's overloaded L1P configuration on 1.36.2 — the task
-  should read RF FAULT within ~5 s and be stopped; with Auto-restart on, relaunched once and tripped.
+- **Verify §14m on hardware (1.36.3):** the overloaded L1P configuration should read RF FAULT within
+  ~5 s and be stopped (with Auto-restart on: relaunched once, then tripped); a healthy task with the odd
+  sparse report must stay OK — the 1.36.2 false positive.
 - Follow-ups deliberately deferred by the owner (2026-09-21), see §14k "gaps": gate-tune read-back
   → RF fault; arm-time pre-roll check + a longer default lead-in; persistent journald; a deferral
   annotation in the run log; the co-timed deferral edge.

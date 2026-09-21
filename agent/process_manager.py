@@ -995,33 +995,45 @@ class ManagedProcess:
     def _underflow_fault_detail(self, text: str) -> Optional[str]:
         """Feed one scan's new log text to the sustained-underflow detector (§14m).
 
-        A GR underflow report continues the current streak when the previous one was seen within the
-        gap (UNDERFLOW_GAP_S, floored to 1.5 polls), else it starts a new streak. The streak's length is
-        the SUM of the reported windows (each line covers "the last N ms" — real transmit time, whatever
-        the poll cadence). Returns the fault detail once an unbroken streak covers UNDERFLOW_FAULT_S
-        (0 = never), else None. Lines are the only timing source (GR stamps none), so two bursts that
-        land in ONE scan read as one streak — a scan spans ~one poll, so that is a bounded error."""
+        GR reports `In the last N ms, M underflows occurred` when underflows happened and >= 750 ms
+        passed since its previous report — N is the time since that report, NOT a fixed window. So a
+        report is judged by its RATE M/N: at or above UNDERFLOW_FAULT_RATE it is HEAVY and its window
+        counts toward the streak (a saturated stream reports every ~750 ms with thousands); below it
+        the report is ignored (a healthy stream with a hiccup reports once per tens of seconds with a
+        handful), and a light report whose window is at least the gap ENDS the streak — the stream was
+        demonstrably fine for that long. A heavy report continues the streak when the previous heavy
+        one was seen within the gap (UNDERFLOW_GAP_S, floored to 1.5 polls), else it starts a new one.
+        Returns the fault detail as soon as an unbroken streak's heavy windows cover UNDERFLOW_FAULT_S
+        (<= 0 = never), else None. Lines are the only timing source (GR stamps none), so within ONE
+        scan the reports are taken in order."""
         reports = _underflow_reports(text)
         if not reports:
             return None
+        limit_s = _agentcfg.UNDERFLOW_FAULT_S
+        rate_limit = _agentcfg.UNDERFLOW_FAULT_RATE
+        gap_s = max(_agentcfg.UNDERFLOW_GAP_S, 1.5 * _agentcfg.HEALTH_POLL_S)
         now = _monotonic()
-        gap = max(_agentcfg.UNDERFLOW_GAP_S, 1.5 * _agentcfg.HEALTH_POLL_S)
-        if self._uf_last is None or now - self._uf_last > gap:
-            self._uf_ms = self._uf_reports = self._uf_count = 0     # a new streak
-        self._uf_last = now
+        if self._uf_last is not None and now - self._uf_last > gap_s:
+            self._reset_underflow_streak()                        # the previous streak went quiet
         for window_ms, count in reports:
-            self._uf_ms += max(0, window_ms)
+            w_s = max(window_ms, 1) / 1000.0
+            rate = count / w_s
+            if rate < rate_limit:
+                if w_s >= gap_s:
+                    self._reset_underflow_streak()                # a long light window: stream was fine
+                continue
+            self._uf_last = now
+            self._uf_ms += window_ms
             self._uf_reports += 1
             self._uf_count += max(0, count)
-        limit_s = _agentcfg.UNDERFLOW_FAULT_S
-        if limit_s <= 0 or self._uf_ms < limit_s * 1000.0:
-            return None
-        covered = self._uf_ms / 1000.0
-        rate = self._uf_count / covered if covered > 0 else 0.0
-        return (f"sustained TX underflows: {self._uf_reports} reports over {covered:.1f} s "
-                f"(~{rate:,.0f} underflows/s) — the host cannot keep the sample stream full at this "
-                f"configuration (sample rate / generator load), so the radio is emitting bursts with "
-                f"gaps between them")
+            if limit_s > 0 and self._uf_ms >= limit_s * 1000.0:
+                covered = self._uf_ms / 1000.0
+                avg = self._uf_count / covered if covered > 0 else 0.0
+                return (f"sustained TX underflows: {self._uf_reports} heavy reports over {covered:.1f} s "
+                        f"at ~{avg:,.0f} underflows/s (limit {rate_limit:g}/s) — the host cannot keep the "
+                        f"sample stream full at this configuration (sample rate / generator load), so the "
+                        f"radio is emitting bursts with gaps between them")
+        return None
 
     async def _flag_rf_fault(self, detail: str) -> None:
         """Mark this task RF-faulted (dead-but-alive, docs/rf-fault-recovery.md §5.3): set health,
